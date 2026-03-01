@@ -1,0 +1,44 @@
+{
+  "global_settings": {
+    "output_dir": "Notebooks/Karna/Proximity Model/Output",
+    "default_max_speed": 25,
+    "curb_ramp_trustworthiness_outer_buffer": 15.0,
+    "curb_ramp_trustworthiness_inner_buffer": 5.0
+  },
+  "cities": [
+    {
+      "name": "San Francisco County, CA",
+      "government_data_paths": {
+        "parcels": "",
+        "street_centerlines": "",
+        "intersection_nodes": "",
+        "sidewalks": "",
+        "bikelanes": "",
+        "curb_ramps": "",
+        "crosswalks": "",
+        "street_features": "",
+        "sidewalk_features": "",
+        "bikeway_features": ""
+      },
+      "column_mappings": {},
+      "curbramp_trustworthy": true
+    },
+    {
+      "name": "Alameda County, CA",
+      "government_data_paths": {
+        "parcels": "",
+        "street_centerlines": "",
+        "intersection_nodes": "",
+        "sidewalks": "",
+        "bikelanes": "",
+        "curb_ramps": "",
+        "crosswalks": "",
+        "street_features": "",
+        "sidewalk_features": "",
+        "bikeway_features": ""
+      },
+      "column_mappings": {},
+      "curbramp_trustworthy": false
+    }
+  ]
+}
