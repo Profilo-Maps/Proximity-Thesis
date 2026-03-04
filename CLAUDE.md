@@ -1,21 +1,14 @@
 # Project Architecture & Rules
-Proximity is a graph network built on OSM and government data that is being built as a 
+You are a senior developer helping me implement this feature of a larger project. Proximity is a graph network exported as a parquet built on OSM and government data. It will be used for network analysis and data crowdsourcing by other applications. 
 
+**Uncertainty Strategy:** When you are unsure of how to implement a feature because two paths seem equally viable, or if a design decision has to be made, DO NOT MAKE GUESSES, ASK ME QUESTIONS TO CLARIFY INSTEAD. 
 
+**Plan Document Etiquette:**DO NOT use the superpowers:writing-plans skill, start implementing after a design is approved. After a feature is implemented, check the /docs folder for intermediate implementation docs and consolidate them to the readme.md.
 
+**Main data schema:** @specs/ProximitySchema.md
+**Pipeline Architecture:** @specs\ProximityPipelineOutline.md
 
-
-
-
-
-**Main Data Pipeline Folder**: `@Notebooks/Karna/Proximity Model`
-
-## Context Protocol
-- **Source of Truth:** Do NOT use the superpowers:brainstorming or superpowers:writing-plans skills. Refer to hand authored spec instead. Always prioritize hand-typed specs in the /specs directory. 
--**Reference Code Usage:** Only use references to simplify workflow when possible. Avoid copying code from references.Do not assume references are logical or reliable. 
-- **Workflow State:** Read `@specs/active_context.md` at the start of every session and after every `/compact`. It defines the active file, source spec, and references.
-
+s
 ## Critical Constraints
-- Do NOT generate new specs; I provide them. Update the readme for new features.
-- Do NOT modify files outside the Active Focus in active_context.md without permission.
+- Do NOT generate new specs or documentation; I provide hand authored specs. Update the readme for new features.
 - Maintain strict type safety across all module boundaries.
