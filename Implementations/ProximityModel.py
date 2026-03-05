@@ -1,12 +1,14 @@
+import math
 import numpy as np
 import osmnx as ox
 import geopandas as gpd
 import pandas as pd
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 from tqdm import tqdm
 from shapely import STRtree
-from shapely.geometry import MultiLineString
+from shapely.geometry import MultiLineString, Point
 from shapely.geometry.base import BaseGeometry
 
 # --- Global Config ---
@@ -27,11 +29,401 @@ CENTERLINE_COINCIDENCE_THRESHOLD_M = 2.0
 NEARBY_SEPARATE_SIDEWALK_THRESHOLD_M = 20.0
 
 # --- Cities Config ---
-CITIES_CONFIG = ["San Francisco County, California, USA", "Alameda County, California, USA"]
+CITIES_CONFIG = [
+    {"place": "San Francisco County, California, USA", "default_lane_width_m": 3.5},
+    {"place": "Alameda County, California, USA",       "default_lane_width_m": 3.5},
+]
+
+
+# --- Block Detection ---
+
+# Highway types that are not driveable roads and should be excluded from face traversal
+_NON_ROAD_HIGHWAY = frozenset({
+    "cycleway", "footway", "pedestrian", "path",
+    "steps", "corridor", "bridleway",
+})
+
+_COMPASS_DIRS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+
+
+@dataclass
+class GridCache:
+    origin_x: float      # SW corner x (EPSG:32610 metres)
+    origin_y: float      # SW corner y
+    cell_size: float     # 500.0
+    n_cols: int
+    n_rows: int
+
+
+@dataclass
+class BlockResult:
+    edge_blocks: dict[tuple[int, int, int], tuple[str | None, str | None]]
+    # (u, v, key) -> (left_block_id, right_block_id)
+    edge_bearings: dict[tuple[int, int, int], float]
+    # (u, v, key) -> normalized_bearing (0 deg N compass)
+    edge_side_labels: dict[tuple[int, int, int], str | None]
+    # (u, v, key) -> compass label of the block side this edge belongs to (left face)
+    node_block_faces: dict[int, set[str]]
+    # node_id -> set of block IDs touching this node
+    block_nodes: set[int]
+    # nodes that are vertices of block polygons
+    grid: GridCache
+
+
+def _circular_mean_bearing(bearings: list[float]) -> float:
+    """Circular mean of compass bearings (0–360°)."""
+    if not bearings:
+        return 0.0
+    sin_s = sum(math.sin(math.radians(b)) for b in bearings)
+    cos_s = sum(math.cos(math.radians(b)) for b in bearings)
+    return math.degrees(math.atan2(sin_s, cos_s)) % 360
+
+
+def _quantize_compass(bearing: float) -> str:
+    """Quantize a bearing (0–360°) to the nearest of 8 compass directions."""
+    return _COMPASS_DIRS[round(bearing / 45) % 8]
+
+
+def detect_blocks(G, nodes: gpd.GeoDataFrame) -> BlockResult:
+    """Detect city blocks via left-turn face traversal on the OSM road graph.
+
+    Runs on the raw NetworkX graph immediately after OSM load, before schema
+    population.  Returns a BlockResult with block assignments, bearings, block
+    side labels, and node classifications for every directed road edge.
+    """
+    # 1. Build grid from node bounding box (EPSG:32610, metres)
+    xs: np.ndarray = np.array(nodes.geometry.x.values, dtype=np.float64)
+    ys: np.ndarray = np.array(nodes.geometry.y.values, dtype=np.float64)
+    cell = 500.0
+    ox_g: float = float(xs.min())
+    oy_g: float = float(ys.min())
+    n_cols = int(math.ceil((float(xs.max()) - ox_g) / cell)) + 1
+    n_rows = int(math.ceil((float(ys.max()) - oy_g) / cell)) + 1
+    grid = GridCache(origin_x=ox_g, origin_y=oy_g, cell_size=cell,
+                     n_cols=n_cols, n_rows=n_rows)
+
+    # 2. Collect projected node coordinates
+    node_xy: dict[int, tuple[float, float]] = {}
+    for nid in nodes.index:
+        geom = cast(Point, nodes.at[nid, "geometry"])
+        node_xy[int(nid)] = (float(geom.x), float(geom.y))
+
+    # 3. Build node_out: outgoing road edges per node, sorted by compass bearing (ascending)
+    # Ascending compass sort + "first bearing > reverse_bearing" = leftmost turn at each node.
+    def _is_non_road(data: dict) -> bool:
+        hw = data.get("highway", "")
+        hw_vals = hw if isinstance(hw, list) else [hw]
+        return bool(frozenset(str(h) for h in hw_vals) & _NON_ROAD_HIGHWAY)
+
+    node_out: dict[int, list[tuple[float, int, int]]] = {}
+    all_road_edges: set[tuple[int, int, int]] = set()
+
+    for u, v, k, data in G.edges(keys=True, data=True):
+        if u == v or _is_non_road(data):
+            continue
+        if u not in node_xy or v not in node_xy:
+            continue
+        ux, uy = node_xy[u]
+        vx, vy = node_xy[v]
+        dx, dy = vx - ux, vy - uy
+        if dx == 0.0 and dy == 0.0:
+            continue
+        bearing = math.degrees(math.atan2(dx, dy)) % 360
+        node_out.setdefault(u, []).append((bearing, v, k))
+        all_road_edges.add((u, v, k))
+
+    for nid in node_out:
+        node_out[nid].sort(key=lambda t: t[0])
+
+    # 4. Left-turn face traversal
+    visited: set[tuple[int, int, int]] = set()
+    edge_left_block: dict[tuple[int, int, int], str | None] = {e: None for e in all_road_edges}
+    edge_bearings: dict[tuple[int, int, int], float] = {}
+    node_block_faces: dict[int, set[str]] = {}
+    block_nodes: set[int] = set()
+    face_edges_by_block: dict[str, list[tuple[int, int, int]]] = {}
+    face_seq: dict[tuple[int, int], int] = {}
+    n_interior = n_exterior = n_terminal = 0
+    safety_limit = len(all_road_edges) + 2
+
+    for start_edge in all_road_edges:
+        if start_edge in visited:
+            continue
+        u0, v0, k0 = start_edge
+        face: list[tuple[int, int, int]] = []
+        shoelace = 0.0
+        has_terminal = False
+        cu, cv, ck = u0, v0, k0
+        safety = safety_limit
+
+        while True:
+            if (cu, cv, ck) in visited:
+                break
+            visited.add((cu, cv, ck))
+            face.append((cu, cv, ck))
+
+            ux, uy = node_xy[cu]
+            vx, vy = node_xy[cv]
+            b = math.degrees(math.atan2(vx - ux, vy - uy)) % 360
+            edge_bearings[(cu, cv, ck)] = b
+            shoelace += ux * vy - vx * uy
+
+            out = node_out.get(cv, [])
+            if not out:
+                has_terminal = True
+                break
+
+            # Find next edge: first in ascending-bearing list with bearing > rev_bearing
+            # (wraps to smallest if none qualifies). This yields the leftmost turn.
+            rev = (b + 180.0) % 360
+            next_e: tuple[int, int, int] | None = None
+            for ob, od, ok in out:
+                if ob > rev:
+                    next_e = (cv, od, ok)
+                    break
+            if next_e is None:
+                ob, od, ok = out[0]
+                next_e = (cv, od, ok)
+
+            safety -= 1
+            if safety <= 0:
+                break
+            cu, cv, ck = next_e
+            if (cu, cv, ck) == (u0, v0, k0):
+                break
+
+        # Classify face by shoelace sign
+        if has_terminal or abs(shoelace) < 1e-6:
+            n_terminal += 1
+            continue
+        if shoelace < 0:
+            n_exterior += 1
+            continue
+
+        # Interior face → assign block ID
+        n_interior += 1
+        # Anchor vertex: lowest grid row, then lowest grid col
+        anchor_r: int | None = None
+        anchor_c: int | None = None
+        for u, v, _ in face:
+            for nid in (u, v):
+                nx, ny = node_xy[nid]
+                c = int((nx - ox_g) / cell)
+                r = int((ny - oy_g) / cell)
+                if anchor_r is None or r < anchor_r or (anchor_r == r and anchor_c is not None and c < anchor_c):
+                    anchor_r, anchor_c = r, c
+        assert anchor_r is not None and anchor_c is not None
+        cell_key = (anchor_c, anchor_r)
+        seq = face_seq.get(cell_key, 0)
+        face_seq[cell_key] = seq + 1
+        block_id = f"{anchor_c}_{anchor_r}_{seq}"
+
+        face_edges_by_block[block_id] = list(face)
+        for u, v, k in face:
+            edge_left_block[(u, v, k)] = block_id
+            for nid in (u, v):
+                node_block_faces.setdefault(nid, set()).add(block_id)
+                block_nodes.add(nid)
+
+    print(
+        f"Block detection: {n_interior} interior faces, {n_exterior} exterior, "
+        f"{n_terminal} terminal | grid {n_cols}×{n_rows} ({cell:.0f}m cells)"
+    )
+    assigned = sum(1 for v in edge_left_block.values() if v is not None)
+    print(f"  Left-block assigned: {assigned}/{len(all_road_edges)} road edges")
+
+    # 5. Derive right blocks from the reverse directed edges
+    edge_blocks: dict[tuple[int, int, int], tuple[str | None, str | None]] = {}
+    for uvk in all_road_edges:
+        u, v, k = uvk
+        left = edge_left_block.get(uvk)
+        right: str | None = None
+        if G.has_edge(v, u):
+            for k_rev in G[v][u]:
+                r_cand = edge_left_block.get((v, u, k_rev))
+                if r_cand is not None:
+                    right = r_cand
+                    break
+        edge_blocks[uvk] = (left, right)
+
+    # 6. Block side labeling
+    # Intersection nodes: nodes touching 3+ distinct block faces
+    intersection_nodes: set[int] = {
+        nid for nid, faces in node_block_faces.items() if len(faces) >= 3
+    }
+    edge_side_labels: dict[tuple[int, int, int], str | None] = {e: None for e in all_road_edges}
+
+    for block_id, face in face_edges_by_block.items():
+        # Walk face edges and split into sides at intersection nodes
+        sides: list[list[tuple[int, int, int]]] = []
+        current_side: list[tuple[int, int, int]] = []
+        for u, v, k in face:
+            current_side.append((u, v, k))
+            if v in intersection_nodes:
+                sides.append(current_side)
+                current_side = []
+        if current_side:
+            if sides:
+                sides[0] = current_side + sides[0]  # merge trailing edges into first side
+            else:
+                sides.append(current_side)          # dead-end block: one side
+
+        if not sides:
+            sides = [face]
+
+        for side_edges in sides:
+            side_bearings = [edge_bearings[e] for e in side_edges if e in edge_bearings]
+            label = _quantize_compass(_circular_mean_bearing(side_bearings)) if side_bearings else None
+            for e in side_edges:
+                edge_side_labels[e] = label
+
+    labelled = sum(1 for v in edge_side_labels.values() if v is not None)
+    print(f"  Block side labels: {labelled}/{len(all_road_edges)} edges labelled")
+
+    return BlockResult(
+        edge_blocks=edge_blocks,
+        edge_bearings=edge_bearings,
+        edge_side_labels=edge_side_labels,
+        node_block_faces=node_block_faces,
+        block_nodes=block_nodes,
+        grid=grid,
+    )
+
+
+def _populate_block_columns(
+    populated: gpd.GeoDataFrame,
+    edges_reset: gpd.GeoDataFrame,
+    G,
+    block_result: BlockResult,
+) -> None:
+    """Write block-derived columns into the schema GeoDataFrame (in-place)."""
+    eb = block_result.edge_blocks
+    ebear = block_result.edge_bearings
+    esl = block_result.edge_side_labels
+    nbf = block_result.node_block_faces
+    bn = block_result.block_nodes
+
+    u_arr = edges_reset["u"].astype(int).values
+    v_arr = edges_reset["v"].astype(int).values
+    k_arr = edges_reset["key"].astype(int).values
+
+    block_ids_list: list[dict[str, str | None]] = []
+    block_sides_list: list[dict[str, str | None]] = []
+    bearings: list[float | None] = []
+    start_block: list[bool] = []
+    start_inter: list[bool] = []
+    end_block: list[bool] = []
+    end_inter: list[bool] = []
+
+    for u, v, k, geom in zip(u_arr, v_arr, k_arr, edges_reset["geometry"]):
+        uvk = (int(u), int(v), int(k))
+        left_b, right_b = eb.get(uvk, (None, None))
+        block_ids_list.append({"left": left_b, "right": right_b})
+
+        # Side label for left face is esl[uvk]; right face = esl of reverse edge
+        left_side = esl.get(uvk)
+        right_side: str | None = None
+        if G.has_edge(int(v), int(u)):
+            for k_rev in G[int(v)][int(u)]:
+                rs = esl.get((int(v), int(u), k_rev))
+                if rs is not None:
+                    right_side = rs
+                    break
+        block_sides_list.append({"left": left_side, "right": right_side})
+
+        # Normalized bearing: from traversal if available, else geometry fallback
+        bear = ebear.get(uvk)
+        if bear is None and geom is not None:
+            bear = _linestring_bearing(geom)
+        bearings.append(bear)
+
+        start_block.append(int(u) in bn)
+        start_inter.append(len(nbf.get(int(u), set())) >= 3)
+        end_block.append(int(v) in bn)
+        end_inter.append(len(nbf.get(int(v), set())) >= 3)
+
+    populated["block_ids"] = pd.Series(block_ids_list, index=edges_reset.index)
+    populated["block_sides"] = pd.Series(block_sides_list, index=edges_reset.index)
+    populated["normalized_bearing"] = pd.Series(bearings, index=edges_reset.index)
+    populated["start_node_is_block_node"] = pd.Series(start_block, index=edges_reset.index)
+    populated["start_node_is_intersection_node"] = pd.Series(start_inter, index=edges_reset.index)
+    populated["end_node_is_block_node"] = pd.Series(end_block, index=edges_reset.index)
+    populated["end_node_is_intersection_node"] = pd.Series(end_inter, index=edges_reset.index)
+
+
+def swap_facilities_by_bearing(
+    populated: gpd.GeoDataFrame,
+    edges_reset: gpd.GeoDataFrame,
+    block_result: BlockResult,
+) -> gpd.GeoDataFrame:
+    """Swap left/right facility columns for edges whose OSM geometry is stored
+    in reverse order relative to the graph direction u→v.
+
+    When normalized_bearing (u→v from graph nodes) and the raw geometry bearing
+    (coords[0]→coords[-1]) differ by ~180° (±30°), the OSM sidewalk/cycleway
+    tags were authored relative to the reversed geometry and need to be re-mapped.
+    """
+    # Identify left↔right swap pairs from schema columns
+    cols = set(populated.columns)
+    swap_pairs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for col in populated.columns:
+        if "_left_" in col:
+            right_col = col.replace("_left_", "_right_", 1)
+        elif col.endswith("_left"):
+            right_col = col[: -len("_left")] + "_right"
+        else:
+            continue
+        if right_col in cols and right_col not in seen:
+            swap_pairs.append((col, right_col))
+            seen.add(right_col)
+
+    # Compute bearings as numeric Series
+    norm_bear = pd.to_numeric(populated["normalized_bearing"], errors="coerce")
+    raw_bear = pd.to_numeric(
+        edges_reset["geometry"].apply(_linestring_bearing), errors="coerce"
+    )
+
+    both_valid = norm_bear.notna() & raw_bear.notna()
+    diff = (norm_bear - raw_bear).abs() % 360
+    diff_sym = diff.where(diff <= 180, 360 - diff)
+    # ~180° difference (within 30° tolerance) → geometry is reversed
+    is_reversed = (diff_sym >= 150) & both_valid
+
+    n_swapped = int(is_reversed.sum())
+    if n_swapped > 0:
+        for left_col, right_col in swap_pairs:
+            tmp = populated.loc[is_reversed, left_col].copy()
+            populated.loc[is_reversed, left_col] = populated.loc[is_reversed, right_col].values
+            populated.loc[is_reversed, right_col] = tmp.values
+
+    # Diagnostics
+    n_both = int(both_valid.sum())
+    n_norm_only = int(norm_bear.notna().sum() - n_both)
+    n_raw_only = int(raw_bear.notna().sum() - n_both)
+    n_neither = int((~norm_bear.notna() & ~raw_bear.notna()).sum())
+    if n_both > 0:
+        diffs_valid = diff_sym[both_valid]
+        mean_diff = float(diffs_valid.mean())
+        max_diff = float(diffs_valid.max())
+        n_exact = int((diffs_valid < 0.1).sum())
+        n_small = int(((diffs_valid >= 0.1) & (diffs_valid < 30)).sum())
+        n_mid = int(((diffs_valid >= 30) & (diffs_valid < 150)).sum())
+        n_rev = int((diffs_valid >= 150).sum())
+        print(f"Facility bearing swap: {n_swapped} edges swapped left↔right "
+              f"(pairs={len(swap_pairs)}, compared={n_both}, "
+              f"norm_only={n_norm_only}, raw_only={n_raw_only}, neither={n_neither})")
+        print(f"  Bearing diff distribution: exact(<0.1°)={n_exact}, "
+              f"small(0.1-30°)={n_small}, mid(30-150°)={n_mid}, "
+              f"reversed(>=150°)={n_rev} | mean={mean_diff:.1f}°, max={max_diff:.1f}°")
+    else:
+        print(f"Facility bearing swap: no edges with both bearings available "
+              f"(norm_only={n_norm_only}, raw_only={n_raw_only}, neither={n_neither})")
+    return populated
 
 
 #---Data Pipeline---
-def populate_schema(place: str) -> gpd.GeoDataFrame:
+def populate_schema(place: str, *, default_lane_width_m: float = 3.5) -> gpd.GeoDataFrame:
     """Load OSM street network for a place, map edge/node data into the proximity
     schema columns, export the result as a parquet to OUTPUT_DIR, and return it."""
     # --- Load OSM graph ---
@@ -91,6 +483,9 @@ def populate_schema(place: str) -> gpd.GeoDataFrame:
 
     print(f"Nodes: {len(nodes)}, Edges: {len(edges)}")
 
+    # --- Block detection (runs on raw graph before schema population) ---
+    block_result = detect_blocks(G, nodes)
+
     # --- Map OSM edge/node data into schema columns ---
     schema = _create_schema_dataframe()
 
@@ -130,18 +525,15 @@ def populate_schema(place: str) -> gpd.GeoDataFrame:
     populated["start_node_geometry"] = edges_reset["u"].map(node_geom)
     populated["end_node_geometry"]   = edges_reset["v"].map(node_geom)
 
-    # Mark intersection nodes (degree > 2 in the undirected sense)
-    undirected_degree = pd.Series(dict(G.degree()), name="degree")
-    populated["start_node_is_intersection_node"] = (
-        edges_reset["u"].map(undirected_degree) > 2
-    )
-    populated["end_node_is_intersection_node"] = (
-        edges_reset["v"].map(undirected_degree) > 2
-    )
+    # Block columns: block_ids, block_sides, normalized_bearing, and node flags
+    _populate_block_columns(populated, edges_reset, G, block_result)
 
     populated = populate_base_bikelanes(populated, edges_reset)
     populated = populate_base_footlanes(populated, edges_reset)
-    populated = _populate_separate_facilities(populated, edges_reset)
+    # Swap left/right facility columns on edges with reversed geometry (deferred
+    # until after tag population so all sidewalk/bikeway columns exist)
+    populated = swap_facilities_by_bearing(populated, edges_reset, block_result)
+    populated = _populate_separate_facilities(populated, edges_reset, default_lane_width_m)
     # --- Export ---
     # Geometry columns other than the active one must be serialized to WKB so
     # they round-trip correctly through parquet (GeoParquet only encodes the
@@ -212,13 +604,24 @@ def populate_schema(place: str) -> gpd.GeoDataFrame:
             except (TypeError, ValueError):
                 pass
             return str(x)
+        # Struct columns (block_ids, block_sides) are stored as dicts and must be
+        # written via pyarrow StructArray.  Ensure every cell is either a plain dict
+        # or None so pyarrow can infer a uniform schema.
+        _STRUCT_COLS = {"block_ids", "block_sides"}
         for col in export_df.columns:
             if col in present_geom_cols or col == export_df.geometry.name:
                 continue
             if export_df[col].dtype == object:
-                has_list = any(isinstance(x, (list, np.ndarray)) for x in export_df[col])
-                if has_list:
-                    export_df[col] = export_df[col].apply(_safe_str)
+                if col in _STRUCT_COLS:
+                    # Normalise: replace NA/non-dict values with {"left": None, "right": None}
+                    _empty_struct: dict = {"left": None, "right": None}
+                    export_df[col] = export_df[col].apply(
+                        lambda x: x if isinstance(x, dict) else _empty_struct
+                    )
+                else:
+                    has_list = any(isinstance(x, (list, np.ndarray)) for x in export_df[col])
+                    if has_list:
+                        export_df[col] = export_df[col].apply(_safe_str)
         place_slug = place.replace(", ", "_").replace(" ", "_")
         output_path = OUTPUT_DIR / f"{place_slug}_network.parquet"
         export_df.to_parquet(output_path)
@@ -467,7 +870,7 @@ def populate_base_footlanes(
     return populated
 
 
-def _road_side(road_geom, point) -> str:
+def _road_side(road_geom: BaseGeometry, point: Point) -> str:
     """Return 'left' or 'right' based on cross product of road direction × road→point."""
     coords = list(road_geom.coords)
     ax, ay = coords[0]
@@ -502,6 +905,7 @@ def _sindex_nearest_idx(sindex, geom, df) -> int:
 def _populate_separate_facilities(
     populated: gpd.GeoDataFrame,
     edges_reset: gpd.GeoDataFrame,
+    default_lane_width_m: float = 3.5,
 ) -> gpd.GeoDataFrame:
     """Match independently mapped cycleway and footway edges to their parent road
     segments and write attributes + geometry into the appropriate schema slots.
@@ -753,8 +1157,7 @@ def _populate_separate_facilities(
     # Build unified tree of ALL separate sidewalk geometries (both sides).
     all_sep_sw_geoms: list[BaseGeometry] = []
     all_sep_sw_bearings: list[float] = []
-    all_sep_sw_street_ids: list = []  # OSM way ID for same-way suppression guard
-    all_sep_sw_names: list = []       # street name for same-street suppression guard
+    all_sep_sw_row_indices: list = []  # row index to prevent self-suppression
     for sw_side in ("left", "right"):
         gcol = f"sidewalk_{sw_side}_geometry"
         bcol = f"sidewalk_{sw_side}_buffered"
@@ -772,8 +1175,7 @@ def _populate_separate_facilities(
                 continue
             all_sep_sw_geoms.append(cast(BaseGeometry, g))
             all_sep_sw_bearings.append(bearing)
-            all_sep_sw_street_ids.append(populated.at[idx, "street_id"])  # type: ignore[index]
-            all_sep_sw_names.append(populated.at[idx, "name"] if "name" in populated.columns else None)  # type: ignore[index]
+            all_sep_sw_row_indices.append(idx)
 
     sep_sw_tree = STRtree(all_sep_sw_geoms) if all_sep_sw_geoms else None
     total_buffered = 0
@@ -811,28 +1213,21 @@ def _populate_separate_facilities(
             street_geom = cast(BaseGeometry, street_geom)
 
             # Sidewalk suppression: skip if a nearby parallel separate sidewalk
-            # from a DIFFERENT street exists on the same side.  Suppression is
-            # guarded by both street_id and street name so that footways on the
-            # same physical street (which may span multiple OSM way IDs) do not
-            # suppress buffering on adjacent segments.
+            # exists on the same side.  Only guard is same-row (a row's own
+            # separate geometry can't cause false suppression since it already
+            # has geometry and therefore isn't a buffering candidate).  This
+            # allows separate sidewalks from adjacent segments of the SAME
+            # street to suppress buffering, preventing mixed separate/buffered
+            # output on streets with inconsistent OSM footway coverage.
             if kind == "sidewalk" and sep_sw_tree is not None:
-                this_street_id = populated.at[idx, "street_id"]
-                this_name = populated.at[idx, "name"] if "name" in populated.columns else None
                 street_bearing = _linestring_bearing(street_geom)
                 if street_bearing is not None:
                     search_area = street_geom.buffer(NEARBY_SEPARATE_SIDEWALK_THRESHOLD_M)
                     hit_indices = sep_sw_tree.query(search_area)
                     skip = False
                     for hi in hit_indices:
-                        # Same OSM way → not a parallel-street duplicate
-                        if all_sep_sw_street_ids[hi] == this_street_id:
-                            continue
-                        # Same street name → same physical street, different OSM way
-                        if (this_name is not None
-                                and all_sep_sw_names[hi] is not None
-                                and not _is_na(this_name)
-                                and not _is_na(all_sep_sw_names[hi])
-                                and str(this_name).lower() == str(all_sep_sw_names[hi]).lower()):
+                        # Same row → can't be a real suppression source
+                        if all_sep_sw_row_indices[hi] == idx:
                             continue
                         if not _bearings_parallel(street_bearing, all_sep_sw_bearings[hi]):
                             continue
@@ -848,7 +1243,7 @@ def _populate_separate_facilities(
 
             n_buffer_called += 1
             geom_before = populated.at[idx, geom_col]
-            populated = _buffer_segment(idx, sub_id, street_geom, populated, side, _buffer_debug)
+            populated = _buffer_segment(idx, sub_id, street_geom, populated, side, _buffer_debug, default_lane_width_m)
             geom_after = populated.at[idx, geom_col]
             if geom_after is not None and hasattr(geom_after, "geom_type"):
                 n_buffer_wrote += 1
@@ -870,9 +1265,13 @@ def _populate_separate_facilities(
 
 def run_multi_city():
     results = {}
-    for city in CITIES_CONFIG:
-        print(f"\n=== Processing: {city} ===")
-        results[city] = populate_schema(city)
+    for cfg in CITIES_CONFIG:
+        place = cfg["place"]
+        print(f"\n=== Processing: {place} ===")
+        results[place] = populate_schema(
+            place,
+            default_lane_width_m=cfg.get("default_lane_width_m", _DEFAULT_LANE_WIDTH_M),
+        )
     return results
 
 _FACILITY_SLOTS = [
@@ -968,7 +1367,7 @@ def _is_centerline(
     return True
 
 
-_DEFAULT_LANE_WIDTH_M  = 3.5   # fallback when lane_width is missing
+_DEFAULT_LANE_WIDTH_M  = 3.5   # fallback when lane_width is missing (overridden by per-city config)
 _DEFAULT_BIKE_WIDTH_M  = 1.5   # fallback when a bikeway width cell is missing
 
 
@@ -990,6 +1389,7 @@ def _buffer_segment(
     populated: gpd.GeoDataFrame,
     side: str,
     debug: dict[str, Any],
+    default_lane_width_m: float = _DEFAULT_LANE_WIDTH_M,
 ) -> gpd.GeoDataFrame:
     """Offset a bikelane or sidewalk geometry away from its street centerline.
 
@@ -1031,7 +1431,7 @@ def _buffer_segment(
     raw_lanes = row.get("lanes")
     raw_lane_width = row.get("lane_width")
     lanes      = _parse_numeric(raw_lanes,      2.0)
-    lane_width = _parse_numeric(raw_lane_width, _DEFAULT_LANE_WIDTH_M)
+    lane_width = _parse_numeric(raw_lane_width, default_lane_width_m)
     half_road  = (lanes * lane_width) / 2.0   # distance from centreline to kerb edge
 
     # Track NaN sources

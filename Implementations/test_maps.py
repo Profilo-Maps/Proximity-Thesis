@@ -460,19 +460,302 @@ function toggleFG(fgName, show) {{
     return out_path
 
 
-# ── ENTRY POINT ────────────────────────────────────────────────────────────────
-if not LOCATIONS:
-    import warnings
-    warnings.warn("LOCATIONS is empty — no maps will be generated.", stacklevel=1)
+# ── BLOCK MAP GENERATION ──────────────────────────────────────────────────────
 
-for loc in LOCATIONS:
-    parquet_path = loc["parquet"]
-    path = generate_map(
-        data        = load_parquet(parquet_path),
-        center_lat  = loc["lat"],
-        center_lon  = loc["lon"],
-        output_name = loc["name"],
-        zoom        = loc.get("zoom", 19),
-        bbox_m      = loc.get("bbox_m", 750),
-    )
-    print(f"Map saved -> {path}")
+# Palette large enough that greedy graph-coloring rarely needs to wrap.
+_BLOCK_PALETTE = [
+    '#e6194b', '#3cb44b', '#4363d8', '#f58231', '#911eb4',
+    '#42d4f4', '#f032e6', '#bfef45', '#fabed4', '#469990',
+    '#dcbeff', '#9A6324', '#800000', '#aaffc3', '#808000',
+    '#000075', '#a9a9a9',
+]
+
+
+def _graph_color_blocks(data: pd.DataFrame) -> dict[str, int]:
+    """Assign a color index to each block ID such that no two adjacent blocks
+    share the same colour (greedy graph colouring).
+
+    Two blocks are adjacent when they appear on left/right of the same edge.
+    """
+    adjacency: dict[str, set[str]] = {}
+    for _, row in data.iterrows():
+        bid = row.get('block_ids')
+        if not isinstance(bid, dict):
+            continue
+        left  = bid.get('left')
+        right = bid.get('right')
+        if left is not None:
+            adjacency.setdefault(left, set())
+        if right is not None:
+            adjacency.setdefault(right, set())
+        if left is not None and right is not None and left != right:
+            adjacency[left].add(right)
+            adjacency[right].add(left)
+
+    # Greedy colouring: process nodes in descending adjacency-count order
+    color_map: dict[str, int] = {}
+    n_colors = len(_BLOCK_PALETTE)
+    for block_id in sorted(adjacency, key=lambda b: len(adjacency[b]), reverse=True):
+        used = {color_map[nb] for nb in adjacency[block_id] if nb in color_map}
+        for c in range(n_colors):
+            if c not in used:
+                color_map[block_id] = c
+                break
+        else:
+            color_map[block_id] = 0  # wrap if palette exhausted
+
+    return color_map
+
+
+def generate_block_map(data: pd.DataFrame, center_lat: float, center_lon: float,
+                       output_name: str, zoom: int = 17, bbox_m: int = 750) -> str:
+    """Build a folium map showing street segments coloured by block assignment,
+    with a block ID label placed at the centroid of each block's total geometry.
+    """
+    from shapely.ops import unary_union
+
+    cx, cy = _to_utm.transform(center_lon, center_lat)
+    bbox   = box(cx - bbox_m, cy - bbox_m, cx + bbox_m, cy + bbox_m)
+    lat_deg = bbox_m / 111320
+    lon_deg = bbox_m / (111320 * math.cos(math.radians(center_lat)))
+
+    def in_bbox(geom):
+        return geom is not None and bbox.intersects(geom)
+
+    # Filter to edges inside bbox
+    visible_rows = []
+    for idx, row in data.iterrows():
+        street_geom = parse_geom(row.get('street_geometry'))
+        if in_bbox(street_geom):
+            visible_rows.append(idx)
+
+    subset    = data.loc[visible_rows]
+    color_map = _graph_color_blocks(subset)
+
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom,
+                   tiles='CartoDB positron')
+
+    fg_blocks     = folium.FeatureGroup(name='Block-coloured streets', show=True)
+    fg_unassigned = folium.FeatureGroup(name='Unassigned streets',     show=True)
+    fg_labels     = folium.FeatureGroup(name='Block ID labels',        show=True)
+    fg_bbox       = folium.FeatureGroup(name=f'{bbox_m} m bbox',       show=True)
+
+    folium.Rectangle(
+        bounds=[
+            [center_lat - lat_deg, center_lon - lon_deg],
+            [center_lat + lat_deg, center_lon + lon_deg],
+        ],
+        color='gray', weight=1.5, fill=False, dash_array='6 4',
+        tooltip=f"{bbox_m} m bounding box"
+    ).add_to(fg_bbox)
+
+    # Draw coloured streets and accumulate geometries per block ID
+    block_geoms: dict[str, list] = {}
+    n_assigned   = 0
+    n_unassigned = 0
+
+    for _, row in subset.iterrows():
+        street_geom = parse_geom(row.get('street_geometry'))
+        if street_geom is None:
+            continue
+        coords = geom_to_latlons(street_geom)
+        if not coords:
+            continue
+
+        bid      = row.get('block_ids')
+        left_id  = bid.get('left')  if isinstance(bid, dict) else None
+        right_id = bid.get('right') if isinstance(bid, dict) else None
+        primary_id = left_id or right_id
+        name = row.get('name', '') or ''
+
+        if primary_id is not None and primary_id in color_map:
+            color  = _BLOCK_PALETTE[color_map[primary_id] % len(_BLOCK_PALETTE)]
+            target = fg_blocks
+            n_assigned += 1
+        else:
+            color  = '#cccccc'
+            target = fg_unassigned
+            n_unassigned += 1
+
+        attrs = [
+            ('Name',         name),
+            ('Highway',      row.get('highway')),
+            ('Block left',   left_id),
+            ('Block right',  right_id),
+            ('Block side L', (row.get('block_sides') or {}).get('left')  if isinstance(row.get('block_sides'), dict) else None),
+            ('Block side R', (row.get('block_sides') or {}).get('right') if isinstance(row.get('block_sides'), dict) else None),
+            ('Bearing',      row.get('normalized_bearing')),
+        ]
+        folium.PolyLine(
+            coords, color=color, weight=4, opacity=0.9,
+            tooltip=f"{name} | L={left_id} R={right_id}",
+            popup=make_popup(f'Street: {name or "(unnamed)"}', attrs),
+        ).add_to(target)
+
+        # Accumulate geometries per block side for centroid labels
+        if isinstance(bid, dict):
+            for side_id in (left_id, right_id):
+                if side_id is not None:
+                    block_geoms.setdefault(str(side_id), []).append(street_geom)
+
+    # Place block ID label at centroid of each block's unioned geometry
+    n_labels = 0
+    for block_id, geoms in block_geoms.items():
+        union    = unary_union(geoms)
+        centroid = union.centroid
+        lat_lon  = _utm_to_latlon(centroid.x, centroid.y)
+        folium.Marker(
+            lat_lon,
+            icon=folium.DivIcon(
+                html=(
+                    f'<div style="'
+                    f'font-size:9px;font-weight:bold;color:#222;'
+                    f'white-space:nowrap;'
+                    f'background:rgba(255,255,255,0.75);'
+                    f'padding:1px 3px;border-radius:2px;'
+                    f'border:1px solid #999;line-height:1.2'
+                    f'">{block_id}</div>'
+                ),
+                icon_size=(80, 18),
+                icon_anchor=(40, 9),
+            ),
+            tooltip=f"Block {block_id}",
+        ).add_to(fg_labels)
+        n_labels += 1
+
+    # Assemble
+    for fg in (fg_bbox, fg_blocks, fg_unassigned, fg_labels):
+        fg.add_to(m)
+
+    folium.Marker(
+        [center_lat, center_lon],
+        popup=output_name,
+        icon=folium.Icon(color='orange', icon='map-marker')
+    ).add_to(m)
+
+    # Legend
+    map_var       = m.get_name()
+    js_blocks     = fg_blocks.get_name()
+    js_unassigned = fg_unassigned.get_name()
+    js_labels     = fg_labels.get_name()
+    js_bbox       = fg_bbox.get_name()
+
+    legend_html = f"""
+<div id="px-legend" style="
+    position:fixed;bottom:30px;left:30px;z-index:9999;
+    background:white;padding:10px 14px;border:2px solid #aaa;
+    border-radius:6px;font-size:13px;font-family:sans-serif;line-height:1.9;">
+  <b style="font-size:14px">Block Map</b><br>
+
+  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+    <input type="checkbox" checked
+           onchange="toggleFG('{js_blocks}', this.checked)">
+    <span style="font-size:18px;line-height:1">&#9644;</span>
+    Block-coloured ({n_assigned})
+  </label>
+
+  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+    <input type="checkbox" checked
+           onchange="toggleFG('{js_unassigned}', this.checked)">
+    <span style="color:#cccccc;font-size:18px;line-height:1">&#9644;</span>
+    Unassigned ({n_unassigned})
+  </label>
+
+  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+    <input type="checkbox" checked
+           onchange="toggleFG('{js_labels}', this.checked)">
+    <span style="font-size:11px;font-weight:bold;border:1px solid #999;padding:0 3px">ID</span>
+    Block ID labels ({n_labels})
+  </label>
+
+  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+    <input type="checkbox" checked
+           onchange="toggleFG('{js_bbox}', this.checked)">
+    <span style="color:gray;font-size:18px;line-height:1">&#9645;</span>
+    {bbox_m} m bbox
+  </label>
+
+</div>
+
+<script>
+function toggleFG(fgName, show) {{
+  var mapObj = window['{map_var}'];
+  if (show) {{
+    if (!mapObj.hasLayer(window[fgName])) mapObj.addLayer(window[fgName]);
+  }} else {{
+    if (mapObj.hasLayer(window[fgName]))  mapObj.removeLayer(window[fgName]);
+  }}
+}}
+</script>
+"""
+
+    m.get_root().html.add_child(folium.Element(legend_html))  # type: ignore[attr-defined]
+    folium.LayerControl(collapsed=False).add_to(m)
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    out_path = os.path.join(OUTPUT_DIR, f"{output_name}.html")
+    m.save(out_path)
+    return out_path
+
+
+BLOCK_MAP_LOCATIONS = [
+    {
+        "name":    "sf_block_map",
+        "lat":     37 + 46/60 + 16.6/3600,
+        "lon":     -(122 + 25/60 + 27.1/3600),
+        "zoom":    17,
+        "bbox_m":  750,
+        "parquet": "Output/San_Francisco_County_California_USA_network.parquet",
+    },
+    {
+        "name":    "alameda_block_map",
+        "lat":     37 + 52/60 + 16.4/3600,
+        "lon":     -(122 + 16/60 + 4.8/3600),
+        "zoom":    17,
+        "bbox_m":  750,
+        "parquet": "Output/Alameda_County_California_USA_network.parquet",
+    },
+]
+
+
+# ── ENTRY POINT ────────────────────────────────────────────────────────────────
+# Group all map jobs by parquet path so each file is loaded exactly once.
+_facility_jobs: list[tuple[str, dict]] = [(loc["parquet"], loc) for loc in LOCATIONS]
+_block_jobs:    list[tuple[str, dict]] = [(loc["parquet"], loc) for loc in BLOCK_MAP_LOCATIONS]
+
+_all_parquets: list[str] = list(dict.fromkeys(
+    p for p, _ in _facility_jobs + _block_jobs
+))
+
+if not _all_parquets:
+    import warnings
+    warnings.warn("No map locations configured — no maps will be generated.", stacklevel=1)
+
+for parquet_path in _all_parquets:
+    data = load_parquet(parquet_path)
+
+    for pq, loc in _facility_jobs:
+        if pq != parquet_path:
+            continue
+        path = generate_map(
+            data        = data,
+            center_lat  = loc["lat"],
+            center_lon  = loc["lon"],
+            output_name = loc["name"],
+            zoom        = loc.get("zoom", 19),
+            bbox_m      = loc.get("bbox_m", 750),
+        )
+        print(f"Map saved -> {path}")
+
+    for pq, loc in _block_jobs:
+        if pq != parquet_path:
+            continue
+        path = generate_block_map(
+            data        = data,
+            center_lat  = loc["lat"],
+            center_lon  = loc["lon"],
+            output_name = loc["name"],
+            zoom        = loc.get("zoom", 17),
+            bbox_m      = loc.get("bbox_m", 750),
+        )
+        print(f"Block map saved -> {path}")
