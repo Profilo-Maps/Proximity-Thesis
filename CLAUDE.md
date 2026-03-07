@@ -9,7 +9,7 @@ You are a senior developer helping me implement this feature of a larger project
 **Pipeline Architecture:** @specs\ProximityPipelineOutline.md
 **Path to Python:**(ParkximityENV) PS C:\Dev\Proximity> & C:\Users\karna\miniconda3\envs\ParkximityENV\python.exe 
 
-s
+
 ## Critical Constraints
 - Do NOT generate new specs or documentation; I provide hand authored specs. Update the readme for new features.
-- Always use Pyright to check new code and maintain strict type safety across all module boundaries.
+- Maintain strict type safety across all module boundaries.
