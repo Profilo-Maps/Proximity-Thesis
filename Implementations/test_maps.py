@@ -35,6 +35,14 @@ LOCATIONS = [
         "parquet": "Output/San_Francisco_County_California_USA_network.parquet",
     },
     {
+        "name":   "sf_outer_sunset",
+        "lat":    37 + 44/60 + 57.9/3600,      # 37°44'57.9"N
+        "lon":    -(122 + 28/60 + 17.0/3600),   # 122°28'17.0"W
+        "zoom":   19,
+        "bbox_m": 750,
+        "parquet": "Output/San_Francisco_County_California_USA_network.parquet",
+    },
+    {
         "name":   "alameda_test_map",
         "lat":    37 + 52/60 + 16.4/3600,      # 37°52'16.4"N
         "lon":    -(122 + 16/60 + 4.8/3600),    # 122°16'04.8"W
@@ -288,6 +296,8 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
     fg_bk_buf    = folium.FeatureGroup(name='Bikeways – buffered',  show=True)
     fg_nodes         = folium.FeatureGroup(name='Intersection Nodes',   show=True)
     fg_curbramps     = folium.FeatureGroup(name='Curb Ramps',           show=True)
+    fg_crosswalks    = folium.FeatureGroup(name='Crosswalks',            show=True)
+    fg_curb_returns  = folium.FeatureGroup(name='Curb Returns',         show=True)
     fg_traffic_calm  = folium.FeatureGroup(name='Traffic Calming',      show=True)
     fg_bbox          = folium.FeatureGroup(name=f'{bbox_m} m bbox',     show=True)
 
@@ -307,6 +317,8 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
         'bikeway_separate': 0,
         'bikeway_buffered': 0,
         'curbramp': 0,
+        'crosswalk': 0,
+        'curb_return': 0,
         'traffic_calming': 0,
         'intersection_node': 0,
     }
@@ -317,6 +329,8 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
         + [_curbramp_col(s, p, i, 'geometry')
            for s in _CURBRAMP_SIDES for p in _CURBRAMP_POSITIONS for i in _CURBRAMP_INDICES]
         + ['street_feature_geometry']
+        + ['crosswalk_start_geometry', 'crosswalk_end_geometry']
+        + ['curb_return_geometry']
     )
 
     def _parse_list_col(v):
@@ -543,6 +557,45 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
                         ).add_to(fg_curbramps)
                         counts['curbramp'] += 1
 
+            # Crosswalks (magenta)
+            for cw_pos in ('start', 'end'):
+                cw_geom = row.get(f'_p_crosswalk_{cw_pos}_geometry')
+                if in_bbox(cw_geom):
+                    cw_coords = geom_to_latlons(cw_geom)
+                    if cw_coords:
+                        cw_type = row.get(f'crosswalk_{cw_pos}_type', '')
+                        cw_attrs = [
+                            ('ID',           row.get(f'crosswalk_{cw_pos}_id')),
+                            ('Position',     cw_pos),
+                            ('Type',         cw_type),
+                            ('Controlled',   row.get(f'crosswalk_{cw_pos}_controlled')),
+                            ('Marked',       row.get(f'crosswalk_{cw_pos}_marked')),
+                            ('Markings',     row.get(f'crosswalk_{cw_pos}_markings')),
+                            ('Signals',      row.get(f'crosswalk_{cw_pos}_signals')),
+                            ('Island',       row.get(f'crosswalk_{cw_pos}_island')),
+                            ('Kerb',         row.get(f'crosswalk_{cw_pos}_kerb')),
+                            ('Tactile',      row.get(f'crosswalk_{cw_pos}_tactile_paving')),
+                            ('Street name',  row.get('name')),
+                        ]
+                        folium.PolyLine(
+                            cw_coords, color='#ff00ff', weight=3, opacity=0.8,
+                            dash_array='5 5',
+                            tooltip=f"Crosswalk ({cw_pos}): {cw_type or '(implicit)'}",
+                            popup=make_popup(f'Crosswalk ({cw_pos})', cw_attrs)
+                        ).add_to(fg_crosswalks)
+                        counts['crosswalk'] += 1
+
+            # Curb Returns (teal)
+            cr_geom = row.get('_p_curb_return_geometry')
+            if in_bbox(cr_geom):
+                cr_coords = geom_to_latlons(cr_geom)
+                if cr_coords:
+                    folium.PolyLine(
+                        cr_coords, color='#008080', weight=2, opacity=0.7,
+                        tooltip=f"Curb return: {row.get('name', '') or '(unnamed)'}",
+                    ).add_to(fg_curb_returns)
+                    counts['curb_return'] += 1
+
             # Traffic Calming (purple) — from street_feature_* columns
             feat_types = row.get('_feat_types')
             mp         = row.get('_p_street_feature_geometry')
@@ -582,7 +635,7 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
 
         # ── Stage 6: assemble + save ──────────────────────────────────────────
         pbar.set_description(f'{output_name} · saving')
-        for fg in (fg_bbox, fg_streets, fg_bk_sep, fg_bk_buf, fg_sw_sep, fg_sw_buf, fg_curbramps, fg_traffic_calm, fg_nodes):
+        for fg in (fg_bbox, fg_streets, fg_bk_sep, fg_bk_buf, fg_sw_sep, fg_sw_buf, fg_curbramps, fg_crosswalks, fg_curb_returns, fg_traffic_calm, fg_nodes):
             fg.add_to(m)
 
         folium.Marker(
@@ -598,6 +651,8 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
         js_bk_sep    = fg_bk_sep.get_name()
         js_bk_buf    = fg_bk_buf.get_name()
         js_curbramps    = fg_curbramps.get_name()
+        js_crosswalks   = fg_crosswalks.get_name()
+        js_curb_returns = fg_curb_returns.get_name()
         js_traffic_calm = fg_traffic_calm.get_name()
         js_nodes        = fg_nodes.get_name()
         js_bbox         = fg_bbox.get_name()
@@ -621,6 +676,20 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
            onchange="toggleFG('{js_curbramps}', this.checked)">
     <span style="color:orange;font-size:18px;line-height:1">&#9679;</span>
     Curb Ramps ({counts['curbramp']})
+  </label>
+
+  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+    <input type="checkbox" id="cb_crosswalks" checked
+           onchange="toggleFG('{js_crosswalks}', this.checked)">
+    <span style="color:#ff00ff;font-size:18px;line-height:1">&#9644;</span>
+    Crosswalks ({counts['crosswalk']})
+  </label>
+
+  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+    <input type="checkbox" id="cb_curb_returns" checked
+           onchange="toggleFG('{js_curb_returns}', this.checked)">
+    <span style="color:#008080;font-size:18px;line-height:1">&#9644;</span>
+    Curb Returns ({counts['curb_return']})
   </label>
 
   <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">

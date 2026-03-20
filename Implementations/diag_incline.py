@@ -114,7 +114,7 @@ if not slopes.empty:
     print(f"  Segments AT or OVER ±{SLOPE_CAP_PCT:.0f}% cap     : {len(over_cap):,}  (should be 0 — cap should null these)")
     if not over_cap.empty:
         print("  WARNING: values at/over cap were NOT nulled correctly!")
-        print(over_cap[["street_id", "street_incline"]].head(10).to_string(index=False))
+        print(over_cap[["street_id", "street_incline"]].head(10).to_string(index=False))  # type: ignore[index,union-attr]
 
 
 # ── 5. Short-segment audit ────────────────────────────────────────────────────
@@ -433,7 +433,7 @@ print(f"  Mean |slope|: {np.abs(_prop_arr).mean():.4f}%  |  Max |slope|: {np.abs
 # but were still given 0.0 — these may be suspicious
 _both_zero_neighbors = (
     (_prop_arr == 0.0) &
-    (np.asarray(seg_lengths[_short_with_slope.index].values, dtype=np.float64) < DEM_RESOLUTION_M)
+    (np.asarray(seg_lengths[_short_with_slope.index], dtype=np.float64) < DEM_RESOLUTION_M)  # type: ignore[arg-type]
 )
 print(f"\n  Short segments with propagated slope=0.0 (neighbor was flat): "
       f"{_both_zero_neighbors.sum():,}")
@@ -441,10 +441,10 @@ print("  (If a short segment is on a hilly block, its neighbors should not be 0.
 print("   a high count here means propagation is absorbing real elevation change.)")
 
 # Sample 5 suspicious ones: short, high |slope| (neighbors were steep)
-_steep_short = _short_with_slope[np.abs(_prop_arr) >= 10.0]
-if not _steep_short.empty:
+_steep_short = _short_with_slope[np.abs(_prop_arr) >= 10.0]  # type: ignore[index]
+if not _steep_short.empty:  # type: ignore[union-attr]
     print(f"\n  Short segments with |propagated slope| ≥ 10% (steep neighbors): {len(_steep_short):,}")
-    print(_steep_short[["street_id", "street_incline", "name"]].head(8).to_string(index=False))
+    print(_steep_short[["street_id", "street_incline", "name"]].head(8).to_string(index=False))  # type: ignore[union-attr]
 else:
     print("\n  No short segments with |propagated slope| ≥ 10%.")
 

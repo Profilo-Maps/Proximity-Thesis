@@ -1,5 +1,6 @@
 import math
 import pickle
+import re
 import numpy as np
 import osmnx as ox
 import geopandas as gpd
@@ -11,6 +12,10 @@ from tqdm import tqdm
 from shapely import STRtree
 from shapely.geometry import LineString, MultiLineString, MultiPoint, Point
 from shapely.geometry.base import BaseGeometry
+
+# Pre-compiled regex for extracting a leading numeric value from OSM tag strings
+# (e.g. "25 mph", "3.5 m", "-3.2%").  Compiled once at import time.
+_NUMERIC_PREFIX_RE = re.compile(r"([+-]?\d+(?:\.\d+)?)")
 
 # --- Global Config ---
 OUTPUT_DIR = Path("Output")
@@ -326,20 +331,31 @@ def compute_grid_assignments(
 
         # --- 4. Grid ID assignment ---
         pbar.set_postfix_str("assigning grid IDs")
+        # Batch-extract centroids for all edges at once, then compute col/row
+        # with vectorized integer arithmetic instead of per-row .at[] access.
+        centroids = edges_reset.geometry.centroid
+        cx_vals = np.asarray(centroids.x, dtype=np.float64)
+        cy_vals = np.asarray(centroids.y, dtype=np.float64)
+        col_arr = np.floor((cx_vals - ox_g) / cell).astype(int)
+        row_arr = np.floor((cy_vals - oy_g) / cell).astype(int)
+        # Sequential counter per cell still needs a small Python loop since
+        # each row's sequence number depends on how many prior rows share its cell.
         cell_seq: dict[tuple[int, int], int] = {}
-        edge_grid_ids: dict[int, str] = {}
-        for idx in edges_reset.index:
-            geom = edges_reset.at[idx, "geometry"]
-            if geom is None:
-                continue
-            # Use centroid (geometric center) instead of interpolate for ~10x speedup
-            mid = cast(BaseGeometry, geom).centroid
-            col = int((mid.x - ox_g) / cell)
-            row = int((mid.y - oy_g) / cell)
-            cell_key = (col, row)
-            seq = cell_seq.get(cell_key, 0)
-            cell_seq[cell_key] = seq + 1
-            edge_grid_ids[idx] = f"{col}_{row}_{seq}"
+        seqs: list[int] = []
+        for c, r in zip(col_arr.tolist(), row_arr.tolist()):
+            key = (c, r)
+            seq = cell_seq.get(key, 0)
+            cell_seq[key] = seq + 1
+            seqs.append(seq)
+        seqs_arr = np.array(seqs, dtype=int)
+        grid_id_strs = (
+            pd.Series(col_arr, index=edges_reset.index).astype(str)
+            + "_"
+            + pd.Series(row_arr, index=edges_reset.index).astype(str)
+            + "_"
+            + pd.Series(seqs_arr, index=edges_reset.index).astype(str)
+        )
+        edge_grid_ids: dict[int, str] = cast(dict[int, str], grid_id_strs.to_dict())
         pbar.update(1)
 
         # --- 5. Intersection detection ---
@@ -349,13 +365,13 @@ def compute_grid_assignments(
             hw_vals = hw if isinstance(hw, list) else [hw]
             return bool(frozenset(str(h) for h in hw_vals) & _NON_ROAD_HIGHWAY)
 
-        node_degree: dict[int, int] = {}
+        node_neighbors: dict[int, set[int]] = {}
         for u, v, data in G.edges(data=True):
             if _is_non_road(data):
                 continue
-            node_degree[u] = node_degree.get(u, 0) + 1
-            node_degree[v] = node_degree.get(v, 0) + 1
-        intersection_node_ids = {nid for nid, deg in node_degree.items() if deg >= 3}
+            node_neighbors.setdefault(u, set()).add(v)
+            node_neighbors.setdefault(v, set()).add(u)
+        intersection_node_ids = {nid for nid, nbrs in node_neighbors.items() if len(nbrs) >= 3}
         pbar.update(1)
 
     print(f"Grid assignments: {len(edge_grid_ids)} segments across "
@@ -383,29 +399,16 @@ def _populate_grid_columns(
     grid_result: GridResult,
 ) -> None:
     """Write grid-derived columns into the schema GeoDataFrame (in-place)."""
-    bearings: list[float | None] = []
-    grid_ids: list[str | None] = []
-    start_inter: list[bool] = []
-    end_inter: list[bool] = []
-
+    idx = edges_reset.index
     intersection_ids = grid_result.intersection_node_ids
 
-    for idx in edges_reset.index:
-        bearings.append(grid_result.edge_bearings.get(idx))
-        grid_ids.append(grid_result.edge_grid_ids.get(idx))
+    populated["street_grid_id"] = pd.Series(grid_result.edge_grid_ids, dtype=object).reindex(idx)
+    populated["normalized_bearing"] = pd.Series(grid_result.edge_bearings, dtype=float).reindex(idx)
 
-        u = cast(int | float, edges_reset.at[idx, "u"])
-        v = cast(int | float, edges_reset.at[idx, "v"])
-        # Synthetic split nodes (negative ints) are never intersections
-        u_int = int(u) if not (isinstance(u, (int, float)) and u < 0) else u
-        v_int = int(v) if not (isinstance(v, (int, float)) and v < 0) else v
-        start_inter.append(u_int in intersection_ids)
-        end_inter.append(v_int in intersection_ids)
-
-    populated["street_grid_id"] = pd.Series(grid_ids, index=edges_reset.index)
-    populated["normalized_bearing"] = pd.Series(bearings, index=edges_reset.index)
-    populated["start_node_is_intersection_node"] = pd.Series(start_inter, index=edges_reset.index)
-    populated["end_node_is_intersection_node"] = pd.Series(end_inter, index=edges_reset.index)
+    # Synthetic split nodes have negative IDs and are never in intersection_ids
+    # (which contains only positive OSM node IDs), so .isin() handles them correctly.
+    populated["start_node_is_intersection_node"] = edges_reset["u"].isin(intersection_ids)
+    populated["end_node_is_intersection_node"] = edges_reset["v"].isin(intersection_ids)
 
 
 def swap_facilities_by_bearing(
@@ -519,8 +522,7 @@ def _parse_maxspeed(val: object) -> int | None:
     if not s:
         return None
     # Strip common unit suffixes: "25 mph", "40 km/h", "30 knots"
-    import re
-    m = re.match(r"([+-]?\d+(?:\.\d+)?)", s)
+    m = _NUMERIC_PREFIX_RE.match(s)
     if m:
         return int(float(m.group(1)))
     return None
@@ -552,8 +554,7 @@ def _parse_float_tag(val: object) -> float | None:
         pass
     s = str(val).strip()
     # Strip unit suffixes like "3.5 m", "12 ft"
-    import re
-    m = re.match(r"([+-]?\d+(?:\.\d+)?)", s)
+    m = _NUMERIC_PREFIX_RE.match(s)
     if m:
         return float(m.group(1))
     return None
@@ -729,13 +730,11 @@ def _query_dem_by_grid(
 def _query_dem_by_native_tile(
     us_pts: list[tuple[float, float]],
 ) -> dict[tuple[float, float], float | None]:
-    """Fetch USGS 3DEP DEM tiles grouped by native tile boundaries.
+    """Fetch USGS 3DEP DEM tiles grouped by 0.1° fixed grid cells (~10 km × ~10 km).
 
-    Probes the 3DEP service with a single small bbox to discover the native
-    tile size and alignment in EPSG:5070, then groups all query points by
-    their native tile and fetches each tile exactly once.  This avoids
-    redundant fetches (many street-grid cells typically fall within the same
-    ~20 km native tile) and keeps peak memory to one tile at a time.
+    Groups all query points into 0.1° × 0.1° cells and fetches one DEM per
+    occupied cell.  A small border buffer is added to each cell bbox so points
+    near cell edges are never clipped by the returned raster.
     """
     import gc
     import math
@@ -747,59 +746,36 @@ def _query_dem_by_native_tile(
     if not us_pts:
         return {}
 
-    to_5070  = Transformer.from_crs("EPSG:4326", "EPSG:5070", always_xy=True)
-    to_wgs84 = Transformer.from_crs("EPSG:5070", "EPSG:4326", always_xy=True)
+    CELL_DEG   = 0.1    # ~10 km per cell side at mid-latitudes
+    BUFFER_DEG = 0.01   # ~1 km border so boundary points aren't clipped
+
+    to_5070 = Transformer.from_crs("EPSG:4326", "EPSG:5070", always_xy=True)
 
     lons = np.array([p[0] for p in us_pts], dtype=np.float64)
     lats = np.array([p[1] for p in us_pts], dtype=np.float64)
     xs_5070, ys_5070 = to_5070.transform(lons, lats)
 
-    # ── Probe: discover native tile dimensions ────────────────────────────────
-    mid_lon = float(np.median(lons))
-    mid_lat = float(np.median(lats))
-    probe_bbox = (mid_lon - 0.001, mid_lat - 0.001,
-                  mid_lon + 0.001, mid_lat + 0.001)
-    try:
-        _probe = py3dep.get_dem(probe_bbox, crs="EPSG:4326", resolution=10)
-        tile_x0 = float(_probe.x.min())
-        tile_y0 = float(_probe.y.min())
-        tile_w  = float(_probe.x.max() - _probe.x.min())
-        tile_h  = float(_probe.y.max() - _probe.y.min())
-        del _probe
-        gc.collect()
-    except Exception as exc:
-        print(f"  Native tile probe failed ({exc}); falling back to single DEM tile")
-        return _query_dem_tile(us_pts)
-
-    # Snap dimensions to nearest 100 m to absorb floating-point jitter
-    tile_w = round(tile_w / 100) * 100
-    tile_h = round(tile_h / 100) * 100
-    print(f"  Topography DEM: {len(us_pts)} endpoints → "
-          f"{tile_w/1000:.1f} km × {tile_h/1000:.1f} km native tiles")
-
-    # ── Group endpoints by their native tile ──────────────────────────────────
+    # ── Group endpoints by 0.1° cell ─────────────────────────────────────────
     tile_to_idxs: dict[tuple[int, int], list[int]] = defaultdict(list)
-    for i, (x5, y5) in enumerate(zip(xs_5070, ys_5070)):
-        col = math.floor((x5 - tile_x0) / tile_w)
-        row = math.floor((y5 - tile_y0) / tile_h)
+    for i, (lon, lat) in enumerate(us_pts):
+        col = math.floor(lon / CELL_DEG)
+        row = math.floor(lat / CELL_DEG)
         tile_to_idxs[(col, row)].append(i)
 
     result: dict[tuple[float, float], float | None] = {}
     n_valid = n_nan = 0
-    n_tiles = len(tile_to_idxs)
+    n_cells = len(tile_to_idxs)
 
-    with tqdm(total=n_tiles, desc="Topography DEM (native tiles)", unit="tile") as pbar:
+    print(f"  Topography DEM: {len(us_pts)} endpoints → {n_cells} × {CELL_DEG}° cells")
+
+    with tqdm(total=n_cells, desc="Topography DEM (grid cells)", unit="cell") as pbar:
         for (tc, tr), idxs in tile_to_idxs.items():
-            # Tile bbox in EPSG:5070 → WGS-84
-            x_lo = tile_x0 + tc * tile_w
-            x_hi = x_lo + tile_w
-            y_lo = tile_y0 + tr * tile_h
-            y_hi = y_lo + tile_h
-            cx = [x_lo, x_hi, x_lo, x_hi]
-            cy = [y_lo, y_lo, y_hi, y_hi]
-            lons_c, lats_c = to_wgs84.transform(cx, cy)
-            bbox_wgs = (float(min(lons_c)), float(min(lats_c)),
-                        float(max(lons_c)), float(max(lats_c)))
+            bbox_wgs = (
+                tc * CELL_DEG - BUFFER_DEG,
+                tr * CELL_DEG - BUFFER_DEG,
+                (tc + 1) * CELL_DEG + BUFFER_DEG,
+                (tr + 1) * CELL_DEG + BUFFER_DEG,
+            )
 
             try:
                 dem = py3dep.get_dem(bbox_wgs, crs="EPSG:4326", resolution=10)
@@ -809,7 +785,7 @@ def _query_dem_by_native_tile(
                     result[us_pts[i]] = None
                     n_nan += 1
                 pbar.update(1)
-                print(f"\n  DEM fetch failed for tile ({tc},{tr}): {exc}")
+                print(f"\n  DEM fetch failed for cell ({tc},{tr}): {exc}")
                 continue
 
             idx_arr = np.array(idxs, dtype=np.intp)
@@ -829,13 +805,13 @@ def _query_dem_by_native_tile(
             pbar.update(1)
 
     print(f"  Topography DEM: {n_valid} elevations sampled ({n_nan} NaN/clipped) "
-          f"across {n_tiles} native tiles")
+          f"across {n_cells} cells")
     return result
 
 
 def _bfs_nearest_slope(
     pos: int,
-    slopes: list[float | None],
+    slopes: "np.ndarray[Any, Any]",
     start_ids: list[Any],
     end_ids: list[Any],
     node_to_positions: dict[Any, list[int]],
@@ -848,7 +824,7 @@ def _bfs_nearest_slope(
     """Dijkstra through the street network from the segment at *pos*.
 
     Returns the slope of the nearest connected segment (by network path
-    distance) that already has a non-None slope, provided the shared node
+    distance) that already has a non-NaN slope, provided the shared node
     is within *max_dist_m* straight-line distance from (cx, cy) — the WGS-84
     centroid of the query segment.  Returns None if no such segment exists.
     """
@@ -878,8 +854,8 @@ def _bfs_nearest_slope(
             if nbr_pos == pos:
                 continue
             slope = slopes[nbr_pos]
-            if slope is not None:
-                return slope
+            if not np.isnan(slope):
+                return float(slope)
             # No slope yet — traverse through this segment to its far node
             seg_len = float(dists[nbr_pos])
             nu, nv = start_ids[nbr_pos], end_ids[nbr_pos]
@@ -916,6 +892,7 @@ def _haversine_m_vectorized(
 
 def enrich_topography(
     populated: gpd.GeoDataFrame,
+    place: str,
 ) -> gpd.GeoDataFrame:
     """Compute street_incline (slope %) for every segment using USGS 3DEP.
 
@@ -969,8 +946,19 @@ def enrich_topography(
 
     print(f"  Topography: {len(populated)} segments → {len(us_pts)} unique US endpoints to query")
 
-    # Fetch elevations grouped by native 3DEP tile for reproducibility
-    elev_map = _query_dem_by_native_tile(us_pts)
+    # Fetch elevations grouped by native 3DEP tile for reproducibility.
+    # Cache the result to disk so re-runs skip the 3DEP API entirely.
+    place_slug = place.replace(", ", "_").replace(" ", "_")
+    elev_cache_path = CACHE_DIR / f"{place_slug}_elevation.pkl"
+    if elev_cache_path.exists():
+        with open(elev_cache_path, "rb") as _f:
+            elev_map: dict[tuple[float, float], float | None] = pickle.load(_f)
+        print(f"  Topography: loaded elevation cache ({len(elev_map)} points) from {elev_cache_path}")
+    else:
+        elev_map = _query_dem_by_native_tile(us_pts)
+        with open(elev_cache_path, "wb") as _f:
+            pickle.dump(elev_map, _f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"  Topography: elevation cache saved to {elev_cache_path}")
 
     # Vectorized slope computation
     elev_start = np.array([elev_map.get(p) for p in start_lonlat], dtype=np.float64)
@@ -989,19 +977,14 @@ def enrich_topography(
     )
     raw_slopes = np.round(raw_slopes, 4)
 
-    slopes: list[float | None] = [
-        float(raw_slopes[i]) if valid_mask[i] else None
-        for i in range(len(raw_slopes))
-    ]
+    # Keep slopes as a numpy float64 array; NaN represents "no slope yet".
+    slopes_arr = np.where(valid_mask, raw_slopes, np.nan)
 
     # Propagate slopes to short segments (<DEM_RESOLUTION_M) via Dijkstra BFS
     # through the street network.  Accepts the nearest connected segment (by
     # network path distance) within MAX_PROP_DIST_M straight-line radius that
-    # already has a non-None slope.
-    too_short_positions = [
-        i for i in range(len(slopes))
-        if slopes[i] is None and has_both_elev[i]
-    ]
+    # already has a non-NaN slope.
+    too_short_positions = np.flatnonzero(np.isnan(slopes_arr) & has_both_elev).tolist()
     n_propagated = 0
     if too_short_positions and "start_node_id" in populated.columns and "end_node_id" in populated.columns:
         start_ids = populated["start_node_id"].tolist()
@@ -1025,25 +1008,24 @@ def enrich_topography(
             cx = (start_lonlat[pos][0] + end_lonlat[pos][0]) / 2.0
             cy = (start_lonlat[pos][1] + end_lonlat[pos][1]) / 2.0
             slope = _bfs_nearest_slope(
-                pos, slopes, start_ids, end_ids,
+                pos, slopes_arr, start_ids, end_ids,
                 node_to_positions, node_to_lonlat,
                 cx, cy, dists, MAX_PROP_DIST_M,
             )
             if slope is not None:
-                slopes[pos] = slope
+                slopes_arr[pos] = slope
                 n_propagated += 1
 
     # Apply hard cap: slopes beyond ±SLOPE_CAP_PCT are DEM artifacts; null them
     # so they remain flagged for crowdsourced correction.
-    n_capped = 0
-    for i, s in enumerate(slopes):
-        if s is not None and abs(s) > SLOPE_CAP_PCT:
-            slopes[i] = None
-            n_capped += 1
+    finite_mask = ~np.isnan(slopes_arr)
+    cap_mask = finite_mask & (np.abs(slopes_arr) > SLOPE_CAP_PCT)
+    n_capped = int(cap_mask.sum())
+    slopes_arr[cap_mask] = np.nan
 
-    populated["street_incline"] = slopes
+    populated["street_incline"] = slopes_arr
 
-    n_ok = sum(1 for s in slopes if s is not None)
+    n_ok = int(finite_mask.sum()) - n_capped
     n_missing_elev = int((~has_both_elev).sum())
     n_too_short_total = len(too_short_positions)
     n_too_short_unfilled = n_too_short_total - n_propagated
@@ -1054,12 +1036,12 @@ def enrich_topography(
           f"{n_propagated} filled from neighbors, {n_too_short_unfilled} unfilled | "
           f"{n_capped} nulled (|slope| > {SLOPE_CAP_PCT:.0f}%)")
 
-    valid_slopes = [s for s in slopes if s is not None]
-    if valid_slopes:
-        arr = np.array(valid_slopes)
-        print(f"  Topography slopes: min={arr.min():.2f}% max={arr.max():.2f}% "
-              f"mean={arr.mean():.2f}% median={float(np.median(arr)):.2f}% "
-              f"| uphill={int((arr > 0).sum())} downhill={int((arr < 0).sum())} flat={int((arr == 0).sum())}")
+    valid_slopes_arr = slopes_arr[~np.isnan(slopes_arr)]
+    if len(valid_slopes_arr) > 0:
+        print(f"  Topography slopes: min={valid_slopes_arr.min():.2f}% max={valid_slopes_arr.max():.2f}% "
+              f"mean={valid_slopes_arr.mean():.2f}% median={float(np.median(valid_slopes_arr)):.2f}% "
+              f"| uphill={int((valid_slopes_arr > 0).sum())} downhill={int((valid_slopes_arr < 0).sum())} "
+              f"flat={int((valid_slopes_arr == 0).sum())}")
 
     return populated
 
@@ -1337,7 +1319,7 @@ def populate_schema(place: str, *, default_lane_width_m: float = 3.5, default_ma
 
     # --- Topography enrichment (pipeline step 5) ---
     if ENRICH_TOPOGRAPHY:
-        populated = enrich_topography(populated)
+        populated = enrich_topography(populated, place)
 
     populated = populate_base_bikelanes(populated, edges_reset)
     populated = populate_base_footlanes(populated, edges_reset)
@@ -1346,6 +1328,7 @@ def populate_schema(place: str, *, default_lane_width_m: float = 3.5, default_ma
     populated = swap_facilities_by_bearing(populated, edges_reset)
     populated = _populate_separate_facilities(populated, edges_reset, default_lane_width_m)
     populated = _assign_facility_grid_ids(populated)
+    populated = _assign_curb_ramp_geometries(populated)
     # --- Export ---
     # Geometry columns other than the active one must be serialized to WKB so
     # they round-trip correctly through parquet (GeoParquet only encodes the
@@ -1412,7 +1395,7 @@ def populate_schema(place: str, *, default_lane_width_m: float = 3.5, default_ma
             if len(non_null) == 0:
                 continue
             # Vectorized type check: if all non-null values are str, no action needed
-            has_non_str = not all(isinstance(x, str) for x in non_null)
+            has_non_str = not non_null.apply(isinstance, args=(str,)).all()
             if has_non_str:
                 mask_na = populated[col].isna()
                 populated[col] = populated[col].astype(str)
@@ -2045,17 +2028,23 @@ def _populate_separate_facilities(
         bcol = f"sidewalk_{sw_side}_buffered"
         if gcol not in populated.columns:
             continue
-        for idx in populated.index:
-            g = populated.at[idx, gcol]
-            if g is None or not hasattr(g, "geom_type"):
-                continue
-            bval = populated.at[idx, bcol] if bcol in populated.columns else None  # type: ignore[index]
-            if bval is True or str(bval).lower() == "yes":
-                continue
-            bearing = _linestring_bearing(cast(BaseGeometry, g))
+        geom_series = populated[gcol]
+
+        # Vectorized pre-filter: rows that have real geometry and are not buffered
+        has_geom = geom_series.apply(lambda g: g is not None and hasattr(g, "geom_type"))
+        if bcol in populated.columns:
+            bvals = populated[bcol]
+            is_buffered = bvals.eq(True) | bvals.astype(str).str.lower().eq("yes")
+        else:
+            is_buffered = pd.Series(False, index=populated.index)
+        valid_idx = populated.index[has_geom & ~is_buffered]
+
+        for idx in valid_idx:
+            g = cast(BaseGeometry, geom_series.at[idx])
+            bearing = _linestring_bearing(g)
             if bearing is None:
                 continue
-            all_sep_sw_geoms.append(cast(BaseGeometry, g))
+            all_sep_sw_geoms.append(g)
             all_sep_sw_bearings.append(bearing)
             all_sep_sw_row_indices.append(idx)
 
@@ -2523,6 +2512,47 @@ def _is_na(val) -> bool:
         return False
 
 
+def _assign_curb_ramp_geometries(populated: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Place a curb ramp point at each sidewalk endpoint that touches an intersection node.
+
+    For every street segment whose start or end node is an intersection node,
+    take the corresponding endpoint of the left/right sidewalk LineString and
+    write it as a Point into the _curbramp_{start|end}_1_geometry slot.
+    Slots 2 and 3 are reserved for crowdsourced / government data.
+    """
+    def _endpoint(geom: BaseGeometry | None, which: str) -> Point | None:
+        if not isinstance(geom, BaseGeometry) or geom.is_empty:
+            return None
+        coords = _flatten_coords(geom)
+        if not coords:
+            return None
+        return Point(coords[0] if which == "start" else coords[-1])
+
+    n_assigned = 0
+    for side in ("left", "right"):
+        geom_col = f"sidewalk_{side}_geometry"
+        if geom_col not in populated.columns:
+            continue
+        for position, node_flag in (
+            ("start", "start_node_is_intersection_node"),
+            ("end",   "end_node_is_intersection_node"),
+        ):
+            ramp_col = f"sidewalk_{side}_curbramp_{position}_1_geometry"
+            if ramp_col not in populated.columns or node_flag not in populated.columns:
+                continue
+            mask = populated[node_flag] == True  # noqa: E712
+            sub = populated.loc[mask, geom_col]
+            populated.loc[mask, ramp_col] = pd.Series(
+                [_endpoint(cast(BaseGeometry | None, g), position) for g in sub],
+                index=sub.index,
+                dtype=object,
+            )
+            n_assigned += int(populated[ramp_col].notna().sum())
+
+    print(f"Curb ramp geometries assigned: {n_assigned} ramps")
+    return populated
+
+
 def _assign_facility_grid_ids(populated: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """Assign grid IDs and sequential IDs to sidewalk and bikeway slots.
 
@@ -2546,12 +2576,14 @@ def _assign_facility_grid_ids(populated: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     sgid = populated["street_grid_id"] if "street_grid_id" in populated.columns else None
 
     def _absent_mask(col: str) -> "pd.Series[bool]":
-        """True where the column value is a known-absent value."""
+        """True where the column value is a known-absent value ('no'/'none').
+        NaN/None values are NOT absent (they are eligible/unknown)."""
         if col not in populated.columns:
             return pd.Series(True, index=populated.index)
-        return populated[col].apply(
-            lambda v: False if _is_na(v) else str(v).strip().lower() in _ABSENT
-        )
+        s = populated[col]
+        na_mask = s.isna()
+        # NaN rows → False (not absent); only 'no'/'none' strings → True
+        return (~na_mask) & s.astype(str).str.strip().str.lower().isin(_ABSENT)
 
     def _write_ids(id_col: str, grid_id_col: str | None, suffix: str,
                    eligible_mask: "pd.Series[bool]") -> None:

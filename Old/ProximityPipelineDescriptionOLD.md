@@ -210,7 +210,7 @@ For each corner at the intersection node, resolve all facility geometry in one p
 **Government curb ramp integration**
 
 *Curbramps*
-Curb ramp slots refer to the curb ramp data columns in the parquet that are associated with the start and end of a sidewalk segment. Curb Ramp Slot b in the diagram below would be the right side end ramp on STR1.
+Curb ramp slots refer to the curb ramp data columns in the parquet that are associated with the start and end of a sidewalk segment. Curb Ramp Slot b in the diagram below would be the right side end ramp on STR1. It should be joined by crosswalk to Slot a. 
 
                 | [STR1]|
                 | (End) |
