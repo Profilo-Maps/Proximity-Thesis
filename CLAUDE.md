@@ -26,3 +26,6 @@ uv remove: Remove a dependency from the project.
 uv sync: Sync the project's dependencies with the environment.
 uv lock: Create a lockfile for the project's dependencies.
 uv run: Run a command in the project environment.
+
+## Correction History Protocol
+After sucessfully implementing a feature (or set of features) for the data pipeline, prompt me and then save it with annotations about what problem it solves and what data schema it operates on in the notesforrobot folder. Every time you fix a bug in your topology correction model, document the error and the solution in the same folder in a markdown file.
