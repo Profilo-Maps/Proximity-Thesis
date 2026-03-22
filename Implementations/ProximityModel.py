@@ -1,16 +1,20 @@
 import math
 import pickle
 import re
+import time
 from collections import defaultdict
+from contextlib import contextmanager
 import numpy as np
 import osmnx as ox
 import geopandas as gpd
 import pandas as pd
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Generator, cast
 from tqdm import tqdm
+import shapely
 from shapely import STRtree
+from shapely.ops import nearest_points
 from shapely.geometry import LineString, MultiLineString, MultiPoint, MultiPolygon, Point
 from shapely.geometry.base import BaseGeometry
 from shapely.geometry.collection import GeometryCollection
@@ -18,6 +22,37 @@ from shapely.geometry.collection import GeometryCollection
 # Pre-compiled regex for extracting a leading numeric value from OSM tag strings
 # (e.g. "25 mph", "3.5 m", "-3.2%").  Compiled once at import time.
 _NUMERIC_PREFIX_RE = re.compile(r"([+-]?\d+(?:\.\d+)?)")
+
+# --- Performance Tracking ---
+_SLOW_STEP_THRESHOLD_S = 300.0  # 5 minutes
+
+_slow_steps: list[tuple[str, float]] = []
+
+
+@contextmanager
+def _track_step(label: str) -> Generator[None, None, None]:
+    """Time a pipeline step; log and record it if it exceeds the threshold."""
+    t0 = time.perf_counter()
+    yield
+    elapsed = time.perf_counter() - t0
+    if elapsed >= _SLOW_STEP_THRESHOLD_S:
+        mins = elapsed / 60.0
+        print(f"  ⏱ SLOW STEP [{mins:.1f} min]: {label}")
+        _slow_steps.append((label, elapsed))
+
+
+def _print_slow_step_summary() -> None:
+    """Print a summary of all slow steps at the end of a pipeline run."""
+    if not _slow_steps:
+        print("Performance: no steps exceeded 5 min.")
+        return
+    print(f"\n{'='*60}")
+    print(f"SLOW STEPS (>{_SLOW_STEP_THRESHOLD_S / 60:.0f} min threshold):")
+    print(f"{'='*60}")
+    for label, elapsed in sorted(_slow_steps, key=lambda x: -x[1]):
+        print(f"  {elapsed / 60:.1f} min — {label}")
+    print(f"{'='*60}\n")
+
 
 # --- Global Config ---
 OUTPUT_DIR = Path("Output")
@@ -126,9 +161,8 @@ def _find_deflection_split_points(
     if not np.any(valid):
         return []
 
-    dot = np.where(valid,
-                   np.sum(incoming * outgoing, axis=1) / (incoming_len * outgoing_len),
-                   1.0)
+    normalized = np.sum(incoming * outgoing, axis=1) / (incoming_len * outgoing_len)
+    dot = np.where(valid, normalized, 1.0)
     dot = np.clip(dot, -1.0, 1.0)
     deflections = np.arccos(dot)
 
@@ -154,6 +188,10 @@ def split_deflected_segments(
     rows_to_drop: list[int] = []
     new_rows: list[dict[str, Any]] = []
 
+    # Pre-extract column arrays to avoid expensive .loc[].to_dict() per row
+    _sds_cols = edges_reset.columns.tolist()
+    _sds_arrays = {c: edges_reset[c].values for c in _sds_cols}
+
     for idx in edges_reset.index:
         geom = edges_reset.at[idx, "geometry"]
         if geom is None:
@@ -166,7 +204,7 @@ def split_deflected_segments(
         if not split_indices:
             continue
 
-        row_data = edges_reset.loc[idx].to_dict()
+        row_data = {c: _sds_arrays[c][idx] for c in _sds_cols}
         original_u = row_data.get("u")
         original_v = row_data.get("v")
 
@@ -241,15 +279,10 @@ def compute_grid_assignments(
                          n_cols=n_cols, n_rows=n_rows)
         pbar.update(1)
 
-        # --- 2. Raw bearings ---
-        raw_bearings: dict[int, float] = {}
+        # --- 2. Raw bearings (vectorized via .apply) ---
         pbar.set_postfix_str("computing raw bearings")
-        for idx in edges_reset.index:
-            geom = edges_reset.at[idx, "geometry"]
-            if geom is not None:
-                b = _linestring_bearing(cast(BaseGeometry, geom))
-                if b is not None:
-                    raw_bearings[idx] = b
+        _raw_bear_series = _linestring_bearings_vectorized(edges_reset["geometry"])
+        raw_bearings: dict[int, float] = cast(dict[int, float], _raw_bear_series.dropna().to_dict())
         pbar.update(1)
 
         # --- 3. Bearing normalization ---
@@ -261,17 +294,13 @@ def compute_grid_assignments(
 
         edge_bearings: dict[int, float] = {}
 
-        # One-way segments: use direction of travel
-        for idx in edges_reset.index:
-            if idx not in raw_bearings:
-                continue
-            ow = oneway_col.at[idx]
-            if ow in (True, "yes", "1", 1):
-                # Forward one-way: raw bearing is direction of travel
-                edge_bearings[idx] = raw_bearings[idx]
-            elif ow in ("-1", "reverse"):
-                # Reverse one-way: flip by 180°
-                edge_bearings[idx] = (raw_bearings[idx] + 180.0) % 360
+        # One-way segments: use direction of travel (vectorized)
+        raw_bear_s = pd.Series(raw_bearings, dtype=np.float64)
+        ow_at_raw = oneway_col.reindex(raw_bear_s.index)
+        fwd_mask = ow_at_raw.isin([True, "yes", "1", 1])
+        rev_mask = ow_at_raw.isin(["-1", "reverse"])
+        edge_bearings.update(cast(dict[int, float], raw_bear_s[fwd_mask].to_dict()))
+        edge_bearings.update(cast(dict[int, float], ((raw_bear_s[rev_mask] + 180.0) % 360).to_dict()))
 
         # Two-way segments: Strategy C — majority vote by name
         name_col = edges_reset["name"] if "name" in edges_reset.columns else pd.Series(
@@ -294,20 +323,18 @@ def compute_grid_assignments(
                     continue
             unnamed_indices.append(idx)
 
-        # Majority vote per named group
+        # Majority vote per named group (vectorized per group)
         for name, indices in name_groups.items():
-            north_count = sum(1 for i in indices if raw_bearings[i] < 180.0)
-            south_count = len(indices) - north_count
-            if north_count >= south_count:
+            bearings_arr = np.array([raw_bearings[i] for i in indices], dtype=np.float64)
+            north_count = int((bearings_arr < 180.0).sum())
+            if north_count >= len(indices) - north_count:
                 # Majority is [0, 180): flip any in [180, 360)
-                for i in indices:
-                    b = raw_bearings[i]
-                    edge_bearings[i] = (b + 180.0) % 360 if b >= 180.0 else b
+                flipped = np.where(bearings_arr >= 180.0, (bearings_arr + 180.0) % 360, bearings_arr)
             else:
                 # Majority is [180, 360): flip any in [0, 180)
-                for i in indices:
-                    b = raw_bearings[i]
-                    edge_bearings[i] = (b + 180.0) % 360 if b < 180.0 else b
+                flipped = np.where(bearings_arr < 180.0, (bearings_arr + 180.0) % 360, bearings_arr)
+            for i, b in zip(indices, flipped):
+                edge_bearings[i] = float(b)
 
         # Unnamed / unassigned: infer from adjacent named segments, then northward fallback
         # Build node → [edge_index, …] lookup so we can find neighbors efficiently
@@ -379,8 +406,8 @@ def compute_grid_assignments(
     print(f"Grid assignments: {len(edge_grid_ids)} segments across "
           f"{len(cell_seq)} grid cells ({n_cols}×{n_rows} @ {cell:.0f}m) "
           f"| {len(intersection_node_ids)} intersection nodes")
-    n_oneway = sum(1 for idx in edges_reset.index
-                   if idx in edge_bearings and oneway_col.at[idx] in (True, "yes", "1", 1, "-1", "reverse"))
+    _eb_index = pd.Index(edge_bearings.keys())
+    n_oneway = int(oneway_col.reindex(_eb_index).isin([True, "yes", "1", 1, "-1", "reverse"]).sum())
     n_named = sum(len(v) for v in name_groups.values())
     n_inferred = len(unnamed_indices) - len(northward_fallback_indices)
     print(f"  Bearings: {n_oneway} one-way, {n_named} named two-way (majority vote), "
@@ -441,9 +468,7 @@ def swap_facilities_by_bearing(
 
     # Compute bearings as numeric Series
     norm_bear = pd.to_numeric(populated["normalized_bearing"], errors="coerce")
-    raw_bear = pd.to_numeric(
-        edges_reset["geometry"].apply(_linestring_bearing), errors="coerce"
-    )
+    raw_bear = _linestring_bearings_vectorized(edges_reset["geometry"])
 
     both_valid = norm_bear.notna() & raw_bear.notna()
     diff = (norm_bear - raw_bear).abs() % 360
@@ -562,6 +587,42 @@ def _parse_float_tag(val: object) -> float | None:
     return None
 
 
+# --- Vectorized parse helpers (replace per-row .apply() calls) ---
+
+def _parse_maxspeed_series(s: Any) -> pd.Series:  # type: ignore[type-arg]
+    """Vectorized _parse_maxspeed: extract leading integer from OSM maxspeed strings."""
+    ser = pd.Series(s) if not isinstance(s, pd.Series) else s
+    str_vals = ser.astype(str).str.strip()
+    extracted = str_vals.str.extract(r'([+-]?\d+(?:\.\d+)?)', expand=False)
+    numeric = pd.to_numeric(extracted, errors='coerce')
+    # Floor toward zero to match int(float(x)) behavior; wrap for Pylance
+    return pd.Series(np.trunc(numeric.values), index=numeric.index).astype('Int64')
+
+
+def _parse_int_tag_series(s: Any) -> pd.Series:  # type: ignore[type-arg]
+    """Vectorized _parse_int_tag: convert OSM tag values to nullable int."""
+    ser = pd.Series(s) if not isinstance(s, pd.Series) else s
+    numeric = pd.to_numeric(ser, errors='coerce')
+    return pd.Series(np.trunc(numeric.values), index=numeric.index).astype('Int64')
+
+
+def _parse_float_tag_series(s: Any) -> pd.Series:  # type: ignore[type-arg]
+    """Vectorized _parse_float_tag: extract leading float from OSM tag strings."""
+    ser = pd.Series(s) if not isinstance(s, pd.Series) else s
+    str_vals = ser.astype(str).str.strip()
+    extracted = str_vals.str.extract(r'([+-]?\d+(?:\.\d+)?)', expand=False)
+    return pd.to_numeric(extracted, errors='coerce')
+
+
+def _parse_incline_series(s: Any) -> pd.Series:  # type: ignore[type-arg]
+    """Vectorized _parse_incline: convert OSM incline strings to float %."""
+    ser = pd.Series(s) if not isinstance(s, pd.Series) else s
+    str_vals = ser.astype(str).str.strip().str.lower()
+    str_vals = str_vals.str.replace('°', '', regex=False).str.replace('%', '', regex=False).str.strip()
+    str_vals = str_vals.where(~str_vals.isin(('up', 'down')))
+    return pd.to_numeric(str_vals, errors='coerce').round(4)
+
+
 # Bounding box for contiguous US (USGS 3DEP coverage)
 _US_BBOX = {"minx": -125.0, "miny": 24.0, "maxx": -66.9, "maxy": 49.4}
 
@@ -623,9 +684,12 @@ def _query_dem_tile(
             sampled[start:end] = dem.interp(x=xs, y=ys, method="nearest").values
             pbar.update(end - start)
 
-    result: dict[tuple[float, float], float | None] = {}
-    for pt, val in zip(us_pts, sampled):
-        result[pt] = None if (np.isnan(val) or float(val) < -1000) else round(float(val), 3)
+    _invalid = np.isnan(sampled) | (sampled < -1000)
+    _rounded = np.round(sampled, 3)
+    result: dict[tuple[float, float], float | None] = {
+        pt: (None if inv else float(v))
+        for pt, v, inv in zip(us_pts, _rounded, _invalid)
+    }
 
     valid_elevs = [v for v in result.values() if v is not None]
     n_missing = len(result) - len(valid_elevs)
@@ -655,7 +719,6 @@ def _query_dem_by_grid(
     import gc
     import py3dep
     import xarray as xr
-    from collections import defaultdict
     from pyproj import Transformer
 
     if not us_pts:
@@ -713,12 +776,14 @@ def _query_dem_by_grid(
             sampled = dem.interp(x=xs_da, y=ys_da, method="nearest").values
             del dem, xs_da, ys_da
 
-            for pt, val in zip(pts, sampled):
-                if np.isnan(val) or float(val) < -1000:
+            _inv_mask = np.isnan(sampled) | (sampled < -1000)
+            _rnd_vals = np.round(sampled, 3)
+            for pt, val, inv in zip(pts, _rnd_vals, _inv_mask):
+                if inv:
                     result[pt] = None
                     n_nan += 1
                 else:
-                    result[pt] = round(float(val), 3)
+                    result[pt] = float(val)
                     n_valid += 1
             pbar.update(1)
             if n_valid % 10_000 < len(pts):
@@ -739,10 +804,8 @@ def _query_dem_by_native_tile(
     near cell edges are never clipped by the returned raster.
     """
     import gc
-    import math
     import py3dep
     import xarray as xr
-    from collections import defaultdict
     from pyproj import Transformer
 
     if not us_pts:
@@ -797,12 +860,14 @@ def _query_dem_by_native_tile(
             del dem, xs_da, ys_da
             gc.collect()
 
-            for i, val in zip(idxs, vals):
-                if np.isnan(val) or float(val) < -1000:
+            _inv_mask = np.isnan(vals) | (vals < -1000)
+            _rnd_vals = np.round(vals, 3)
+            for i, val, inv in zip(idxs, _rnd_vals, _inv_mask):
+                if inv:
                     result[us_pts[i]] = None
                     n_nan += 1
                 else:
-                    result[us_pts[i]] = round(float(val), 3)
+                    result[us_pts[i]] = float(val)
                     n_valid += 1
             pbar.update(1)
 
@@ -1097,14 +1162,15 @@ def _find_coincident_segment(
 
     best_idx: int | None = None
     best_dist = float("inf")
+    tc_x, tc_y = tc_point.x, tc_point.y
     for idx in candidate_idxs:
         geom: BaseGeometry = edges_reset.geometry.iloc[idx]  # type: ignore[assignment]
-        for coord in geom.coords:
-            vertex = Point(coord)
-            d = tc_point.distance(vertex)
-            if d <= _TC_COINCIDENCE_THRESHOLD_M and d < best_dist:
-                best_dist = d
-                best_idx = idx
+        coords_arr = np.array(list(geom.coords), dtype=np.float64)
+        dists = np.sqrt((coords_arr[:, 0] - tc_x) ** 2 + (coords_arr[:, 1] - tc_y) ** 2)
+        min_d = float(dists.min())
+        if min_d <= _TC_COINCIDENCE_THRESHOLD_M and min_d < best_dist:
+            best_dist = min_d
+            best_idx = idx
     return best_idx
 
 
@@ -1141,17 +1207,23 @@ def populate_street_features(
     _SKIP_COLS = frozenset({"geometry", "osmid", "element_type"})
 
     matched = 0
-    for _, row in tqdm(tc_gdf.iterrows(), total=len(tc_gdf),
-                       desc="Matching traffic calming", unit="node"):
-        pt: Point = row.geometry  # type: ignore[assignment]
-        tc_type: str = str(row["traffic_calming"])
+    # Use pre-extracted arrays instead of iterrows() for speed
+    _tc_geoms = tc_gdf.geometry.values
+    _tc_types = tc_gdf["traffic_calming"].values
+    _tc_attr_cols = [c for c in tc_gdf.columns if c not in _SKIP_COLS]
+    _tc_col_arrays = {c: tc_gdf[c].values for c in _tc_attr_cols}
+
+    for _tc_pos in tqdm(range(len(tc_gdf)), total=len(tc_gdf),
+                        desc="Matching traffic calming", unit="node"):
+        pt: Point = _tc_geoms[_tc_pos]  # type: ignore[assignment]
+        tc_type: str = str(_tc_types[_tc_pos])
         seg_idx = _find_coincident_segment(pt, edges_reset, edge_sindex)
         if seg_idx is None:
             continue
         matched += 1
         attrs: dict[str, Any] = {
-            str(k): v for k, v in row.items()
-            if k not in _SKIP_COLS and pd.notna(v)
+            c: _tc_col_arrays[c][_tc_pos] for c in _tc_attr_cols
+            if pd.notna(_tc_col_arrays[c][_tc_pos])
         }
         seg_features.setdefault(seg_idx, []).append(
             (f"traffic_calming:{tc_type}", pt, attrs)
@@ -1255,11 +1327,16 @@ def populate_schema(place: str, *, default_lane_width_m: float = 3.5, default_ma
 
     print(f"Nodes: {len(nodes)}, Edges: {len(edges)}")
 
+    _slow_steps.clear()
+    pipeline_t0 = time.perf_counter()
+
     # --- Vertex deflection splitting ---
-    edges_reset = split_deflected_segments(edges_reset)
+    with _track_step("split_deflected_segments"):
+        edges_reset = split_deflected_segments(edges_reset)
 
     # --- Grid assignments (bearings, grid IDs, intersection nodes) ---
-    grid_result = compute_grid_assignments(edges_reset, nodes, G)
+    with _track_step("compute_grid_assignments"):
+        grid_result = compute_grid_assignments(edges_reset, nodes, G)
 
     # --- Map OSM edge/node data into schema columns ---
     schema = _create_schema_dataframe()
@@ -1274,10 +1351,14 @@ def populate_schema(place: str, *, default_lane_width_m: float = 3.5, default_ma
                 result = result.where(result.notna(), edges_reset[col])
         return result
 
-    init_data: dict[str, Any] = {col: pd.NA for col in schema.columns}
-    init_data["street_geometry"] = edges_reset["geometry"].values
+    # Build the GeoDataFrame with only the geometry column to avoid a huge
+    # up-front allocation (225 object columns × 600k+ rows triggers an OOM
+    # during pandas block consolidation).  Missing schema columns are added
+    # lazily as each pipeline step writes to them, and any still-absent
+    # columns are back-filled with pd.NA before export.
+    schema_columns = list(schema.columns)
     populated = gpd.GeoDataFrame(
-        init_data,
+        {"street_geometry": edges_reset["geometry"].values},
         index=edges_reset.index,
         geometry="street_geometry",
         crs="EPSG:32610",
@@ -1291,18 +1372,24 @@ def populate_schema(place: str, *, default_lane_width_m: float = 3.5, default_ma
     # OSM tags that map directly (string tags)
     for tag in ("name", "highway", "oneway", "surface"):
         populated[tag] = _get(tag)
-    # Numeric tags: parse to typed columns
+    # Numeric tags: parse to typed columns (create with NA if OSM tag absent)
     raw_maxspeed = _get("maxspeed")
     if raw_maxspeed is not None:
-        populated["maxspeed"] = raw_maxspeed.apply(_parse_maxspeed)
+        populated["maxspeed"] = _parse_maxspeed_series(raw_maxspeed)
+    else:
+        populated["maxspeed"] = pd.array([pd.NA] * len(populated), dtype="Int64")
     populated["maxspeed"] = populated["maxspeed"].fillna(default_maxspeed).astype("Int64")
     raw_lanes = _get("lanes")
     if raw_lanes is not None:
-        populated["lanes"] = raw_lanes.apply(_parse_int_tag)
+        populated["lanes"] = _parse_int_tag_series(raw_lanes)
+    else:
+        populated["lanes"] = pd.array([pd.NA] * len(populated), dtype="Int64")
     populated["lanes"] = populated["lanes"].astype("Int64")
     raw_lane_width = _get("lane_width")
     if raw_lane_width is not None:
-        populated["lane_width"] = raw_lane_width.apply(_parse_float_tag)
+        populated["lane_width"] = _parse_float_tag_series(raw_lane_width)
+    else:
+        populated["lane_width"] = pd.array([pd.NA] * len(populated), dtype="Float64")
     populated["lane_width"] = populated["lane_width"].astype("Float64")
 
     # Main street geometry (the edge LineString)
@@ -1317,21 +1404,39 @@ def populate_schema(place: str, *, default_lane_width_m: float = 3.5, default_ma
     _populate_grid_columns(populated, edges_reset, grid_result)
 
     # --- Street centerline features (pipeline step 3) ---
-    populated = populate_street_features(populated, edges_reset, place)
+    with _track_step("populate_street_features"):
+        populated = populate_street_features(populated, edges_reset, place)
 
     # --- Topography enrichment (pipeline step 5) ---
     if ENRICH_TOPOGRAPHY:
-        populated = enrich_topography(populated, place)
+        with _track_step("enrich_topography"):
+            populated = enrich_topography(populated, place)
 
-    populated = populate_base_bikelanes(populated, edges_reset)
-    populated = populate_base_footlanes(populated, edges_reset)
+    with _track_step("populate_base_bikelanes"):
+        populated = populate_base_bikelanes(populated, edges_reset)
+    with _track_step("populate_base_footlanes"):
+        populated = populate_base_footlanes(populated, edges_reset)
     # Swap left/right facility columns on edges with reversed geometry (deferred
     # until after tag population so all sidewalk/bikeway columns exist)
-    populated = swap_facilities_by_bearing(populated, edges_reset)
-    populated = _populate_separate_facilities(populated, edges_reset, default_lane_width_m)
-    populated = _assign_facility_grid_ids(populated)
-    populated = _assign_curb_ramp_geometries(populated, default_lane_width_m)
+    with _track_step("swap_facilities_by_bearing"):
+        populated = swap_facilities_by_bearing(populated, edges_reset)
+    with _track_step("_populate_separate_facilities"):
+        populated = _populate_separate_facilities(populated, edges_reset, default_lane_width_m)
+    with _track_step("_assign_facility_grid_ids"):
+        populated = _assign_facility_grid_ids(populated)
+    with _track_step("_assign_curb_ramp_geometries"):
+        populated = _assign_curb_ramp_geometries(populated, default_lane_width_m)
+    # --- Ensure all schema columns exist and are ordered correctly ---
+    for col in schema_columns:
+        if col not in populated.columns:
+            populated[col] = pd.NA
+    populated = populated[
+        [c for c in schema_columns if c in populated.columns]
+        + [c for c in populated.columns if c not in schema_columns]
+    ]
+
     # --- Export ---
+    _export_t0 = time.perf_counter()
     # Geometry columns other than the active one must be serialized to WKB so
     # they round-trip correctly through parquet (GeoParquet only encodes the
     # active geometry column; raw Shapely objects in object columns do not survive).
@@ -1363,12 +1468,18 @@ def populate_schema(place: str, *, default_lane_width_m: float = 3.5, default_ma
     ]
     present_geom_cols = [col for col in SECONDARY_GEOM_COLS if col in populated.columns]
     with tqdm(total=len(present_geom_cols) + 1, desc="Exporting parquet", unit="col") as pbar:
-        # Convert geometry columns to WKB hex in-place (avoids full DataFrame copy)
+        # Convert geometry columns to WKB hex using vectorized shapely.to_wkb
         for col in present_geom_cols:
             pbar.set_postfix_str(col)
-            populated[col] = populated[col].apply(
-                lambda g: g.wkb_hex if hasattr(g, 'wkb_hex') else None
+            col_values = populated[col].values
+            valid_mask = np.fromiter(
+                (isinstance(g, BaseGeometry) for g in col_values),
+                dtype=bool, count=len(col_values),
             )
+            wkb_result = np.full(len(col_values), None, dtype=object)
+            if valid_mask.any():
+                wkb_result[valid_mask] = shapely.to_wkb(np.asarray(col_values[valid_mask]), hex=True)
+            populated[col] = wkb_result
             pbar.update(1)
 
         pbar.set_postfix_str("normalizing buffered columns")
@@ -1397,7 +1508,7 @@ def populate_schema(place: str, *, default_lane_width_m: float = 3.5, default_ma
             if len(non_null) == 0:
                 continue
             # Vectorized type check: if all non-null values are str, no action needed
-            has_non_str = not non_null.apply(isinstance, args=(str,)).all()
+            has_non_str = not all(isinstance(v, str) for v in non_null.values)
             if has_non_str:
                 mask_na = populated[col].isna()
                 populated[col] = populated[col].astype(str)
@@ -1409,7 +1520,16 @@ def populate_schema(place: str, *, default_lane_width_m: float = 3.5, default_ma
         populated.to_parquet(output_path)
         pbar.update(1)
 
+    _export_elapsed = time.perf_counter() - _export_t0
+    if _export_elapsed >= _SLOW_STEP_THRESHOLD_S:
+        print(f"  ⏱ SLOW STEP [{_export_elapsed / 60:.1f} min]: export_parquet")
+        _slow_steps.append(("export_parquet", _export_elapsed))
+
     print(f"Populated schema parquet exported to {output_path}")
+
+    pipeline_elapsed = time.perf_counter() - pipeline_t0
+    print(f"Total pipeline time: {pipeline_elapsed / 60:.1f} min")
+    _print_slow_step_summary()
 
     return populated
 
@@ -1569,8 +1689,8 @@ def populate_base_bikelanes(
         populated["bikeway_right_1_quality"] = _coalesce("cycleway:right:smoothness", "cycleway:smoothness")
         populated["bikeway_left_1_surface"]  = _coalesce("cycleway:left:surface",  "cycleway:surface")
         populated["bikeway_right_1_surface"] = _coalesce("cycleway:right:surface", "cycleway:surface")
-        populated["bikeway_left_1_width"]    = _coalesce("cycleway:left:width",  "cycleway:width").apply(_parse_float_tag)
-        populated["bikeway_right_1_width"]   = _coalesce("cycleway:right:width", "cycleway:width").apply(_parse_float_tag)
+        populated["bikeway_left_1_width"]    = _parse_float_tag_series(_coalesce("cycleway:left:width",  "cycleway:width"))
+        populated["bikeway_right_1_width"]   = _parse_float_tag_series(_coalesce("cycleway:right:width", "cycleway:width"))
         populated["bikeway_left_1_seperator"]   = _coalesce("cycleway:left:buffer",  "cycleway:buffer")
         populated["bikeway_right_1_seperator"] = _coalesce("cycleway:right:buffer", "cycleway:buffer")
         pbar.update(1)
@@ -1580,7 +1700,7 @@ def populate_base_bikelanes(
         populated["bikeway_left_1_permitted"]  = _get("bicycle")
         populated["bikeway_right_1_permitted"] = _get("bicycle")
         _raw_incline = _get("incline")
-        _parsed_incline = _raw_incline.apply(_parse_incline) if _raw_incline is not None else None
+        _parsed_incline = _parse_incline_series(_raw_incline) if _raw_incline is not None else None
         if _parsed_incline is not None:
             populated["bikeway_left_1_incline"]  = _parsed_incline
             populated["bikeway_right_1_incline"] = _parsed_incline
@@ -1596,9 +1716,9 @@ def populate_base_bikelanes(
         populated["bikeway_left_2_surface"]   = _get("cycleway:left:2:surface")
         populated["bikeway_right_2_surface"]  = _get("cycleway:right:2:surface")
         _raw_bl2w = _get("cycleway:left:2:width")
-        populated["bikeway_left_2_width"]     = _raw_bl2w.apply(_parse_float_tag) if _raw_bl2w is not None else pd.NA
+        populated["bikeway_left_2_width"]     = _parse_float_tag_series(_raw_bl2w) if _raw_bl2w is not None else pd.NA
         _raw_br2w = _get("cycleway:right:2:width")
-        populated["bikeway_right_2_width"]    = _raw_br2w.apply(_parse_float_tag) if _raw_br2w is not None else pd.NA
+        populated["bikeway_right_2_width"]    = _parse_float_tag_series(_raw_br2w) if _raw_br2w is not None else pd.NA
         populated["bikeway_left_2_permitted"] = _get("bicycle")
         populated["bikeway_right_2_permitted"]= _get("bicycle")
         if _parsed_incline is not None:
@@ -1650,13 +1770,13 @@ def populate_base_footlanes(
         populated["sidewalk_left_surface"]    = _get("sidewalk:left:surface")
         populated["sidewalk_right_surface"]   = _get("sidewalk:right:surface")
         _raw_slw = _get("sidewalk:left:width")
-        populated["sidewalk_left_width"]      = _raw_slw.apply(_parse_float_tag) if _raw_slw is not None else pd.NA
+        populated["sidewalk_left_width"]      = _parse_float_tag_series(_raw_slw) if _raw_slw is not None else pd.NA
         _raw_srw = _get("sidewalk:right:width")
-        populated["sidewalk_right_width"]     = _raw_srw.apply(_parse_float_tag) if _raw_srw is not None else pd.NA
+        populated["sidewalk_right_width"]     = _parse_float_tag_series(_raw_srw) if _raw_srw is not None else pd.NA
         _raw_sw_l = _get("sidewalk:left:incline")
-        populated["sidewalk_left_incline"]  = _raw_sw_l.apply(_parse_incline) if _raw_sw_l is not None else pd.NA
+        populated["sidewalk_left_incline"]  = _parse_incline_series(_raw_sw_l) if _raw_sw_l is not None else pd.NA
         _raw_sw_r = _get("sidewalk:right:incline")
-        populated["sidewalk_right_incline"] = _raw_sw_r.apply(_parse_incline) if _raw_sw_r is not None else pd.NA
+        populated["sidewalk_right_incline"] = _parse_incline_series(_raw_sw_r) if _raw_sw_r is not None else pd.NA
         populated["sidewalk_left_quality"]    = _get("sidewalk:left:smoothness")
         populated["sidewalk_right_quality"]   = _get("sidewalk:right:smoothness")
         populated["sidewalk_left_seperator"]  = _get("sidewalk:left:buffer")
@@ -1737,6 +1857,12 @@ def _populate_separate_facilities(
     roads = populated[~is_separate.to_numpy(dtype=bool)].copy()
     road_sindex = roads.geometry.sindex
 
+    # Pre-compute road bearings once — vectorized to avoid per-road Python calls.
+    _road_bearing_series = _linestring_bearings_vectorized(roads.geometry)
+    _road_bearing_cache: dict[int, float | None] = cast(
+        dict[int, float | None], _road_bearing_series.dropna().to_dict()
+    )
+
     # ── Occupancy tracking (independent of geometry/type columns) ────────────
     # Both bikeways and sidewalks start empty — separate OSM edges take
     # priority over any centerline-derived data already written, so slots
@@ -1756,6 +1882,18 @@ def _populate_separate_facilities(
     # Adjacent sidewalk segments within this distance are merged rather than
     # deduplicated, so corner connectors and block-spanning footways combine.
     _FOOT_MERGE_THRESHOLD_M = 3.0
+    # Cumulative length guard: reject a footway match when the total
+    # accumulated sidewalk geometry would exceed the road length by this
+    # factor.  Prevents unrelated plazas / trails from piling onto short
+    # service roads (e.g. Stow Plaza → Frank Schlessinger Way).
+    _MAX_CUMULATIVE_SW_ROAD_RATIO = 4.0
+    # Overlap deduplication: before adding a footway to a road's sidewalk slot,
+    # check if an already-assigned sidewalk covers the same corridor.
+    # An existing geometry is considered "covering" if ≥ this fraction of its
+    # length falls within _SIDEWALK_DEDUP_BUFFER_M of the candidate geometry,
+    # OR the two geometries share both start and end points.
+    _SIDEWALK_DEDUP_BUFFER_M  = 3.0   # metres
+    _SIDEWALK_DEDUP_THRESHOLD = 0.75  # fraction of existing segment's length
 
     def _bikeway_slot_or_merge(road_idx, side, cy_geom) -> tuple[str | None, bool]:
         """Determine whether a cycleway edge merges into an existing slot or gets a new one.
@@ -1792,14 +1930,27 @@ def _populate_separate_facilities(
         s = str(val).strip().lower()
         return s if s else None
 
+    def _coerce_name_raw(val) -> str | None:
+        """Coerce a raw OSM name value (str, bytes, list, ndarray, NA) to str | None."""
+        if isinstance(val, (list, np.ndarray)):
+            val = next((x for x in val if isinstance(x, str)), None)
+        if isinstance(val, bytes):
+            return val.decode("utf-8")
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            return None
+        return val if isinstance(val, str) else None
+
     def _match_road_by_name(sindex, fac_geom, fac_mid, df, fac_name: str | None):
         """Find the best road segment for a facility edge using name + proximity.
 
         Strategy:
         1. Query all roads within ``_NAME_MATCH_RADIUS_M`` of the facility.
         2. Among roads whose name matches ``fac_name``, pick the closest.
-        3. If no name match (or facility has no name), fall back to the
-           spatially nearest road (``_sindex_nearest_idx``).
+        3. If the facility has no name, fall back to the spatially nearest road.
+        4. If the facility has a name but no road matches it, return None —
+           named footways/cycleways that don't match any road by name are
+           independent paths (plazas, trails, etc.) and should not be
+           adopted as a sidewalk of the nearest road.
 
         Returns (road_idx, road_geom, side).
         """
@@ -1828,15 +1979,37 @@ def _populate_separate_facilities(
                     best_geom = rgeom
                     best_side = _road_side(rgeom, fac_mid)
 
-        if best_idx is not None:
+            # Named facility with no road name match → independent path, skip.
             return best_idx, best_geom, best_side
 
-        # Fallback: spatially nearest road (no name filter)
-        nearest_idx = _sindex_nearest_idx(sindex, fac_geom, df)
-        nearest_geom = populated.at[nearest_idx, "street_geometry"]  # type: ignore[index]
-        if not isinstance(nearest_geom, BaseGeometry):
-            return None, None, None
-        return nearest_idx, nearest_geom, _road_side(nearest_geom, fac_mid)
+        # Unnamed facility: fall back to nearest road whose bearing is
+        # roughly parallel.  A sidewalk always runs alongside its road; a
+        # perpendicular footway (e.g. one sharing only a node with a service
+        # driveway) must not be adopted by that road.
+        fac_bearing = _linestring_bearing(fac_geom)
+        search_area = fac_geom.buffer(_NAME_MATCH_RADIUS_M)
+        hit_positions = sindex.query(search_area)
+        # Find the nearest parallel road without sorting all hits upfront.
+        best_par_dist = float("inf")
+        best_par_idx = None
+        best_par_geom = None
+        for pos in hit_positions:
+            ridx = df.index[pos]
+            rgeom = populated.at[ridx, "street_geometry"]  # type: ignore[index]
+            if not isinstance(rgeom, BaseGeometry):
+                continue
+            if fac_bearing is not None:
+                road_bearing = _road_bearing_cache.get(ridx)
+                if road_bearing is not None and not _bearings_parallel(fac_bearing, road_bearing):
+                    continue
+            d = rgeom.distance(fac_geom)
+            if d < best_par_dist:
+                best_par_dist = d
+                best_par_idx = ridx
+                best_par_geom = rgeom
+        if best_par_idx is not None and best_par_geom is not None:
+            return best_par_idx, best_par_geom, _road_side(best_par_geom, fac_mid)
+        return None, None, None
 
     # ── Bikelane pass ───────────────────────────────────────────────────────
     cycleways = edges_reset[is_bikeway].copy()
@@ -1849,25 +2022,20 @@ def _populate_separate_facilities(
     n_bike_merged = 0
     n_bike_slot_full = 0
 
-    # Pre-compute geometry properties for bikeways (positional lists avoid duplicate-index ambiguity)
+    # Pre-compute geometry and tag properties for bikeways as positional lists.
     cy_mids_list  = [g.interpolate(0.5, normalized=True) if g is not None else None for g in cycleways.geometry]
     cy_names_list = list(cycleways["name"]) if "name" in cycleways.columns else [None] * len(cycleways)
+    cy_geoms_list: list[BaseGeometry] = list(cycleways.geometry)
+    cy_highway_list = list(cycleways["highway"]) if "highway" in cycleways.columns else [pd.NA] * len(cycleways)
+    cy_surface_list = list(cycleways["surface"]) if "surface" in cycleways.columns else [pd.NA] * len(cycleways)
+    cy_width_list   = list(cycleways["width"])   if "width"   in cycleways.columns else [pd.NA] * len(cycleways)
+    cy_bicycle_list = list(cycleways["bicycle"]) if "bicycle" in cycleways.columns else [pd.NA] * len(cycleways)
+    cy_incline_list = list(cycleways["incline"]) if "incline" in cycleways.columns else [pd.NA] * len(cycleways)
 
     for cy_pos in tqdm(range(len(cycleways)), total=len(cycleways), desc="Matching bikeways", unit="edge"):
-        cy_row     = cycleways.iloc[cy_pos]
-        cy_geom    = cast(BaseGeometry, cy_row["geometry"])
+        cy_geom    = cy_geoms_list[cy_pos]
         cy_mid     = cy_mids_list[cy_pos]
-        cy_name_raw = cy_names_list[cy_pos]
-        # Coerce list/array to first str element (OSM names can be multi-valued)
-        if isinstance(cy_name_raw, (list, np.ndarray)):
-            cy_name_raw = next((x for x in cy_name_raw if isinstance(x, str)), None)
-        # Convert scalar to str | None
-        if isinstance(cy_name_raw, bytes):
-            cy_name: str | None = cy_name_raw.decode('utf-8')
-        elif cy_name_raw is None or (isinstance(cy_name_raw, float) and pd.isna(cy_name_raw)):
-            cy_name = None
-        else:
-            cy_name = cy_name_raw if isinstance(cy_name_raw, str) else None
+        cy_name = _coerce_name_raw(cy_names_list[cy_pos])
 
         road_idx, road_geom, side = _match_road_by_name(
             road_sindex, cy_geom, cy_mid, roads, cy_name)
@@ -1893,11 +2061,11 @@ def _populate_separate_facilities(
             n_bike_merged += 1
         else:
             # New facility — write all attributes
-            populated.at[road_idx, f"{prefix}_type"]      = cy_row.get("highway",  pd.NA)  # type: ignore[index]
-            populated.at[road_idx, f"{prefix}_surface"]   = cy_row.get("surface",  pd.NA)  # type: ignore[index]
-            populated.at[road_idx, f"{prefix}_width"]     = _parse_float_tag(cy_row.get("width",    pd.NA))  # type: ignore[index]
-            populated.at[road_idx, f"{prefix}_permitted"] = cy_row.get("bicycle",  pd.NA)  # type: ignore[index]
-            populated.at[road_idx, f"{prefix}_incline"]   = _parse_incline(cy_row.get("incline",  pd.NA))  # type: ignore[index]
+            populated.at[road_idx, f"{prefix}_type"]      = cy_highway_list[cy_pos]  # type: ignore[index]
+            populated.at[road_idx, f"{prefix}_surface"]   = cy_surface_list[cy_pos]  # type: ignore[index]
+            populated.at[road_idx, f"{prefix}_width"]     = _parse_float_tag(cy_width_list[cy_pos])  # type: ignore[index]
+            populated.at[road_idx, f"{prefix}_permitted"] = cy_bicycle_list[cy_pos]  # type: ignore[index]
+            populated.at[road_idx, f"{prefix}_incline"]   = _parse_incline(cy_incline_list[cy_pos])  # type: ignore[index]
             populated.at[road_idx, f"{prefix}_geometry"]  = cy_geom  # type: ignore[index]
             populated.at[road_idx, f"{prefix}_buffered"] = False  # type: ignore[index]
             bike_slots_used.add((road_idx, side, slot))
@@ -1915,26 +2083,94 @@ def _populate_separate_facilities(
     n_foot_matched = 0
     n_foot_merged = 0
     n_foot_name_matched = 0
+    n_foot_deduped = 0
 
-    # Pre-compute geometry properties for footways (positional lists avoid duplicate-index ambiguity)
+    # Track assigned sidewalk geometries for cross-road overlap deduplication.
+    # Uses an STRtree rebuilt periodically for O(log n) spatial queries instead
+    # of an O(n) linear scan.
+    assigned_sw_geoms: list[BaseGeometry] = []
+    _sw_dedup_tree: STRtree | None = None
+    _sw_dedup_tree_size: int = 0  # size when tree was last built
+    _SW_DEDUP_TREE_REBUILD_INTERVAL = 500  # rebuild every N new geometries
+
+    def _rebuild_dedup_tree_if_needed() -> None:
+        nonlocal _sw_dedup_tree, _sw_dedup_tree_size
+        new_count = len(assigned_sw_geoms) - _sw_dedup_tree_size
+        if new_count >= _SW_DEDUP_TREE_REBUILD_INTERVAL or _sw_dedup_tree is None:
+            _sw_dedup_tree = STRtree(assigned_sw_geoms)
+            _sw_dedup_tree_size = len(assigned_sw_geoms)
+
+    def _is_sidewalk_covered(new_geom: BaseGeometry) -> bool:
+        """True if *new_geom* substantially duplicates an already-assigned sidewalk."""
+        if not assigned_sw_geoms:
+            return False
+        _rebuild_dedup_tree_if_needed()
+        assert _sw_dedup_tree is not None
+        search_buf = new_geom.buffer(_SIDEWALK_DEDUP_BUFFER_M)
+        hit_positions = _sw_dedup_tree.query(search_buf)
+        if len(hit_positions) == 0:
+            return False
+        new_pts = _flatten_coords(new_geom)
+        for pos in hit_positions:
+            if pos >= len(assigned_sw_geoms):
+                continue  # stale tree entry; will be caught after next rebuild
+            eg = assigned_sw_geoms[pos]
+            # Length-coverage check: ≥ threshold of existing geometry within buffer
+            covered = eg.intersection(search_buf).length
+            if covered / max(eg.length, 1e-6) >= _SIDEWALK_DEDUP_THRESHOLD:
+                return True
+            # Shared-endpoints check
+            eg_pts = _flatten_coords(eg)
+            if new_pts and eg_pts:
+                ns, ne = Point(new_pts[0]), Point(new_pts[-1])
+                es, ee = Point(eg_pts[0]), Point(eg_pts[-1])
+                if ((ns.distance(es) < 0.5 and ne.distance(ee) < 0.5) or
+                        (ns.distance(ee) < 0.5 and ne.distance(es) < 0.5)):
+                    return True
+        return False
+
+    # Pre-compute geometry and tag properties for footways as positional lists.
+    # Avoids expensive DataFrame.iloc[] lookups (~107k times) in the hot loop.
     fw_mids_list  = [g.interpolate(0.5, normalized=True) if g is not None else None for g in footways.geometry]
     fw_names_list = list(footways["name"]) if "name" in footways.columns else [None] * len(footways)
+    fw_geoms_list: list[BaseGeometry] = list(footways.geometry)
+    fw_surface_list = list(footways["surface"]) if "surface" in footways.columns else [pd.NA] * len(footways)
+    fw_width_list   = list(footways["width"])   if "width"   in footways.columns else [pd.NA] * len(footways)
+    fw_incline_list = list(footways["incline"]) if "incline" in footways.columns else [pd.NA] * len(footways)
+    fw_smooth_list  = list(footways["smoothness"]) if "smoothness" in footways.columns else [pd.NA] * len(footways)
+
+    # ── Name inheritance for unnamed footways ────────────────────────────
+    # Unnamed footway segments adjacent to named footways (e.g. unnamed
+    # parts of "Stow Plaza") should inherit the name so that name-gating
+    # in _match_road_by_name correctly rejects them instead of matching
+    # them to unrelated nearby roads.
+    _NAME_INHERIT_DIST_M = 3.0
+    coerced_fw_names: list[str | None] = [_coerce_name_raw(n) for n in fw_names_list]
+    named_fw_indices = [i for i, n in enumerate(coerced_fw_names) if n is not None]
+    if named_fw_indices:
+        named_fw_geoms_for_tree = [fw_geoms_list[i] for i in named_fw_indices]
+        named_fw_tree = STRtree(named_fw_geoms_for_tree)
+        n_name_inherited = 0
+        for fw_pos in range(len(footways)):
+            if coerced_fw_names[fw_pos] is not None:
+                continue  # already named
+            buf = fw_geoms_list[fw_pos].buffer(_NAME_INHERIT_DIST_M)
+            hits = named_fw_tree.query(buf)
+            for h in hits:
+                if named_fw_geoms_for_tree[h].distance(fw_geoms_list[fw_pos]) <= _NAME_INHERIT_DIST_M:
+                    inherited_name = coerced_fw_names[named_fw_indices[h]]
+                    coerced_fw_names[fw_pos] = inherited_name
+                    # Also update the raw list so the matching loop sees it
+                    fw_names_list[fw_pos] = inherited_name
+                    n_name_inherited += 1
+                    break
+        if n_name_inherited:
+            print(f"  Name inheritance: {n_name_inherited} unnamed footways inherited names from adjacent named footways")
 
     for fw_pos in tqdm(range(len(footways)), total=len(footways), desc="Matching footways", unit="edge"):
-        fw_row  = footways.iloc[fw_pos]
-        fw_geom = cast(BaseGeometry, fw_row["geometry"])
+        fw_geom = fw_geoms_list[fw_pos]
         fw_mid  = fw_mids_list[fw_pos]
-        fw_name_raw = fw_names_list[fw_pos]
-        # Coerce list/array to first str element (OSM names can be multi-valued)
-        if isinstance(fw_name_raw, (list, np.ndarray)):
-            fw_name_raw = next((x for x in fw_name_raw if isinstance(x, str)), None)
-        # Convert scalar to str | None
-        if isinstance(fw_name_raw, bytes):
-            fw_name: str | None = fw_name_raw.decode('utf-8')
-        elif fw_name_raw is None or (isinstance(fw_name_raw, float) and pd.isna(fw_name_raw)):
-            fw_name = None
-        else:
-            fw_name = fw_name_raw if isinstance(fw_name_raw, str) else None
+        fw_name = _coerce_name_raw(fw_names_list[fw_pos])
 
         road_idx, road_geom, side = _match_road_by_name(
             road_sindex, fw_geom, fw_mid, roads, fw_name)
@@ -1946,8 +2182,24 @@ def _populate_separate_facilities(
                 populated.at[road_idx, "name"] if "name" in populated.columns else None):  # type: ignore[index]
             n_foot_name_matched += 1
 
+        # Overlap deduplication: skip if this corridor is already covered
+        # by a previously assigned sidewalk geometry.
+        if _is_sidewalk_covered(fw_geom):
+            n_foot_deduped += 1
+            continue
+
         prefix = f"sidewalk_{side}"
         slot_key = (road_idx, side)
+
+        # Cumulative length guard: reject when accumulated sidewalk geometry
+        # would far exceed the road segment length — indicates a mismatched
+        # plaza / trail rather than a legitimate sidewalk.
+        geom_col = f"{prefix}_geometry"
+        if road_geom is not None and isinstance(road_geom, BaseGeometry):
+            existing_sw = populated.at[road_idx, geom_col] if geom_col in populated.columns else None  # type: ignore[index]
+            existing_len = existing_sw.length if existing_sw is not None and isinstance(existing_sw, BaseGeometry) else 0.0
+            if (existing_len + fw_geom.length) > road_geom.length * _MAX_CUMULATIVE_SW_ROAD_RATIO:
+                continue
 
         if slot_key in foot_slots_used:
             # Deduplication: merge adjacent segments; otherwise keep the longer geometry.
@@ -1967,7 +2219,7 @@ def _populate_separate_facilities(
                     _is_centerline(winner, cast(BaseGeometry, road_geom), road_idx, prefix, populated)
                     winner_after = populated.at[road_idx, f"{prefix}_geometry"]  # type: ignore[index]
                     if winner_after is not None and isinstance(winner_after, BaseGeometry):
-                        if _is_suspect_geometry(winner_after):
+                        if not winner_after.is_simple:
                             populated.at[road_idx, f"{prefix}_geometry"] = None  # type: ignore[index]
                             populated.at[road_idx, f"{prefix}_buffered"] = True  # type: ignore[index]
                             n_foot_suspect[side] += 1
@@ -1979,25 +2231,33 @@ def _populate_separate_facilities(
             n_foot_merged += 1
         else:
             populated.at[road_idx, f"{prefix}_presence"] = "separate"  # type: ignore[index]
-            populated.at[road_idx, f"{prefix}_surface"]  = fw_row.get("surface",    pd.NA)  # type: ignore[index]
-            populated.at[road_idx, f"{prefix}_width"]    = _parse_float_tag(fw_row.get("width",      pd.NA))  # type: ignore[index]
-            populated.at[road_idx, f"{prefix}_incline"]  = _parse_incline(fw_row.get("incline",    pd.NA))  # type: ignore[index]
-            populated.at[road_idx, f"{prefix}_quality"]  = fw_row.get("smoothness", pd.NA)  # type: ignore[index]
+            populated.at[road_idx, f"{prefix}_surface"]  = fw_surface_list[fw_pos]  # type: ignore[index]
+            populated.at[road_idx, f"{prefix}_width"]    = _parse_float_tag(fw_width_list[fw_pos])  # type: ignore[index]
+            populated.at[road_idx, f"{prefix}_incline"]  = _parse_incline(fw_incline_list[fw_pos])  # type: ignore[index]
+            populated.at[road_idx, f"{prefix}_quality"]  = fw_smooth_list[fw_pos]  # type: ignore[index]
             populated.at[road_idx, f"{prefix}_geometry"] = fw_geom  # type: ignore[index]
             populated.at[road_idx, f"{prefix}_buffered"] = False  # type: ignore[index]
             foot_slots_used.add(slot_key)
             _is_centerline(fw_geom, cast(BaseGeometry, road_geom), road_idx, prefix, populated)
-            # Check if geometry is suspect after centerline check
+            # For separate facilities, only reject self-intersecting geometry.
+            # Sinuosity-based rejection is too aggressive for legitimate curved
+            # sidewalks (cul-de-sac perimeters, U-turns) — prioritize separate
+            # OSM geometry over algorithmic buffered offsets.
             geom_after = populated.at[road_idx, f"{prefix}_geometry"]  # type: ignore[index]
             if geom_after is not None and isinstance(geom_after, BaseGeometry):
-                if _is_suspect_geometry(geom_after):
+                if not geom_after.is_simple:
                     populated.at[road_idx, f"{prefix}_geometry"] = None  # type: ignore[index]
                     populated.at[road_idx, f"{prefix}_buffered"] = True  # type: ignore[index]
                     n_foot_suspect[side] += 1
             n_foot_matched += 1
+            # Track for cross-road overlap deduplication
+            final_geom = populated.at[road_idx, f"{prefix}_geometry"]  # type: ignore[index]
+            if final_geom is not None and isinstance(final_geom, BaseGeometry):
+                assigned_sw_geoms.append(final_geom)
 
     print(f"Matched {n_foot_matched} separate footway edges to road segments "
-          f"({n_foot_name_matched} by name, {n_foot_merged} merged into existing slots).")
+          f"({n_foot_name_matched} by name, {n_foot_merged} merged, "
+          f"{n_foot_deduped} skipped — overlap dedup).")
     print(
         f"[sidewalk] Suspect geometries discarded → flagged for buffering: "
         f"left={n_foot_suspect['left']}, right={n_foot_suspect['right']}"
@@ -2038,7 +2298,8 @@ def _populate_separate_facilities(
         geom_series = populated[gcol]
 
         # Vectorized pre-filter: rows that have real geometry and are not buffered
-        has_geom = geom_series.apply(lambda g: g is not None and hasattr(g, "geom_type"))
+        has_geom = pd.Series([isinstance(g, BaseGeometry) for g in geom_series.values],
+                              index=populated.index, dtype=bool)
         if bcol in populated.columns:
             bvals = populated[bcol]
             is_buffered = bvals.eq(True) | bvals.astype(str).str.lower().eq("yes")
@@ -2068,12 +2329,17 @@ def _populate_separate_facilities(
         buff_col = f"{sub_id}_buffered"
         data_col = f"{sub_id}_type" if kind == "bikeway" else f"{sub_id}_presence"
 
-        if geom_col not in populated.columns or data_col not in populated.columns:
+        if data_col not in populated.columns:
             continue
+        # Ensure the geometry column exists (may not have been created by the
+        # separate-facility matching pass if no separate OSM edges were found).
+        if geom_col not in populated.columns:
+            populated[geom_col] = pd.NA
 
         skip_values = _NEGATIVE_VALUES | _SEPARATE_PRESENCE_VALUES if kind == "sidewalk" else _NEGATIVE_VALUES
         has_data = populated[data_col].notna() & ~populated[data_col].astype(str).str.lower().isin(skip_values)
-        no_geom  = populated[geom_col].apply(lambda g: g is None or not hasattr(g, "geom_type"))
+        no_geom  = pd.Series([not isinstance(g, BaseGeometry) for g in populated[geom_col].values],
+                              index=populated.index, dtype=bool)
         candidates = has_data & no_geom
         print(f"  [{sub_id}] candidates: {candidates.sum()}, has_data: {has_data.sum()}, no_geom: {no_geom.sum()}")
         if not candidates.any():
@@ -2081,6 +2347,7 @@ def _populate_separate_facilities(
 
         n_no_street_geom = 0
         n_suppressed_here = 0
+        n_suppressed_intersection = 0
         n_buffer_called = 0
         n_buffer_wrote = 0
         for idx in populated.index[candidates]:
@@ -2089,6 +2356,23 @@ def _populate_separate_facilities(
                 n_no_street_geom += 1
                 continue
             street_geom = cast(BaseGeometry, street_geom)
+
+            # Intersection approach suppression: segments with at least one
+            # intersection endpoint that are shorter than the road width
+            # (lanes × lane_width) represent road surface within the
+            # intersection itself — there is no physical sidewalk alongside
+            # them.  Skip buffering entirely.
+            start_is_inter = bool(populated.at[idx, "start_node_is_intersection_node"])
+            end_is_inter   = bool(populated.at[idx, "end_node_is_intersection_node"])
+            if start_is_inter or end_is_inter:
+                raw_lanes = populated.at[idx, "lanes"]
+                raw_lw    = populated.at[idx, "lane_width"]
+                seg_lanes = _parse_numeric(raw_lanes, 2.0)
+                seg_lw    = _parse_numeric(raw_lw, default_lane_width_m)
+                road_width = seg_lanes * seg_lw
+                if street_geom.length < road_width:
+                    n_suppressed_intersection += 1
+                    continue
 
             # Sidewalk suppression: skip if a nearby parallel separate sidewalk
             # exists on the same side.  Only guard is same-row (a row's own
@@ -2109,11 +2393,15 @@ def _populate_separate_facilities(
                             continue
                         if not _bearings_parallel(street_bearing, all_sep_sw_bearings[hi]):
                             continue
-                        fac_mid = all_sep_sw_geoms[hi].interpolate(0.5, normalized=True)
-                        if (street_geom.distance(fac_mid) <= NEARBY_SEPARATE_SIDEWALK_THRESHOLD_M
-                                and _road_side(street_geom, fac_mid) == side):
-                            skip = True
-                            break
+                        # Use nearest-point distance instead of midpoint so
+                        # that short approach segments near the end of a long
+                        # separate sidewalk are still correctly suppressed.
+                        sep_geom = all_sep_sw_geoms[hi]
+                        if street_geom.distance(sep_geom) <= NEARBY_SEPARATE_SIDEWALK_THRESHOLD_M:
+                            _, near_pt = nearest_points(street_geom, sep_geom)
+                            if _road_side(street_geom, near_pt) == side:
+                                skip = True
+                                break
                     if skip:
                         total_skipped += 1
                         n_suppressed_here += 1
@@ -2127,6 +2415,7 @@ def _populate_separate_facilities(
                 total_buffered += 1
 
         print(f"    no_street_geom={n_no_street_geom}, suppressed={n_suppressed_here}, "
+              f"intersection_skip={n_suppressed_intersection}, "
               f"buffer_called={n_buffer_called}, buffer_wrote={n_buffer_wrote}")
 
     print(f"Buffering pass: {total_buffered} facility segments offset from centerline"
@@ -2189,6 +2478,42 @@ def _linestring_bearing(geom: BaseGeometry) -> float | None:
     if dx == 0 and dy == 0:
         return None
     return np.degrees(np.arctan2(dx, dy)) % 360
+
+
+def _linestring_bearings_vectorized(geom_series: Any) -> pd.Series:  # type: ignore[type-arg]
+    """Vectorized bearing computation for a GeoSeries of LineStrings.
+
+    Uses shapely C-level array ops for the common LineString case, with a
+    Python fallback for MultiLineStrings and edge cases.
+    """
+    geom_arr = np.asarray(geom_series)
+    n = len(geom_arr)
+    bearings = np.full(n, np.nan, dtype=np.float64)
+
+    # Fast path: shapely vectorized ops extract first/last points of LineStrings.
+    # Returns None (→ NaN coords) for MultiLineString and missing geometries.
+    first_pts = shapely.get_point(geom_arr, 0)
+    last_pts = shapely.get_point(geom_arr, -1)
+
+    x0 = shapely.get_x(first_pts)
+    y0 = shapely.get_y(first_pts)
+    x1 = shapely.get_x(last_pts)
+    y1 = shapely.get_y(last_pts)
+
+    dx = x1 - x0
+    dy = y1 - y0
+    valid = np.isfinite(x0) & np.isfinite(x1) & ((dx != 0) | (dy != 0))
+    bearings[valid] = np.degrees(np.arctan2(dx[valid], dy[valid])) % 360
+
+    # Slow fallback for MultiLineStrings and other edge cases
+    for i in np.flatnonzero(np.isnan(bearings)):
+        g = geom_arr[i]
+        if g is not None and isinstance(g, BaseGeometry):
+            b = _linestring_bearing(g)
+            if b is not None:
+                bearings[i] = b
+
+    return pd.Series(bearings, index=geom_series.index)
 
 
 def _bearings_parallel(a: float, b: float, tolerance: float = _PARALLEL_BEARING_TOLERANCE_DEG) -> bool:
@@ -2326,12 +2651,14 @@ def _is_centerline(
 
     # Confirmed centerline-coincident: clear geometry and mark row for buffering
     geom_col = f"{sub_facility_id}_geometry"
-    if geom_col in populated.columns:
-        populated.at[road_idx, geom_col] = None
+    if geom_col not in populated.columns:
+        populated[geom_col] = pd.NA
+    populated.at[road_idx, geom_col] = None
 
     buffered_col = f"{sub_facility_id}_buffered"
-    if buffered_col in populated.columns:
-        populated.at[road_idx, buffered_col] = True
+    if buffered_col not in populated.columns:
+        populated[buffered_col] = pd.NA
+    populated.at[road_idx, buffered_col] = True
 
     return True
 
@@ -2498,13 +2825,15 @@ def _buffer_segment(
     # Collision checking is row-scoped only (per spec step 4).
 
     geom_col = own_geom_col
-    if geom_col in populated.columns:
-        populated.at[street_id, geom_col] = buffered_geom  # type: ignore[index]
+    if geom_col not in populated.columns:
+        populated[geom_col] = pd.NA
+    populated.at[street_id, geom_col] = buffered_geom  # type: ignore[index]
 
     # --- 6. Mark the slot as buffered -----------------------------------------
     buffered_col = f"{sub_facility_id}_buffered"
-    if buffered_col in populated.columns:
-        populated.at[street_id, buffered_col] = True
+    if buffered_col not in populated.columns:
+        populated[buffered_col] = pd.NA
+    populated.at[street_id, buffered_col] = True
 
     return populated
 
@@ -2762,7 +3091,10 @@ def _assign_curb_ramp_geometries(
                     for row_x, side_x, geom_x in ((ri, si, gi), (rj, sj, gj)):
                         pos_x   = _closer_position(geom_x, ramp_pt)
                         ramp_col = f"sidewalk_{side_x}_curbramp_{pos_x}_1_geometry"
-                        if ramp_col in populated.columns and pd.isna(populated.at[row_x, ramp_col]):
+                        # Ensure the column exists (lazily created on first write)
+                        if ramp_col not in populated.columns:
+                            populated[ramp_col] = pd.NA
+                        if pd.isna(populated.at[row_x, ramp_col]):
                             populated.at[row_x, ramp_col] = ramp_pt  # type: ignore[index]
                             n_assigned += 1
 
@@ -2776,9 +3108,11 @@ def _assign_curb_ramp_geometries(
                 continue
             for position in ("start", "end"):
                 ramp_col = f"sidewalk_{side}_curbramp_{position}_1_geometry"
+                # Ensure the column exists (may not have been created by pairwise pass)
                 if ramp_col not in populated.columns:
-                    continue
-                has_geom  = populated[geom_col].apply(lambda g: isinstance(g, BaseGeometry) and not g.is_empty)
+                    populated[ramp_col] = pd.NA
+                has_geom  = pd.Series([isinstance(g, BaseGeometry) and not g.is_empty for g in populated[geom_col].values],
+                                      index=populated.index, dtype=bool)
                 ramp_empty = populated[ramp_col].isna()
                 for idx in populated.index[has_geom & ramp_empty]:
                     geom = cast(BaseGeometry | None, populated.at[idx, geom_col])
@@ -2836,10 +3170,9 @@ def _assign_facility_grid_ids(populated: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
             return
         active = eligible_mask & sgid.notna()
         val_series = sgid[active].astype(str) + suffix
-        if id_col in populated.columns:
-            populated[id_col] = pd.NA
-            populated.loc[active, id_col] = val_series
-        if grid_id_col is not None and grid_id_col in populated.columns:
+        populated[id_col] = pd.NA
+        populated.loc[active, id_col] = val_series
+        if grid_id_col is not None:
             populated[grid_id_col] = pd.NA
             populated.loc[active, grid_id_col] = val_series
 
@@ -2869,13 +3202,13 @@ def _assign_facility_grid_ids(populated: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
             either_eligible,   # grid_id assigned if any slot present
         )
         # Slot 1 id should only be set when slot 1 itself is eligible; fix it
-        if f"bikeway_{side}_1_id" in populated.columns and sgid is not None:
+        if sgid is not None:
             only1 = eligible1 & sgid.notna()
             populated[f"bikeway_{side}_1_id"] = pd.NA
             populated.loc[only1, f"bikeway_{side}_1_id"] = sgid[only1].astype(str) + f"{suffix}1"
 
         # Slot 2 id (no separate grid_id column per schema)
-        if f"bikeway_{side}_2_id" in populated.columns and sgid is not None:
+        if sgid is not None:
             only2 = eligible2 & sgid.notna()
             populated[f"bikeway_{side}_2_id"] = pd.NA
             populated.loc[only2, f"bikeway_{side}_2_id"] = sgid[only2].astype(str) + f"{suffix}2"
@@ -2888,15 +3221,6 @@ def _assign_facility_grid_ids(populated: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
           f"bikeway_left={n_bk_l}, bikeway_right={n_bk_r}")
 
     return populated
-
-# def create_boundary_grid():
-#     return
-
-# def block_assignment():
-#     return
-
-# def intersection_analysis():
-#     return
 
 if __name__ == "__main__":
     run_multi_city()
