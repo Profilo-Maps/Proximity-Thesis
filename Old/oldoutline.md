@@ -1,3 +1,5 @@
+definition of a curb ramp as the intersection of two sidewalk segments within the convex hull of the outer endpoints of the segments that are connected to a given intersection node
+
 At nodes where multiple blocks meet, transitions will need to be handled for pathfinding. For bike facilities, these transitions can follow street segments. For sidewalks, transitions involve leaving one sidewalk, entering a crosswalk, exiting a crosswalk, and entering a second sidewalk. These transition points are handled by using curb ramps as start and end nodes for sidewalk segments. By default, two directional curb ramps are generated per corner (one per crosswalk approach), aligned with each crossing direction.
 
 All facility corrections at an intersection node are resolved in a single constraint-satisfaction pass rather than sequentially by facility type. This prevents ordering dependencies where a bikelane correction invalidates a sidewalk placement or vice versa.

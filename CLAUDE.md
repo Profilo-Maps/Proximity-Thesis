@@ -9,6 +9,9 @@ You are a senior developer helping me implement this feature of a larger project
 
 **Uncertainty Strategy:** ALWAYS ask questions before writing code. These questions should be used to highlight design decisions that are ambiguously justified by logic or that are matters of taste.
 
+## Correction History Protocol
+After sucessfully implementing a feature (or set of features) for the data pipeline, prompt me and then save it with annotations about what problem it solves and what data schema it operates on in the @notesforrobot folder. Every time you fix a bug in your topology correction model, document the error and the solution in the same folder in a markdown file.
+
 **Plan Document Etiquette:** DO NOT use the superpowers:writing-plans skill, start implementing after a design is approved. After a feature is implemented, check the /docs folder for intermediate implementation docs and consolidate them to the readme.md.
 
 ## Critical Constraints
@@ -27,5 +30,3 @@ uv sync: Sync the project's dependencies with the environment.
 uv lock: Create a lockfile for the project's dependencies.
 uv run: Run a command in the project environment.
 
-## Correction History Protocol
-After sucessfully implementing a feature (or set of features) for the data pipeline, prompt me and then save it with annotations about what problem it solves and what data schema it operates on in the notesforrobot folder. Every time you fix a bug in your topology correction model, document the error and the solution in the same folder in a markdown file.

@@ -1,6 +1,7 @@
 import math
 import pickle
 import re
+from collections import defaultdict
 import numpy as np
 import osmnx as ox
 import geopandas as gpd
@@ -10,8 +11,9 @@ from pathlib import Path
 from typing import Any, cast
 from tqdm import tqdm
 from shapely import STRtree
-from shapely.geometry import LineString, MultiLineString, MultiPoint, Point
+from shapely.geometry import LineString, MultiLineString, MultiPoint, MultiPolygon, Point
 from shapely.geometry.base import BaseGeometry
+from shapely.geometry.collection import GeometryCollection
 
 # Pre-compiled regex for extracting a leading numeric value from OSM tag strings
 # (e.g. "25 mph", "3.5 m", "-3.2%").  Compiled once at import time.
@@ -1328,7 +1330,7 @@ def populate_schema(place: str, *, default_lane_width_m: float = 3.5, default_ma
     populated = swap_facilities_by_bearing(populated, edges_reset)
     populated = _populate_separate_facilities(populated, edges_reset, default_lane_width_m)
     populated = _assign_facility_grid_ids(populated)
-    populated = _assign_curb_ramp_geometries(populated)
+    populated = _assign_curb_ramp_geometries(populated, default_lane_width_m)
     # --- Export ---
     # Geometry columns other than the active one must be serialized to WKB so
     # they round-trip correctly through parquet (GeoParquet only encodes the
@@ -2517,55 +2519,257 @@ def _is_na(val) -> bool:
         return False
 
 
-_CURB_RAMP_PROXIMITY_M = 20.0
-# Sidewalk endpoints within this distance of any intersection node get a curb
-# ramp even when their parent road segment does not directly touch that node.
-# Catches separate sidewalk segments that terminate near (but not at) an
-# intersection — e.g. octagon-corner footways ~12 m from the centreline node.
+_CURB_RAMP_PROXIMITY_M   = 20.0   # fallback: sidewalk endpoint → intersection node distance
+_CURB_RAMP_SNAP_M        = 1.0    # snap close-but-not-touching sidewalk endpoints together
+_CURB_RAMP_HULL_FALLBACK_R = 15.0 # hull radius when < 3 non-collinear projected points exist
 
 
-def _assign_curb_ramp_geometries(populated: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """Place curb ramp points at sidewalk endpoints adjacent to intersections.
+def _sidewalk_max_offset_m(row: "pd.Series[Any]", default_lane_width_m: float) -> float:
+    """Max perpendicular offset (m) from road centreline to sidewalk, either side."""
+    lanes      = _parse_numeric(row.get("lanes"),      2.0)
+    lane_width = _parse_numeric(row.get("lane_width"), default_lane_width_m)
+    half_road  = (lanes * lane_width) / 2.0
+    max_offset = 0.0
+    for s in ("left", "right"):
+        bike_w = 0.0
+        for slot in ("1", "2"):
+            w = row.get(f"bikeway_{s}_{slot}_width")
+            bike_w += (
+                _parse_numeric(w, 0.0) if not _is_na(w)
+                else _DEFAULT_BIKE_WIDTH_M if not _is_na(row.get(f"bikeway_{s}_{slot}_type"))
+                else 0.0
+            )
+        max_offset = max(max_offset, half_road + bike_w)
+    return max_offset if max_offset > 0 else _CURB_RAMP_HULL_FALLBACK_R
 
-    Curb ramps belong to sidewalk segments only.  A ramp is placed at each
-    end of a sidewalk geometry whose endpoint falls within
-    ``_CURB_RAMP_PROXIMITY_M`` of any intersection node.  The ramp coordinate
-    is the sidewalk endpoint itself — never a street centerline node.
+
+def _assign_curb_ramp_geometries(
+    populated: gpd.GeoDataFrame,
+    default_lane_width_m: float = _DEFAULT_LANE_WIDTH_M,
+) -> gpd.GeoDataFrame:
+    """Place curb ramp points where sidewalk segments meet at intersection corners.
+
+    Definition
+    ----------
+    A curb ramp is the geometric intersection of two sidewalk segment
+    geometries that falls within the intersection hull for a given node.
+    Ramps belong to sidewalk segments only — street centerline nodes are
+    never used as ramp positions.
+
+    Hull construction
+    -----------------
+    For each intersection node N, project outward from N along each connected
+    road segment's approach direction by that segment's max sidewalk offset.
+    The convex hull of those projected points defines the intersection zone.
+    If fewer than 3 non-collinear projected points exist, fall back to a
+    circle of radius ``_CURB_RAMP_HULL_FALLBACK_R`` centred on N.
+
+    Snapping
+    --------
+    Before checking for intersections, sidewalk endpoints within
+    ``_CURB_RAMP_SNAP_M`` of each other (but not already coincident) are
+    snapped to their midpoint.  The geometry in *populated* is updated in
+    place so the snap persists in the final output.
+
+    Redundancy
+    ----------
+    Both road segment rows that share a curb ramp store the same Point in
+    their respective ``sidewalk_{side}_curbramp_{pos}_1_geometry`` column.
+    This is intentional: graph builders deduplicate nodes by coordinate, so
+    the redundancy is harmless for pathfinding performance.
+
+    Fallback
+    --------
+    Sidewalk endpoints that are within ``_CURB_RAMP_PROXIMITY_M`` of any
+    intersection node but where no pairwise sidewalk intersection was found
+    (e.g. a T-junction with only one sidewalk on a corner) receive a ramp
+    via direct proximity assignment.
 
     Slots 2 and 3 are reserved for crowdsourced / government data.
     """
+    # ── Inner helpers ─────────────────────────────────────────────────────────
+
     def _endpoint(geom: BaseGeometry | None, which: str) -> Point | None:
+        """Start (coords[0]) or end (coords[-1]) Point of a geometry."""
         if not isinstance(geom, BaseGeometry) or geom.is_empty:
             return None
         coords = _flatten_coords(geom)
-        if not coords:
-            return None
-        return Point(coords[0] if which == "start" else coords[-1])
+        return Point(coords[0] if which == "start" else coords[-1]) if coords else None
 
-    # ── Build STRtree of all intersection node positions ─────────────────────
-    node_pts: list[Point] = []
-    seen_xy: set[tuple[float, float]] = set()
-    for node_col, flag_col in (
-        ("start_node_geometry", "start_node_is_intersection_node"),
-        ("end_node_geometry",   "end_node_is_intersection_node"),
+    def _closer_position(geom: BaseGeometry, ref: Point) -> str:
+        """Return 'start' or 'end' — whichever endpoint of *geom* is closer to *ref*."""
+        coords = _flatten_coords(geom)
+        if not coords:
+            return "start"
+        return "start" if Point(coords[0]).distance(ref) <= Point(coords[-1]).distance(ref) else "end"
+
+    def _snap_endpoint(geom: BaseGeometry, which: str, new_pt: Point) -> BaseGeometry:
+        """Return a copy of *geom* with the start or end coordinate moved to *new_pt*."""
+        if isinstance(geom, MultiLineString):
+            parts = [list(ls.coords) for ls in geom.geoms]
+            if which == "start":
+                parts[0][0] = (new_pt.x, new_pt.y)
+            else:
+                parts[-1][-1] = (new_pt.x, new_pt.y)
+            return MultiLineString([LineString(p) for p in parts])
+        coords = list(geom.coords)  # type: ignore[union-attr]
+        if which == "start":
+            coords[0] = (new_pt.x, new_pt.y)
+        else:
+            coords[-1] = (new_pt.x, new_pt.y)
+        return LineString(coords)
+
+    # ── Step 1: Group road segments by intersection node ──────────────────────
+    # node_key (rounded x, y) → [(row_idx, "start"|"end"), ...]
+    node_to_segs: dict[tuple[float, float], list[tuple[int, str]]] = defaultdict(list)
+    node_key_to_pt: dict[tuple[float, float], Point] = {}
+    for node_col, flag_col, position in (
+        ("start_node_geometry", "start_node_is_intersection_node", "start"),
+        ("end_node_geometry",   "end_node_is_intersection_node",   "end"),
     ):
         if node_col not in populated.columns or flag_col not in populated.columns:
             continue
         mask = populated[flag_col] == True  # noqa: E712
-        for geom in populated.loc[mask, node_col]:
+        for idx in populated.index[mask]:
+            geom = populated.at[idx, node_col]
             if not isinstance(geom, BaseGeometry) or geom.is_empty:
                 continue
-            point = cast(Point, geom)
-            xy = (round(point.x, 2), round(point.y, 2))
-            if xy not in seen_xy:
-                seen_xy.add(xy)
-                node_pts.append(point)
-    intersect_tree: STRtree | None = STRtree(node_pts) if node_pts else None
+            pt = cast(Point, geom)
+            key = (round(pt.x, 1), round(pt.y, 1))
+            node_to_segs[key].append((idx, position))
+            if key not in node_key_to_pt:
+                node_key_to_pt[key] = pt
+
+    # ── Step 2: Pre-build STRtree over all sidewalk geometries ────────────────
+    # Stored as (row_idx, "left"|"right") parallel to the tree's geometry list.
+    all_sw_keys: list[tuple[int, str]] = []
+    all_sw_geoms: list[BaseGeometry] = []
+    for side in ("left", "right"):
+        col = f"sidewalk_{side}_geometry"
+        if col not in populated.columns:
+            continue
+        for idx in populated.index:
+            g = populated.at[idx, col]
+            if isinstance(g, BaseGeometry) and not g.is_empty:
+                all_sw_keys.append((idx, side))
+                all_sw_geoms.append(g)
+
+    sw_tree: STRtree | None = STRtree(all_sw_geoms) if all_sw_geoms else None
 
     n_assigned = 0
+    n_snapped  = 0
 
-    # ── Proximity-based: sidewalk endpoint → nearest intersection node ────────
-    if intersect_tree is not None:
+    # ── Step 3: Process each intersection node ────────────────────────────────
+    for node_key, connections in node_to_segs.items():
+        node_pt = node_key_to_pt.get(node_key)
+        if node_pt is None:
+            continue
+
+        # ── Build convex hull of projected sidewalk offsets ───────────────────
+        hull_pts_list: list[Point] = []
+        for row_idx, position in connections:
+            row    = cast(pd.Series, populated.loc[row_idx])
+            far_col = "end_node_geometry" if position == "start" else "start_node_geometry"
+            far_geom = row.get(far_col)
+            if not isinstance(far_geom, BaseGeometry) or far_geom.is_empty:
+                continue
+            far_pt = cast(Point, far_geom)
+            dx = far_pt.x - node_pt.x
+            dy = far_pt.y - node_pt.y
+            dist = (dx * dx + dy * dy) ** 0.5
+            if dist < 1e-6:
+                continue
+            offset = _sidewalk_max_offset_m(row, default_lane_width_m)
+            hull_pts_list.append(
+                Point(node_pt.x + dx / dist * offset, node_pt.y + dy / dist * offset)
+            )
+
+        if len(hull_pts_list) >= 3:
+            candidate = MultiPoint(hull_pts_list).convex_hull
+            hull: BaseGeometry = (
+                candidate if candidate.geom_type in ("Polygon", "MultiPolygon")
+                else node_pt.buffer(_CURB_RAMP_HULL_FALLBACK_R)
+            )
+        elif len(hull_pts_list) == 2:
+            p0, p1 = hull_pts_list
+            r = max(p0.distance(p1) / 2.0, _CURB_RAMP_HULL_FALLBACK_R)
+            hull = Point((p0.x + p1.x) / 2, (p0.y + p1.y) / 2).buffer(r)
+        else:
+            hull = node_pt.buffer(_CURB_RAMP_HULL_FALLBACK_R)
+
+        # ── Collect sidewalk geometries within this hull ──────────────────────
+        if sw_tree is None:
+            continue
+        nearby_tree_idxs = sw_tree.query(hull)
+        local_sw: list[tuple[int, str]] = [
+            all_sw_keys[i] for i in nearby_tree_idxs
+            if all_sw_geoms[i].intersects(hull)
+        ]
+        if len(local_sw) < 2:
+            continue
+
+        # ── Snap close-but-not-touching endpoints ─────────────────────────────
+        for i in range(len(local_sw)):
+            ri, si = local_sw[i]
+            gi = cast(BaseGeometry | None, populated.at[ri, f"sidewalk_{si}_geometry"])
+            if not isinstance(gi, BaseGeometry) or gi.is_empty:
+                continue
+            pos_i = _closer_position(gi, node_pt)
+            end_i = _endpoint(gi, pos_i)
+            if end_i is None:
+                continue
+            for j in range(i + 1, len(local_sw)):
+                rj, sj = local_sw[j]
+                gj = cast(BaseGeometry | None, populated.at[rj, f"sidewalk_{sj}_geometry"])
+                if not isinstance(gj, BaseGeometry) or gj.is_empty:
+                    continue
+                pos_j = _closer_position(gj, node_pt)
+                end_j = _endpoint(gj, pos_j)
+                if end_j is None:
+                    continue
+                d = end_i.distance(end_j)
+                if 0 < d <= _CURB_RAMP_SNAP_M:
+                    mid = Point((end_i.x + end_j.x) / 2, (end_i.y + end_j.y) / 2)
+                    populated.at[ri, f"sidewalk_{si}_geometry"] = _snap_endpoint(gi, pos_i, mid)  # type: ignore[index]
+                    populated.at[rj, f"sidewalk_{sj}_geometry"] = _snap_endpoint(gj, pos_j, mid)  # type: ignore[index]
+                    n_snapped += 1
+                    # Update gi/end_i for subsequent inner-loop iterations
+                    gi = cast(BaseGeometry, populated.at[ri, f"sidewalk_{si}_geometry"])
+                    end_i = mid
+
+        # ── Find pairwise sidewalk intersections within hull ──────────────────
+        for i, (ri, si) in enumerate(local_sw):
+            gi = cast(BaseGeometry | None, populated.at[ri, f"sidewalk_{si}_geometry"])
+            if not isinstance(gi, BaseGeometry) or gi.is_empty:
+                continue
+            for rj, sj in local_sw[i + 1:]:
+                gj = cast(BaseGeometry | None, populated.at[rj, f"sidewalk_{sj}_geometry"])
+                if not isinstance(gj, BaseGeometry) or gj.is_empty:
+                    continue
+                inter = gi.intersection(gj)
+                if inter.is_empty:
+                    continue
+                # Collect candidate Points only (ignore collinear overlaps)
+                if isinstance(inter, Point):
+                    ramp_candidates: list[Point] = [inter]
+                elif isinstance(inter, (MultiPoint, MultiLineString, MultiPolygon, GeometryCollection)):
+                    ramp_candidates = [p for p in inter.geoms if isinstance(p, Point)]
+                else:
+                    continue
+                for ramp_pt in ramp_candidates:
+                    if not hull.contains(ramp_pt):
+                        continue
+                    for row_x, side_x, geom_x in ((ri, si, gi), (rj, sj, gj)):
+                        pos_x   = _closer_position(geom_x, ramp_pt)
+                        ramp_col = f"sidewalk_{side_x}_curbramp_{pos_x}_1_geometry"
+                        if ramp_col in populated.columns and pd.isna(populated.at[row_x, ramp_col]):
+                            populated.at[row_x, ramp_col] = ramp_pt  # type: ignore[index]
+                            n_assigned += 1
+
+    # ── Fallback: proximity-based for slots still empty ───────────────────────
+    all_node_pts = list(node_key_to_pt.values())
+    if all_node_pts:
+        intersect_tree = STRtree(all_node_pts)
         for side in ("left", "right"):
             geom_col = f"sidewalk_{side}_geometry"
             if geom_col not in populated.columns:
@@ -2574,24 +2778,22 @@ def _assign_curb_ramp_geometries(populated: gpd.GeoDataFrame) -> gpd.GeoDataFram
                 ramp_col = f"sidewalk_{side}_curbramp_{position}_1_geometry"
                 if ramp_col not in populated.columns:
                     continue
-                has_geom = populated[geom_col].apply(
-                    lambda g: isinstance(g, BaseGeometry) and not g.is_empty
-                )
+                has_geom  = populated[geom_col].apply(lambda g: isinstance(g, BaseGeometry) and not g.is_empty)
                 ramp_empty = populated[ramp_col].isna()
                 for idx in populated.index[has_geom & ramp_empty]:
                     geom = cast(BaseGeometry | None, populated.at[idx, geom_col])
-                    pt = _endpoint(geom, position)
-                    if pt is None:
+                    coords = _flatten_coords(geom) if isinstance(geom, BaseGeometry) else []
+                    if not coords:
                         continue
+                    pt = Point(coords[0] if position == "start" else coords[-1])
                     nearby = intersect_tree.query(pt.buffer(_CURB_RAMP_PROXIMITY_M))
                     if len(nearby) > 0 and any(
-                        node_pts[i].distance(pt) <= _CURB_RAMP_PROXIMITY_M
-                        for i in nearby
+                        all_node_pts[k].distance(pt) <= _CURB_RAMP_PROXIMITY_M for k in nearby
                     ):
-                        populated.at[idx, ramp_col] = cast(BaseGeometry, pt)  # type: ignore[index]
+                        populated.at[idx, ramp_col] = pt  # type: ignore[index]
                         n_assigned += 1
 
-    print(f"Curb ramp geometries assigned: {n_assigned} ramps")
+    print(f"Curb ramp geometries assigned: {n_assigned} ramps, {n_snapped} endpoint snaps")
     return populated
 
 
