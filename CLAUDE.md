@@ -7,10 +7,10 @@ You are a senior developer helping me implement this feature of a larger project
 
 **Spec Checking Strategy:** Before implementing a feature, check the specs folder for guidance.
 
-**Uncertainty Strategy:** ALWAYS ask questions before writing code. These questions should be used to highlight design decisions that are ambiguously justified by logic or that are matters of taste.
+**Uncertainty Strategy:** ALWAYS ask questions before writing code. These questions should be used to highlight design decisions that are ambiguously justified by logic or that are matters of taste.When recommending approaches, order them by complexity of implementation.
 
 ## Correction History Protocol
-After sucessfully implementing a feature (or set of features) for the data pipeline, prompt me and then save it with annotations about what problem it solves and what data schema it operates on in the @notesforrobot folder. Every time you fix a bug in your topology correction model, document the error and the solution in the same folder in a markdown file.
+WHENEVER you create a diagnostic script, document the script with comments on the error and the solution in the /notesforrobot folder. ALSO document the problem solving process you used to revise a diagnostic script that led to the optimal solution being uncovered. 
 
 **Plan Document Etiquette:** DO NOT use the superpowers:writing-plans skill, start implementing after a design is approved. After a feature is implemented, check the /docs folder for intermediate implementation docs and consolidate them to the readme.md.
 

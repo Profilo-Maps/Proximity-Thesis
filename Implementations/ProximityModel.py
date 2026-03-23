@@ -14,7 +14,7 @@ from typing import Any, Generator, cast
 from tqdm import tqdm
 import shapely
 from shapely import STRtree
-from shapely.ops import nearest_points
+from shapely.ops import nearest_points, substring as _sw_substring, linemerge as _sw_linemerge
 from shapely.geometry import LineString, MultiLineString, MultiPoint, MultiPolygon, Point
 from shapely.geometry.base import BaseGeometry
 from shapely.geometry.collection import GeometryCollection
@@ -58,7 +58,7 @@ def _track_step(label: str) -> Generator[None, None, None]:
     elapsed = time.perf_counter() - t0
     if elapsed >= _SLOW_STEP_THRESHOLD_S:
         mins = elapsed / 60.0
-        print(f"  ⏱ SLOW STEP [{mins:.1f} min]: {label}")
+        print(f"  SLOW STEP [{mins:.1f} min]: {label}")
         _slow_steps.append((label, elapsed))
 
 
@@ -71,7 +71,7 @@ def _print_slow_step_summary() -> None:
     print(f"SLOW STEPS (>{_SLOW_STEP_THRESHOLD_S / 60:.0f} min threshold):")
     print(f"{'='*60}")
     for label, elapsed in sorted(_slow_steps, key=lambda x: -x[1]):
-        print(f"  {elapsed / 60:.1f} min — {label}")
+        print(f"  {elapsed / 60:.1f} min - {label}")
     print(f"{'='*60}\n")
 
 
@@ -85,15 +85,15 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Maximum distance (metres) for a separate facility edge to be considered
 # coincident with the street centerline.  Edges within this threshold for ≥95%
-# of their length are treated as centerline data (buffered offset replaces the
+# of their length are treated as centerline data (offset replaces the
 # original geometry).  Increase to catch more OSM tagging errors; decrease to
 # preserve close-but-genuinely-separate facilities.
 CENTERLINE_COINCIDENCE_THRESHOLD_M = 2.0
 
 # Maximum distance (metres) from a street centerline to a separate sidewalk's
-# midpoint before buffering is suppressed on that side.  A parallel separate
+# midpoint before offset is suppressed on that side.  A parallel separate
 # sidewalk within this radius indicates the street already has sidewalk geometry
-# and does not need a buffered offset.
+# and does not need an offset.
 NEARBY_SEPARATE_SIDEWALK_THRESHOLD_M = 20.0
 
 # When True, query USGS 3DEP to compute street_incline (slope %) for each
@@ -255,7 +255,7 @@ def split_deflected_segments(
             new_rows.append(piece)
 
     if not new_rows:
-        print(f"Deflection splitting: 0 segments split (threshold={deflection_threshold_deg}°)")
+        print(f"Deflection splitting: 0 segments split (threshold={deflection_threshold_deg} deg)")
         return edges_reset
 
     n_segments_split = len(rows_to_drop)
@@ -267,8 +267,8 @@ def split_deflected_segments(
         crs=edges_reset.crs,
     )
 
-    print(f"Deflection splitting: {n_segments_split} segments → "
-          f"{len(new_rows)} pieces (threshold={deflection_threshold_deg}°)")
+    print(f"Deflection splitting: {n_segments_split} segments -> "
+          f"{len(new_rows)} pieces (threshold={deflection_threshold_deg} deg)")
 
     return result
 
@@ -519,12 +519,12 @@ def swap_facilities_by_bearing(
         n_small = int(((diffs_valid >= 0.1) & (diffs_valid < 30)).sum())
         n_mid = int(((diffs_valid >= 30) & (diffs_valid < 150)).sum())
         n_rev = int((diffs_valid >= 150).sum())
-        print(f"Facility bearing swap: {n_swapped} edges swapped left↔right "
+        print(f"Facility bearing swap: {n_swapped} edges swapped left<->right "
               f"(pairs={len(swap_pairs)}, compared={n_both}, "
               f"norm_only={n_norm_only}, raw_only={n_raw_only}, neither={n_neither})")
-        print(f"  Bearing diff distribution: exact(<0.1°)={n_exact}, "
-              f"small(0.1-30°)={n_small}, mid(30-150°)={n_mid}, "
-              f"reversed(>=150°)={n_rev} | mean={mean_diff:.1f}°, max={max_diff:.1f}°")
+        print(f"  Bearing diff distribution: exact(<0.1 deg)={n_exact}, "
+              f"small(0.1-30 deg)={n_small}, mid(30-150 deg)={n_mid}, "
+              f"reversed(>=150 deg)={n_rev} | mean={mean_diff:.1f} deg, max={max_diff:.1f} deg")
     else:
         print(f"Facility bearing swap: no edges with both bearings available "
               f"(norm_only={n_norm_only}, raw_only={n_raw_only}, neither={n_neither})")
@@ -683,7 +683,7 @@ def _query_dem_tile(
             float(lons.max()) + buf, float(lats.max()) + buf)
 
     # --- Fetch DEM tile (single network call) ---
-    bbox_str = f"({bbox[0]:.4f},{bbox[1]:.4f}) → ({bbox[2]:.4f},{bbox[3]:.4f})"
+    bbox_str = f"({bbox[0]:.4f},{bbox[1]:.4f}) -> ({bbox[2]:.4f},{bbox[3]:.4f})"
     with tqdm(total=1, desc="Topography DEM fetch", unit="tile",
               postfix={"bbox": bbox_str}) as pbar:
         dem: xr.DataArray = py3dep.get_dem(bbox, crs="EPSG:4326", resolution=10)
@@ -719,9 +719,9 @@ def _query_dem_tile(
     if valid_elevs:
         print(f"  Topography DEM: {len(valid_elevs)} elevations sampled "
               f"({n_missing} NaN/clipped), "
-              f"range {min(valid_elevs):.1f}–{max(valid_elevs):.1f} m")
+              f"range {min(valid_elevs):.1f}-{max(valid_elevs):.1f} m")
     else:
-        print(f"  Topography DEM: no valid elevations returned — "
+        print(f"  Topography DEM: no valid elevations returned - "
               f"all {len(result)} points were NaN or clipped")
 
     return result
@@ -854,7 +854,7 @@ def _query_dem_by_native_tile(
     n_valid = n_nan = 0
     n_cells = len(tile_to_idxs)
 
-    print(f"  Topography DEM: {len(us_pts)} endpoints → {n_cells} × {CELL_DEG}° cells")
+    print(f"  Topography DEM: {len(us_pts)} endpoints -> {n_cells} x {CELL_DEG} deg cells")
 
     with tqdm(total=n_cells, desc="Topography DEM (grid cells)", unit="cell") as pbar:
         for (tc, tr), idxs in tile_to_idxs.items():
@@ -1034,7 +1034,7 @@ def enrich_topography(
     if non_us > 0:
         print(f"  Topography: skipping {non_us} non-US points (no 3DEP coverage)")
 
-    print(f"  Topography: {len(populated)} segments → {len(us_pts)} unique US endpoints to query")
+    print(f"  Topography: {len(populated)} segments -> {len(us_pts)} unique US endpoints to query")
 
     # Fetch elevations grouped by native 3DEP tile for reproducibility.
     # Cache the result to disk so re-runs skip the 3DEP API entirely.
@@ -1210,7 +1210,7 @@ def populate_street_features(
     4. Accumulate feature types and geometries per segment.
     5. Compute projected (snapped-to-line) geometries.
     """
-    print("  Street features: querying traffic calming nodes …")
+    print("  Street features: querying traffic calming nodes...")
     tc_gdf = _query_traffic_calming_nodes(place)
     if tc_gdf.empty:
         print("  Street features: no traffic calming nodes found.")
@@ -1453,6 +1453,8 @@ def populate_schema(place: str, *, default_lane_width_m: float = 3.5, default_ma
         populated = _populate_separate_facilities(populated, edges_reset, default_lane_width_m)
     with _track_step("_assign_facility_grid_ids"):
         populated = _assign_facility_grid_ids(populated)
+    with _track_step("_snap_offset_endpoints"):
+        populated = _snap_offset_endpoints(populated, default_lane_width_m)
     with _track_step("_assign_curb_ramp_geometries"):
         populated = _assign_curb_ramp_geometries(populated, default_lane_width_m)
     # --- Ensure all schema columns exist and are ordered correctly ---
@@ -1501,22 +1503,19 @@ def populate_schema(place: str, *, default_lane_width_m: float = 3.5, default_ma
         for col in present_geom_cols:
             pbar.set_postfix_str(col)
             col_values = populated[col].values
-            valid_mask = np.fromiter(
-                (isinstance(g, BaseGeometry) for g in col_values),
-                dtype=bool, count=len(col_values),
-            )
+            valid_mask = np.asarray(shapely.is_geometry(col_values), dtype=bool)
             wkb_result = np.full(len(col_values), None, dtype=object)
             if valid_mask.any():
                 wkb_result[valid_mask] = shapely.to_wkb(np.asarray(col_values[valid_mask]), hex=True)
             populated[col] = wkb_result
             pbar.update(1)
 
-        pbar.set_postfix_str("normalizing buffered columns")
-        # Normalize _buffered columns: pipeline writes True/False booleans while OSM
+        pbar.set_postfix_str("normalizing offset columns")
+        # Normalize _offset columns: pipeline writes True/False booleans while OSM
         # tags provide strings like 'yes'/'no'. Mixed types cause PyArrow serialization
         # failures, so coerce everything to consistent strings before export.
-        buffered_cols = [c for c in populated.columns if c.endswith("_buffered")]
-        for col in buffered_cols:
+        offset_cols = [c for c in populated.columns if c.endswith("_offset")]
+        for col in offset_cols:
             mask_true = populated[col] == True  # noqa: E712
             mask_false = populated[col] == False  # noqa: E712
             populated.loc[mask_true, col] = "yes"
@@ -1537,7 +1536,7 @@ def populate_schema(place: str, *, default_lane_width_m: float = 3.5, default_ma
             if len(non_null) == 0:
                 continue
             # Vectorized type check: if all non-null values are str, no action needed
-            has_non_str = not all(isinstance(v, str) for v in non_null.values)
+            has_non_str = pd.api.types.infer_dtype(non_null, skipna=True) != "string"
             if has_non_str:
                 mask_na = populated[col].isna()
                 populated[col] = populated[col].astype(str)
@@ -1551,7 +1550,7 @@ def populate_schema(place: str, *, default_lane_width_m: float = 3.5, default_ma
 
     _export_elapsed = time.perf_counter() - _export_t0
     if _export_elapsed >= _SLOW_STEP_THRESHOLD_S:
-        print(f"  ⏱ SLOW STEP [{_export_elapsed / 60:.1f} min]: export_parquet")
+        print(f"  SLOW STEP [{_export_elapsed / 60:.1f} min]: export_parquet")
         _slow_steps.append(("export_parquet", _export_elapsed))
 
     print(f"Populated schema parquet exported to {output_path}")
@@ -1578,7 +1577,7 @@ def _create_schema_dataframe():
         # Sidewalk Left
         "sidewalk_left_ID", "sidewalk_left_grid_ID", "sidewalk_left_presence",
         "public_data_id_sidewalk_left", "sidewalk_left_surface", "sidewalk_left_quality",
-        "sidewalk_left_width", "sidewalk_left_incline", "sidewalk_left_seperator", "sidewalk_left_buffered",
+        "sidewalk_left_width", "sidewalk_left_incline", "sidewalk_left_seperator", "sidewalk_left_offset",
         # Curb Ramps Left
         "sidewalk_left_curbramp_start_1_ID", "public_data_id_sidewalk_left_curbramp_start_1",
         "sidewalk_left_curbramp_start_1_returnloc", "sidewalk_left_curbramp_start_1_returnposition",
@@ -1605,7 +1604,7 @@ def _create_schema_dataframe():
         # Sidewalk Right
         "sidewalk_right_ID", "sidewalk_right_grid_ID", "sidewalk_right_presence",
         "public_data_id_sidewalk_right", "sidewalk_right_surface", "sidewalk_right_quality",
-        "sidewalk_right_width", "sidewalk_right_incline", "sidewalk_right_seperator", "sidewalk_right_buffered",
+        "sidewalk_right_width", "sidewalk_right_incline", "sidewalk_right_seperator", "sidewalk_right_offset",
         # Curb Ramps Right
         "sidewalk_right_curbramp_start_1_ID", "public_data_id_sidewalk_right_curbramp_start_1",
         "sidewalk_right_curbramp_start_1_returnloc", "sidewalk_right_curbramp_start_1_returnposition",
@@ -1646,11 +1645,11 @@ def _create_schema_dataframe():
         "bikeway_left_1_id", "bikeway_left_1_grid_id", "public_data_id_bikeway_left_1",
         "bikeway_left_1_type", "bikeway_left_1_surface", "bikeway_left_1_quality",
         "bikeway_left_1_permitted", "bikeway_left_1_width", "bikeway_left_1_incline",
-        "bikeway_left_1_seperator", "bikeway_left_1_buffered",
+        "bikeway_left_1_seperator", "bikeway_left_1_offset",
         "bikeway_left_2_id", "public_data_id_bikeway_left_2",
         "bikeway_left_2_type", "bikeway_left_2_surface", "bikeway_left_2_quality",
         "bikeway_left_2_permitted", "bikeway_left_2_width", "bikeway_left_2_incline",
-        "bikeway_left_2_seperator", "bikeway_left_2_buffered",
+        "bikeway_left_2_seperator", "bikeway_left_2_offset",
         # Bikeway Features Left
         "bikeway_left_1_feature_ids", "bikeway_left_1_feature_types",
         "public_data_id_bikeway_left_1_features", "bikeway_left_1_feature_geometry",
@@ -1661,11 +1660,11 @@ def _create_schema_dataframe():
         "bikeway_right_1_id", "bikeway_right_1_grid_id", "public_data_id_bikeway_right_1",
         "bikeway_right_1_type", "bikeway_right_1_surface", "bikeway_right_1_quality",
         "bikeway_right_1_permitted", "bikeway_right_1_width", "bikeway_right_1_incline",
-        "bikeway_right_1_seperator", "bikeway_right_1_buffered",
+        "bikeway_right_1_seperator", "bikeway_right_1_offset",
         "bikeway_right_2_id", "public_data_id_bikeway_right_2",
         "bikeway_right_2_type", "bikeway_right_2_surface", "bikeway_right_2_quality",
         "bikeway_right_2_permitted", "bikeway_right_2_width", "bikeway_right_2_incline",
-        "bikeway_right_2_seperator", "bikeway_right_2_buffered",
+        "bikeway_right_2_seperator", "bikeway_right_2_offset",
         # Bikeway Features Right
         "bikeway_right_1_feature_ids", "bikeway_right_1_feature_types",
         "public_data_id_bikeway_right_1_features", "bikeway_right_1_feature_geometry",
@@ -1762,12 +1761,12 @@ def populate_base_bikelanes(
         new_cols["bikeway_right_2_seperator"] = _get("cycleway:right:2:buffer")
         pbar.update(1)
 
-        # Pre-create geometry and buffered columns so the separate-facility
+        # Pre-create geometry and offset columns so the separate-facility
         # matching loop never triggers __setitem__ column creation (fragmentation).
         for _side in ("left", "right"):
             for _slot in ("1", "2"):
                 new_cols[f"bikeway_{_side}_{_slot}_geometry"] = None
-                new_cols[f"bikeway_{_side}_{_slot}_buffered"] = pd.NA
+                new_cols[f"bikeway_{_side}_{_slot}_offset"] = pd.NA
         pbar.update(1)
 
     return _add_cols(populated, new_cols)
@@ -1780,8 +1779,8 @@ def populate_base_footlanes(
 ) -> gpd.GeoDataFrame:
     """Populate centerline-derived sidewalk columns from OSM sidewalk tags.
 
-    Does not set buffered or geometry — the separate facilities pass writes
-    geometry where OSM footway edges exist, and the buffering pass generates
+    Does not set offset or geometry — the separate facilities pass writes
+    geometry where OSM footway edges exist, and the offset pass generates
     perpendicular offsets for any side that has presence data but no geometry.
     """
 
@@ -1822,11 +1821,11 @@ def populate_base_footlanes(
         new_cols["sidewalk_right_seperator"] = _get("sidewalk:right:buffer")
         pbar.update(1)
 
-        # Pre-create geometry and buffered columns so the separate-facility
+        # Pre-create geometry and offset columns so the separate-facility
         # matching loop never triggers __setitem__ column creation (fragmentation).
         for _side in ("left", "right"):
             new_cols[f"sidewalk_{_side}_geometry"] = None
-            new_cols[f"sidewalk_{_side}_buffered"] = pd.NA
+            new_cols[f"sidewalk_{_side}_offset"] = pd.NA
         pbar.update(1)
 
     return _add_cols(populated, new_cols)
@@ -1874,8 +1873,8 @@ def _populate_separate_facilities(
 
     Processes bikelanes first, then sidewalks. For ambiguous edges (e.g. a
     ``path`` with no bicycle/foot qualifier), bikelane classification takes
-    priority. Separate geometry always wins over buffered offsets — if a
-    matched edge is written, buffered is set to False.
+    priority. Separate geometry always wins over offset geometry — if a
+    matched edge is written, offset is set to False.
     - collision check during proximity matching is row-scoped per spec step 4
     """
     hw      = edges_reset.get("highway", pd.Series(dtype=object))
@@ -2006,7 +2005,21 @@ def _populate_separate_facilities(
             return None
         return val if isinstance(val, str) else None
 
-    def _match_road_by_name(sindex, fac_geom, fac_mid, df, fac_name: str | None):
+    # Pre-cache normalized road names and street geometries for O(1) lookup
+    # inside _match_road_by_name — replaces hot-path populated.at[] reads.
+    _road_norm_names_cache: dict[int, str | None] = cast(
+        dict[int, str | None],
+        {idx: _normalize_name(v) for idx, v in roads["name"].items()}
+        if "name" in roads.columns else {}
+    )
+    _road_street_geoms_cache: dict[int, BaseGeometry] = cast(
+        dict[int, BaseGeometry],
+        {idx: g for idx, g in roads["street_geometry"].items() if isinstance(g, BaseGeometry)}
+        if "street_geometry" in roads.columns else {}
+    )
+
+    def _match_road_by_name(sindex, fac_geom, fac_mid, df, fac_name: str | None,
+                            fac_bearing: float | None = None):
         """Find the best road segment for a facility edge using name + proximity.
 
         Strategy:
@@ -2017,6 +2030,9 @@ def _populate_separate_facilities(
            named footways/cycleways that don't match any road by name are
            independent paths (plazas, trails, etc.) and should not be
            adopted as a sidewalk of the nearest road.
+
+        ``fac_bearing`` may be supplied as a pre-computed value to avoid a
+        redundant scalar bearing computation inside the unnamed-facility branch.
 
         Returns (road_idx, road_geom, side).
         """
@@ -2032,11 +2048,11 @@ def _populate_separate_facilities(
             hit_positions = sindex.query(search_area)
             for pos in hit_positions:
                 ridx = df.index[pos]
-                rname = _normalize_name(populated.at[ridx, "name"] if "name" in populated.columns else None)  # type: ignore[index]
+                rname = _road_norm_names_cache.get(ridx)
                 if rname != norm_fac:
                     continue
-                rgeom = populated.at[ridx, "street_geometry"]  # type: ignore[index]
-                if not isinstance(rgeom, BaseGeometry):
+                rgeom = _road_street_geoms_cache.get(ridx)
+                if rgeom is None:
                     continue
                 d = rgeom.distance(fac_geom)
                 if d < best_dist:
@@ -2052,7 +2068,8 @@ def _populate_separate_facilities(
         # roughly parallel.  A sidewalk always runs alongside its road; a
         # perpendicular footway (e.g. one sharing only a node with a service
         # driveway) must not be adopted by that road.
-        fac_bearing = _linestring_bearing(fac_geom)
+        if fac_bearing is None:
+            fac_bearing = _linestring_bearing(fac_geom)
         fac_len = fac_geom.length
         search_area = fac_geom.buffer(_NAME_MATCH_RADIUS_M)
         hit_positions = sindex.query(search_area)
@@ -2065,8 +2082,8 @@ def _populate_separate_facilities(
         _par_candidates: list[tuple[float, int, BaseGeometry]] = []
         for pos in hit_positions:
             ridx = df.index[pos]
-            rgeom = populated.at[ridx, "street_geometry"]  # type: ignore[index]
-            if not isinstance(rgeom, BaseGeometry):
+            rgeom = _road_street_geoms_cache.get(ridx)
+            if rgeom is None:
                 continue
             if fac_bearing is not None:
                 road_bearing = _road_bearing_cache.get(ridx)
@@ -2096,7 +2113,7 @@ def _populate_separate_facilities(
     n_bike_slot_full = 0
 
     # Pre-compute geometry and tag properties for bikeways as positional lists.
-    cy_mids_list  = [g.interpolate(0.5, normalized=True) if g is not None else None for g in cycleways.geometry]
+    cy_mids_list  = shapely.line_interpolate_point(np.asarray(cycleways.geometry), 0.5, normalized=True).tolist()
     cy_names_list = list(cycleways["name"]) if "name" in cycleways.columns else [None] * len(cycleways)
     cy_geoms_list: list[BaseGeometry] = list(cycleways.geometry)
     cy_highway_list = list(cycleways["highway"]) if "highway" in cycleways.columns else [pd.NA] * len(cycleways)
@@ -2104,14 +2121,21 @@ def _populate_separate_facilities(
     cy_width_list   = list(cycleways["width"])   if "width"   in cycleways.columns else [pd.NA] * len(cycleways)
     cy_bicycle_list = list(cycleways["bicycle"]) if "bicycle" in cycleways.columns else [pd.NA] * len(cycleways)
     cy_incline_list = list(cycleways["incline"]) if "incline" in cycleways.columns else [pd.NA] * len(cycleways)
+    cy_coerced_names_list = [_coerce_name_raw(n) for n in cy_names_list]
+    # Pre-batch bearing computation for all cycleways (avoids per-edge scalar call inside _match_road_by_name)
+    _cy_bear_arr = _linestring_bearings_vectorized(cycleways.geometry).values
+    cy_bearings_list: list[float | None] = [
+        None if np.isnan(b) else float(b) for b in _cy_bear_arr
+    ]
 
     for cy_pos in tqdm(range(len(cycleways)), total=len(cycleways), desc="Matching bikeways", unit="edge"):
         cy_geom    = cy_geoms_list[cy_pos]
         cy_mid     = cy_mids_list[cy_pos]
-        cy_name = _coerce_name_raw(cy_names_list[cy_pos])
+        cy_name = cy_coerced_names_list[cy_pos]
 
         road_idx, road_geom, side = _match_road_by_name(
-            road_sindex, cy_geom, cy_mid, roads, cy_name)
+            road_sindex, cy_geom, cy_mid, roads, cy_name,
+            fac_bearing=cy_bearings_list[cy_pos])
         if road_idx is None:
             continue
         slot, is_merge = _bikeway_slot_or_merge(road_idx, side, cy_geom)
@@ -2140,7 +2164,7 @@ def _populate_separate_facilities(
             populated.at[road_idx, f"{prefix}_permitted"] = cy_bicycle_list[cy_pos]  # type: ignore[index]
             populated.at[road_idx, f"{prefix}_incline"]   = _parse_incline(cy_incline_list[cy_pos])  # type: ignore[index]
             populated.at[road_idx, f"{prefix}_geometry"]  = cy_geom  # type: ignore[index]
-            populated.at[road_idx, f"{prefix}_buffered"]  = False  # type: ignore[index]
+            populated.at[road_idx, f"{prefix}_offset"]  = False  # type: ignore[index]
             bike_slots_used.add((road_idx, side, slot))
             _is_centerline(cy_geom, cast(BaseGeometry, road_geom), road_idx, prefix, populated)
             n_bike_matched += 1
@@ -2209,7 +2233,7 @@ def _populate_separate_facilities(
 
     # Pre-compute geometry and tag properties for footways as positional lists.
     # Avoids expensive DataFrame.iloc[] lookups (~107k times) in the hot loop.
-    fw_mids_list  = [g.interpolate(0.5, normalized=True) if g is not None else None for g in footways.geometry]
+    fw_mids_list  = shapely.line_interpolate_point(np.asarray(footways.geometry), 0.5, normalized=True).tolist()
     fw_names_list = list(footways["name"]) if "name" in footways.columns else [None] * len(footways)
     fw_geoms_list: list[BaseGeometry] = list(footways.geometry)
     fw_surface_list = list(footways["surface"]) if "surface" in footways.columns else [pd.NA] * len(footways)
@@ -2245,20 +2269,29 @@ def _populate_separate_facilities(
         if n_name_inherited:
             print(f"  Name inheritance: {n_name_inherited} unnamed footways inherited names from adjacent named footways")
 
+    # Pre-normalize footway names once — avoids double _normalize_name call per iteration.
+    fw_norm_names_list = [_normalize_name(n) for n in coerced_fw_names]
+    # Pre-batch bearing computation for all footways (avoids per-edge scalar call inside _match_road_by_name)
+    _fw_bear_arr = _linestring_bearings_vectorized(footways.geometry).values
+    fw_bearings_list: list[float | None] = [
+        None if np.isnan(b) else float(b) for b in _fw_bear_arr
+    ]
+
     for fw_pos in tqdm(range(len(footways)), total=len(footways), desc="Matching footways", unit="edge"):
         fw_geom = fw_geoms_list[fw_pos]
         fw_mid  = fw_mids_list[fw_pos]
-        fw_name = _coerce_name_raw(fw_names_list[fw_pos])
+        fw_name = coerced_fw_names[fw_pos]
 
         road_idx, road_geom, side = _match_road_by_name(
-            road_sindex, fw_geom, fw_mid, roads, fw_name)
+            road_sindex, fw_geom, fw_mid, roads, fw_name,
+            fac_bearing=fw_bearings_list[fw_pos])
         if road_idx is None:
             _dbg_no_match += 1
             continue
         side = cast(str, side)  # type guard: side is non-None when road_idx is non-None
         # Track whether this was a name-based match
-        if _normalize_name(fw_name) is not None and _normalize_name(fw_name) == _normalize_name(
-                populated.at[road_idx, "name"] if "name" in populated.columns else None):  # type: ignore[index]
+        _norm_fw = fw_norm_names_list[fw_pos]
+        if _norm_fw is not None and _norm_fw == _road_norm_names_cache.get(road_idx):
             n_foot_name_matched += 1
 
         prefix = f"sidewalk_{side}"
@@ -2304,12 +2337,12 @@ def _populate_separate_facilities(
                 _new_fc = _flatten_coords(fw_geom)
                 _ex_parts = list(existing.geoms) if isinstance(existing, MultiLineString) else [existing]
                 _is_rev_dup = False
+                _new_arr = np.array(_new_fc, dtype=np.float64) if _new_fc else None
                 for _ep in _ex_parts:
                     _ep_fc = _flatten_coords(_ep)
-                    if len(_new_fc) == len(_ep_fc) and len(_new_fc) >= 2:
-                        _rev = list(reversed(_new_fc))
-                        if all(abs(a[0] - b[0]) < 0.05 and abs(a[1] - b[1]) < 0.05
-                               for a, b in zip(_rev, _ep_fc)):
+                    if _new_arr is not None and len(_new_fc) == len(_ep_fc) and len(_new_fc) >= 2:
+                        _ep_arr = np.array(_ep_fc, dtype=np.float64)
+                        if np.all(np.abs(_new_arr[::-1] - _ep_arr) < 0.05):
                             _is_rev_dup = True
                             break
                 if _is_rev_dup:
@@ -2330,7 +2363,7 @@ def _populate_separate_facilities(
                     if winner_after is not None and isinstance(winner_after, BaseGeometry):
                         if not winner_after.is_simple:
                             populated.at[road_idx, f"{prefix}_geometry"] = None  # type: ignore[index]
-                            populated.at[road_idx, f"{prefix}_buffered"] = True  # type: ignore[index]
+                            populated.at[road_idx, f"{prefix}_offset"] = True  # type: ignore[index]
                             n_foot_suspect[side] += 1
                 else:
                     # Existing is longer and not adjacent — discard new edge.
@@ -2346,19 +2379,19 @@ def _populate_separate_facilities(
             populated.at[road_idx, f"{prefix}_incline"]  = _parse_incline(fw_incline_list[fw_pos])  # type: ignore[index]
             populated.at[road_idx, f"{prefix}_quality"]  = fw_smooth_list[fw_pos]  # type: ignore[index]
             populated.at[road_idx, f"{prefix}_geometry"] = fw_geom  # type: ignore[index]
-            populated.at[road_idx, f"{prefix}_buffered"] = False  # type: ignore[index]
+            populated.at[road_idx, f"{prefix}_offset"] = False  # type: ignore[index]
             foot_slots_used.add(slot_key)
             if _is_centerline(fw_geom, cast(BaseGeometry, road_geom), road_idx, prefix, populated):
                 _dbg_centerline += 1
             # For separate facilities, only reject self-intersecting geometry.
             # Sinuosity-based rejection is too aggressive for legitimate curved
             # sidewalks (cul-de-sac perimeters, U-turns) — prioritize separate
-            # OSM geometry over algorithmic buffered offsets.
+            # OSM geometry over algorithmic offsets.
             geom_after = populated.at[road_idx, f"{prefix}_geometry"]  # type: ignore[index]
             if geom_after is not None and isinstance(geom_after, BaseGeometry):
                 if not geom_after.is_simple:
                     populated.at[road_idx, f"{prefix}_geometry"] = None  # type: ignore[index]
-                    populated.at[road_idx, f"{prefix}_buffered"] = True  # type: ignore[index]
+                    populated.at[road_idx, f"{prefix}_offset"] = True  # type: ignore[index]
                     n_foot_suspect[side] += 1
                     _dbg_suspect += 1
             n_foot_matched += 1
@@ -2374,7 +2407,7 @@ def _populate_separate_facilities(
           f"cum_length={_dbg_cum_length}, dedup={n_foot_deduped}, "
           f"centerline={_dbg_centerline}, suspect={_dbg_suspect}")
     print(
-        f"[sidewalk] Suspect geometries discarded → flagged for buffering: "
+        f"[sidewalk] Suspect geometries discarded -> flagged for offset: "
         f"left={n_foot_suspect['left']}, right={n_foot_suspect['right']}"
     )
     print(
@@ -2382,21 +2415,21 @@ def _populate_separate_facilities(
         f"left={n_foot_replaced['left']}, right={n_foot_replaced['right']}"
     )
 
-    # ── Buffering pass (spec steps 4 & 5) ────────────────────────────────
+    # ── Offset pass (spec steps 4 & 5) ───────────────────────────────────
     # For road segments with presence/type data but no geometry, generate a
-    # perpendicular-offset geometry from the street centerline (buffered=True).
+    # perpendicular-offset geometry from the street centerline (offset=True).
     #
-    # Sidewalk suppression: before buffering a sidewalk slot, check whether
+    # Sidewalk suppression: before offsetting a sidewalk slot, check whether
     # any separate sidewalk geometry (left OR right, from any road) with a
     # parallel bearing already exists within NEARBY_SEPARATE_SIDEWALK_THRESHOLD_M
-    # of the street centerline.  This prevents duplicate buffered sidewalks on
+    # of the street centerline.  This prevents duplicate offset sidewalks on
     # inner service roads that run parallel to a primary road whose real
     # outer sidewalk is already mapped.  The unified (left+right) tree is used
     # so that cross-slot duplicates (service road left ↔ primary road right) are
     # detected correctly.
     _NEGATIVE_VALUES = {"no", "none"}
     # Presence values indicating the sidewalk is mapped as a separate OSM way.
-    # These should never trigger buffered-offset geometry.
+    # These should never trigger offset geometry.
     # Separate footway edges always write "separate" to the presence column;
     # OSM centerline tags (sidewalk:left/right=separate) also produce "separate".
     _SEPARATE_PRESENCE_VALUES = {"separate"}
@@ -2407,51 +2440,81 @@ def _populate_separate_facilities(
     all_sep_sw_row_indices: list = []  # row index to prevent self-suppression
     for sw_side in ("left", "right"):
         gcol = f"sidewalk_{sw_side}_geometry"
-        bcol = f"sidewalk_{sw_side}_buffered"
+        bcol = f"sidewalk_{sw_side}_offset"
         if gcol not in populated.columns:
             continue
         geom_series = populated[gcol]
 
-        # Vectorized pre-filter: rows that have real geometry and are not buffered
-        has_geom = pd.Series([isinstance(g, BaseGeometry) for g in geom_series.values],
-                              index=populated.index, dtype=bool)
+        # Vectorized pre-filter: rows that have real geometry and are not offset
+        has_geom = pd.Series(np.asarray(shapely.is_geometry(geom_series.values), dtype=bool),
+                              index=populated.index)
         if bcol in populated.columns:
             bvals = populated[bcol]
-            is_buffered = bvals.eq(True) | bvals.astype(str).str.lower().eq("yes")
+            is_offset = bvals.eq(True) | bvals.astype(str).str.lower().eq("yes")
         else:
-            is_buffered = pd.Series(False, index=populated.index)
-        valid_idx = populated.index[has_geom & ~is_buffered]
+            is_offset = pd.Series(False, index=populated.index)
+        valid_idx = populated.index[has_geom & ~is_offset]
 
-        for idx in valid_idx:
-            g = cast(BaseGeometry, geom_series.at[idx])
-            bearing = _linestring_bearing(g)
-            if bearing is None:
-                continue
-            all_sep_sw_geoms.append(g)
-            all_sep_sw_bearings.append(bearing)
-            all_sep_sw_row_indices.append(idx)
+        # Batch-compute bearings for all valid geometries at once
+        _valid_geoms    = geom_series.loc[valid_idx]
+        _bearing_series = _linestring_bearings_vectorized(_valid_geoms)
+        _has_bearing    = _bearing_series.notna()
+        all_sep_sw_geoms.extend(list(_valid_geoms[_has_bearing]))
+        all_sep_sw_bearings.extend(_bearing_series[_has_bearing].tolist())
+        all_sep_sw_row_indices.extend(_valid_geoms[_has_bearing].index.tolist())
 
     sep_sw_tree = STRtree(all_sep_sw_geoms) if all_sep_sw_geoms else None
-    total_buffered = 0
+    total_offset = 0
     total_skipped = 0
 
-    # Pre-create all facility geometry and buffered columns at once
+    # ── Antiparallel deduplication ────────────────────────────────────────────
+    # For two-way streets osmnx creates both the (u→v) and (v→u) directed edges.
+    # Both inherit the same sidewalk tags, so both become offset candidates.
+    # Offsetting both produces duplicate offset geometries (A.left = B.right,
+    # A.right = B.left).  Pre-mark the later-indexed reversed edge for
+    # suppression so only the first-seen direction is offset.
+    _antiparallel_suppressed: set = set()
+    if ("start_node_id" in populated.columns
+            and "end_node_id" in populated.columns
+            and "street_id" in populated.columns):
+        _seen_dir: dict[tuple, Any] = {}
+        _ap_u_arr   = populated["start_node_id"].values
+        _ap_v_arr   = populated["end_node_id"].values
+        _ap_sid_arr = populated["street_id"].values
+        for _ap_i, _ap_idx in enumerate(populated.index):
+            _u   = _ap_u_arr[_ap_i]
+            _v   = _ap_v_arr[_ap_i]
+            _sid = _ap_sid_arr[_ap_i]
+            if pd.isna(_u) or pd.isna(_v):
+                continue
+            _u = cast(int, int(_u))
+            _v = cast(int, int(_v))
+            _sid_key = tuple(_sid) if isinstance(_sid, list) else _sid
+            _fwd = (_sid_key, _u, _v)
+            _rev = (_sid_key, _v, _u)
+            if _rev in _seen_dir:
+                _antiparallel_suppressed.add(_ap_idx)
+            else:
+                _seen_dir[_fwd] = _ap_idx
+    print(f"Antiparallel suppression: {len(_antiparallel_suppressed)} reverse-direction edges marked.")
+
+    # Pre-create all facility geometry and offset columns at once
     _pre_facility_cols = {}
     for _kind, _side, _slot in _FACILITY_SLOTS:
         _sub = f"{_kind}_{_side}_{_slot}" if _slot else f"{_kind}_{_side}"
-        for _col in (f"{_sub}_geometry", f"{_sub}_buffered"):
+        for _col in (f"{_sub}_geometry", f"{_sub}_offset"):
             if _col not in populated.columns:
                 _pre_facility_cols[_col] = pd.NA
     if _pre_facility_cols:
         populated = _add_cols(populated, _pre_facility_cols)
 
-    # Debug counters for _buffer_segment failure modes
-    _buffer_debug = {"n_empty_offset": 0, "collision_counts": {}}
+    # Debug counters for _offset_segment failure modes
+    _offset_debug = {"n_empty_offset": 0, "collision_counts": {}}
 
     for kind, side, slot in _FACILITY_SLOTS:
         sub_id   = f"{kind}_{side}_{slot}" if slot else f"{kind}_{side}"
         geom_col = f"{sub_id}_geometry"
-        buff_col = f"{sub_id}_buffered"
+        offset_col = f"{sub_id}_offset"
         data_col = f"{sub_id}_type" if kind == "bikeway" else f"{sub_id}_presence"
 
         if data_col not in populated.columns:
@@ -2466,8 +2529,8 @@ def _populate_separate_facilities(
         else:
             skip_values = _NEGATIVE_VALUES
         has_data = populated[data_col].notna() & ~populated[data_col].astype(str).str.lower().isin(skip_values)
-        no_geom  = pd.Series([not isinstance(g, BaseGeometry) for g in populated[geom_col].values],
-                              index=populated.index, dtype=bool)
+        no_geom  = ~pd.Series(np.asarray(shapely.is_geometry(populated[geom_col].values), dtype=bool),
+                               index=populated.index)
         candidates = has_data & no_geom
         print(f"  [{sub_id}] candidates: {candidates.sum()}, has_data: {has_data.sum()}, no_geom: {no_geom.sum()}")
         if not candidates.any():
@@ -2476,8 +2539,8 @@ def _populate_separate_facilities(
         n_no_street_geom = 0
         n_suppressed_here = 0
         n_suppressed_intersection = 0
-        n_buffer_called = 0
-        n_buffer_wrote = 0
+        n_offset_called = 0
+        n_offset_wrote = 0
         for idx in populated.index[candidates]:
             street_geom = populated.at[idx, "street_geometry"]
             if street_geom is None or not hasattr(street_geom, "geom_type"):
@@ -2489,7 +2552,7 @@ def _populate_separate_facilities(
             # intersection endpoint that are shorter than the road width
             # (lanes × lane_width) represent road surface within the
             # intersection itself — there is no physical sidewalk alongside
-            # them.  Skip buffering entirely.
+            # them.  Skip offset entirely.
             start_is_inter = bool(populated.at[idx, "start_node_is_intersection_node"])
             end_is_inter   = bool(populated.at[idx, "end_node_is_intersection_node"])
             if start_is_inter or end_is_inter:
@@ -2503,21 +2566,27 @@ def _populate_separate_facilities(
                     continue
 
             # Roundabout suppression: OSM junction=roundabout segments form a
-            # circular ring; buffering them inward produces geometry in the
+            # circular ring; offsetting them inward produces geometry in the
             # middle of the intersection island that has no physical sidewalk.
-            # Skip buffering entirely for any segment on a roundabout.
+            # Skip offset entirely for any segment on a roundabout.
             if kind == "sidewalk" and "junction" in populated.columns:
                 junction_val = populated.at[idx, "junction"]
                 if isinstance(junction_val, str) and junction_val.lower() == "roundabout":
                     n_suppressed_intersection += 1
                     continue
 
+            # Antiparallel suppression: skip the reverse-direction duplicate
+            # of a two-way street edge (A.left = B.right, A.right = B.left).
+            if idx in _antiparallel_suppressed:
+                n_suppressed_intersection += 1
+                continue
+
             # Sidewalk suppression: skip if a nearby parallel separate sidewalk
             # exists on the same side.  Only guard is same-row (a row's own
             # separate geometry can't cause false suppression since it already
-            # has geometry and therefore isn't a buffering candidate).  This
+            # has geometry and therefore isn't an offset candidate).  This
             # allows separate sidewalks from adjacent segments of the SAME
-            # street to suppress buffering, preventing mixed separate/buffered
+            # street to suppress offset, preventing mixed separate/offset
             # output on streets with inconsistent OSM footway coverage.
             if kind == "sidewalk" and sep_sw_tree is not None:
                 street_bearing = _linestring_bearing(street_geom)
@@ -2545,25 +2614,25 @@ def _populate_separate_facilities(
                         n_suppressed_here += 1
                         continue
 
-            n_buffer_called += 1
-            populated = _buffer_segment(idx, sub_id, street_geom, populated, side, _buffer_debug, default_lane_width_m)
+            n_offset_called += 1
+            populated = _offset_segment(idx, sub_id, street_geom, populated, side, _offset_debug, default_lane_width_m)
             geom_after = populated.at[idx, geom_col]
             if geom_after is not None and hasattr(geom_after, "geom_type"):
-                n_buffer_wrote += 1
-                total_buffered += 1
+                n_offset_wrote += 1
+                total_offset += 1
 
         print(f"    no_street_geom={n_no_street_geom}, suppressed={n_suppressed_here}, "
               f"intersection_skip={n_suppressed_intersection}, "
-              f"buffer_called={n_buffer_called}, buffer_wrote={n_buffer_wrote}")
+              f"offset_called={n_offset_called}, offset_wrote={n_offset_wrote}")
 
-    print(f"Buffering pass: {total_buffered} facility segments offset from centerline"
+    print(f"Offset pass: {total_offset} facility segments offset from centerline"
           f" ({total_skipped} sidewalk slots skipped — nearby separate sidewalk exists).")
-    print(f"  _buffer_segment failures: empty_offset={_buffer_debug['n_empty_offset']}, "
-          f"collisions={_buffer_debug['collision_counts']}")
-    if "empty_offset_detail" in _buffer_debug:
-        print(f"  empty_offset breakdown: {_buffer_debug['empty_offset_detail']}")
-    if "nan_source_counts" in _buffer_debug:
-        print(f"  NaN source breakdown: {_buffer_debug['nan_source_counts']}")
+    print(f"  _offset_segment failures: empty_offset={_offset_debug['n_empty_offset']}, "
+          f"collisions={_offset_debug['collision_counts']}")
+    if "empty_offset_detail" in _offset_debug:
+        print(f"  empty_offset breakdown: {_offset_debug['empty_offset_detail']}")
+    if "nan_source_counts" in _offset_debug:
+        print(f"  NaN source breakdown: {_offset_debug['nan_source_counts']}")
     return populated
 
 
@@ -2772,7 +2841,7 @@ def _is_centerline(
 
     Uses ``CENTERLINE_COINCIDENCE_THRESHOLD_M`` (default 1 m) and requires
     ≥95% of the facility length to fall within that corridor.  When confirmed,
-    clears the geometry and marks ``buffered=True`` so the buffering pass knows
+    clears the geometry and marks ``offset=True`` so the offset pass knows
     to generate a perpendicular offset for this row.
 
     Returns True when the facility was flagged as centerline-coincident.
@@ -2787,12 +2856,12 @@ def _is_centerline(
     if covered / facility_geom.length < 0.95:
         return False
 
-    # Confirmed centerline-coincident: clear geometry and mark row for buffering
+    # Confirmed centerline-coincident: clear geometry and mark row for offset
     geom_col = f"{sub_facility_id}_geometry"
     populated.at[road_idx, geom_col] = None
 
-    buffered_col = f"{sub_facility_id}_buffered"
-    populated.at[road_idx, buffered_col] = True
+    offset_col = f"{sub_facility_id}_offset"
+    populated.at[road_idx, offset_col] = True
 
     return True
 
@@ -2813,7 +2882,7 @@ def _parse_numeric(val, default: float) -> float:
         return default
 
 
-def _buffer_segment(
+def _offset_segment(
     street_id,
     sub_facility_id: str,
     facility_geom,
@@ -2830,7 +2899,7 @@ def _buffer_segment(
     2. Generates a parallel-offset LineString in the direction of *side*.
        Falls back to progressively smaller offsets if the geometry is degenerate.
     3. Row-scoped collision check against same-row facility geometries (spec step 4).
-    4. Writes the geometry and sets the ``*_buffered`` flag.
+    4. Writes the geometry and sets the ``*_offset`` flag.
 
     Parameters
     ----------
@@ -2893,7 +2962,7 @@ def _buffer_segment(
     # If the full offset fails (empty/degenerate), try progressively smaller
     # offsets down to 25% of the original distance.
     sign = 1 if side == "left" else -1
-    buffered_geom: BaseGeometry | None = None
+    offset_geom: BaseGeometry | None = None
     for fraction in (1.0, 0.75, 0.5, 0.25):
         try:
             cur_offset = sign * offset_m * fraction
@@ -2904,11 +2973,11 @@ def _buffer_segment(
                     abs(cur_offset), side=side, resolution=16, join_style=2,
                 )
             if not candidate.is_empty:
-                buffered_geom = candidate
+                offset_geom = candidate
                 break
         except Exception:
             continue
-    if buffered_geom is None:
+    if offset_geom is None:
         debug["n_empty_offset"] += 1
         # Track why offsets are empty
         gt = facility_geom.geom_type if hasattr(facility_geom, "geom_type") else "unknown"
@@ -2923,7 +2992,7 @@ def _buffer_segment(
 
     # --- 5. Collision checks -----------------------------------------------
     own_geom_col    = f"{sub_facility_id}_geometry"
-    endpoint_buffer = buffered_geom.boundary.buffer(1e-6)
+    endpoint_buffer = offset_geom.boundary.buffer(1e-6)
 
     def _mid_intersection_clear(a, b) -> bool:
         """Return True if a∩b is empty or confined to endpoints only."""
@@ -2952,7 +3021,7 @@ def _buffer_segment(
         other_geom = populated.at[street_id, col]
         if other_geom is None or not hasattr(other_geom, "intersects"):
             continue
-        if not _mid_intersection_clear(buffered_geom, other_geom):
+        if not _mid_intersection_clear(offset_geom, other_geom):
             debug["collision_counts"][col] = debug["collision_counts"].get(col, 0) + 1
             return populated
 
@@ -2961,11 +3030,11 @@ def _buffer_segment(
     # Collision checking is row-scoped only (per spec step 4).
 
     geom_col = own_geom_col
-    populated.at[street_id, geom_col] = buffered_geom  # type: ignore[index]
+    populated.at[street_id, geom_col] = offset_geom  # type: ignore[index]
 
-    # --- 6. Mark the slot as buffered -----------------------------------------
-    buffered_col = f"{sub_facility_id}_buffered"
-    populated.at[street_id, buffered_col] = True
+    # --- 6. Mark the slot as offset -------------------------------------------
+    offset_col = f"{sub_facility_id}_offset"
+    populated.at[street_id, offset_col] = True
 
     return populated
 
@@ -2978,6 +3047,784 @@ def _is_na(val) -> bool:
         return bool(pd.isna(val))
     except (TypeError, ValueError):
         return False
+
+
+_ENDPOINT_SNAP_APPROACH_M = 5.0    # use last N metres of line to compute approach bearing
+_ENDPOINT_SNAP_MAX_EXTEND_M = 12.0 # max extension length for line-intersection snapping
+_ENDPOINT_SNAP_CORNER_ANGLE = 60.0 # max angular spread (degrees) for endpoints in one corner
+
+
+def _snap_offset_endpoints(
+    populated: gpd.GeoDataFrame,
+    default_lane_width_m: float = _DEFAULT_LANE_WIDTH_M,
+) -> gpd.GeoDataFrame:
+    """Snap offset sidewalk endpoints at intersection nodes.
+
+    Corner-grouping algorithm:
+
+    1. At each intersection node, collect all sidewalk endpoints with their
+       positions, tangent bearings, and angle from the node center.
+    2. Group endpoints into **corners** by angular proximity (sorted by
+       angle, consecutive endpoints within ``_ENDPOINT_SNAP_CORNER_ANGLE``
+       degrees).
+    3. For each corner with 2+ endpoints from different segments:
+       a. Find all non-parallel ray-ray intersections among the endpoints.
+       b. Average the valid intersection points to get the corner point.
+       c. If no valid intersections (all parallel), use the centroid.
+       d. Move every endpoint in the corner to the corner point.
+    """
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _tangent_bearing(coords: list[tuple[float, float]], end: str) -> float:
+        """Bearing the sidewalk line is *heading* at the given endpoint.
+
+        For ``end="start"``: bearing from interior toward coords[0].
+        For ``end="end"``: bearing from interior toward coords[-1].
+        Uses the last ``_ENDPOINT_SNAP_APPROACH_M`` metres of the line.
+        """
+        if end == "start":
+            total = 0.0
+            prev = coords[0]
+            interior = coords[min(1, len(coords) - 1)]
+            for i in range(1, len(coords)):
+                cx, cy = coords[i]
+                dx, dy = cx - prev[0], cy - prev[1]
+                total += math.sqrt(dx * dx + dy * dy)
+                interior = coords[i]
+                prev = coords[i]
+                if total >= _ENDPOINT_SNAP_APPROACH_M:
+                    break
+            ddx = coords[0][0] - interior[0]
+            ddy = coords[0][1] - interior[1]
+        else:
+            total = 0.0
+            prev = coords[-1]
+            interior = coords[max(-2, -len(coords))]
+            for i in range(len(coords) - 2, -1, -1):
+                cx, cy = coords[i]
+                dx, dy = cx - prev[0], cy - prev[1]
+                total += math.sqrt(dx * dx + dy * dy)
+                interior = coords[i]
+                prev = coords[i]
+                if total >= _ENDPOINT_SNAP_APPROACH_M:
+                    break
+            ddx = coords[-1][0] - interior[0]
+            ddy = coords[-1][1] - interior[1]
+
+        if ddx == 0 and ddy == 0:
+            return 0.0
+        return math.degrees(math.atan2(ddx, ddy)) % 360
+
+    def _ray_intersect(
+        p1: tuple[float, float], bearing1: float,
+        p2: tuple[float, float], bearing2: float,
+        max_dist: float,
+    ) -> tuple[float, float] | None:
+        """Intersect two forward rays.  Returns None if parallel, behind, or too far."""
+        r1, r2 = math.radians(bearing1), math.radians(bearing2)
+        dx1, dy1 = math.sin(r1), math.cos(r1)
+        dx2, dy2 = math.sin(r2), math.cos(r2)
+
+        det = dx1 * dy2 - dy1 * dx2
+        if abs(det) < 1e-10:
+            return None  # parallel / antiparallel
+
+        dpx, dpy = p2[0] - p1[0], p2[1] - p1[1]
+        t1 = (dpx * dy2 - dpy * dx2) / det
+        t2 = (dpx * dy1 - dpy * dx1) / det
+
+        if t1 < -0.5 or t2 < -0.5:
+            return None  # meeting point behind one of the endpoints
+
+        ix = p1[0] + t1 * dx1
+        iy = p1[1] + t1 * dy1
+
+        d1_sq = (ix - p1[0]) ** 2 + (iy - p1[1]) ** 2
+        d2_sq = (ix - p2[0]) ** 2 + (iy - p2[1]) ** 2
+        if d1_sq > max_dist * max_dist or d2_sq > max_dist * max_dist:
+            return None
+
+        return (ix, iy)
+
+    def _line_intersect(
+        p1: tuple[float, float], bearing1: float,
+        p2: tuple[float, float], bearing2: float,
+        max_dist: float,
+    ) -> tuple[float, float] | None:
+        """Intersect two infinite lines (no forward check).
+
+        Used in Stage 2 where cross-product already ensures correct pairing.
+        """
+        r1, r2 = math.radians(bearing1), math.radians(bearing2)
+        dx1, dy1 = math.sin(r1), math.cos(r1)
+        dx2, dy2 = math.sin(r2), math.cos(r2)
+
+        det = dx1 * dy2 - dy1 * dx2
+        if abs(det) < 1e-10:
+            return None
+
+        dpx, dpy = p2[0] - p1[0], p2[1] - p1[1]
+        t1 = (dpx * dy2 - dpy * dx2) / det
+
+        ix = p1[0] + t1 * dx1
+        iy = p1[1] + t1 * dy1
+
+        d1_sq = (ix - p1[0]) ** 2 + (iy - p1[1]) ** 2
+        d2_sq = (ix - p2[0]) ** 2 + (iy - p2[1]) ** 2
+        if d1_sq > max_dist * max_dist or d2_sq > max_dist * max_dist:
+            return None
+
+        return (ix, iy)
+
+    def _move_endpoint(
+        geom: BaseGeometry, end: str, new_xy: tuple[float, float],
+    ) -> BaseGeometry:
+        """Return a copy of *geom* with the start or end coordinate replaced."""
+        if isinstance(geom, MultiLineString):
+            parts = [list(ls.coords) for ls in geom.geoms]
+            if end == "start":
+                parts[0][0] = new_xy
+            else:
+                parts[-1][-1] = new_xy
+            return MultiLineString([LineString(p) for p in parts])
+        coords = list(geom.coords)  # type: ignore[union-attr]
+        if end == "start":
+            coords[0] = new_xy
+        else:
+            coords[-1] = new_xy
+        return LineString(coords)
+
+    # ── Build intersection-node -> segment mapping ────────────────────────
+    # Scan ALL start/end nodes (no is_intersection flag filter).  Only nodes
+    # shared by 2+ distinct segment IDs are kept — this captures true
+    # intersections AND T-junction bases where OSM omits the flag.
+
+    node_to_segs: dict[tuple[float, float], list[tuple[int, str]]] = defaultdict(list)
+    node_key_to_pt: dict[tuple[float, float], Point] = {}
+
+    # _all_candidates: node_key -> [(seg_idx, position)]
+    _all_candidates: dict[tuple[float, float], list[tuple[int, str]]] = defaultdict(list)
+
+    for node_col, position in (
+        ("start_node_geometry", "start"),
+        ("end_node_geometry",   "end"),
+    ):
+        if node_col not in populated.columns:
+            continue
+        idx_arr  = populated.index.to_numpy()
+        geom_arr = populated[node_col].to_numpy(dtype=object)
+
+        # Vectorised coordinate extraction (Shapely 2.x)
+        valid_mask = np.asarray(
+            shapely.is_geometry(geom_arr) & ~shapely.is_empty(geom_arr), dtype=bool
+        )
+        valid_geoms = geom_arr[valid_mask]
+        valid_idx   = idx_arr[valid_mask]
+        if len(valid_geoms) == 0:
+            continue
+
+        xs = np.round(shapely.get_x(valid_geoms), 1)
+        ys = np.round(shapely.get_y(valid_geoms), 1)
+
+        for seg_idx, x, y, geom in zip(valid_idx, xs, ys, valid_geoms):
+            key: tuple[float, float] = (float(x), float(y))
+            _all_candidates[key].append((int(seg_idx), position))
+            if key not in node_key_to_pt:
+                node_key_to_pt[key] = cast(Point, geom)
+
+    for key, entries in _all_candidates.items():
+        distinct = {idx for idx, _ in entries}
+        if len(distinct) >= 2:
+            node_to_segs[key] = entries
+
+    # ── Proximity node clustering ──────────────────────────────────────────
+    # Cluster ALL nodes (including degree-1) by proximity so that nearby OSM
+    # nodes that collectively serve 2+ distinct segments are merged into a
+    # single virtual node.  Degree-1 nodes filtered out of node_to_segs are
+    # intentionally included here so that split T-junction bases (like the
+    # Delaware/Bonita case where Node B has only one segment) are merged with
+    # their neighbour.  The "2+ distinct segments" filter is applied after
+    # merging.  The actual node geometry data in `populated` is NOT modified.
+
+    _SNAP_NODE_CLUSTER_M = 7.5
+
+    # Use all nodes (node_key_to_pt), not just multi-segment nodes (node_to_segs)
+    _all_nk_list = list(node_key_to_pt.keys())
+    _stage_nodes: list[tuple[Point, list[tuple[int, str]]]] = []
+
+    if _all_nk_list:
+        _nd_geoms = np.array([node_key_to_pt[k] for k in _all_nk_list], dtype=object)
+        _nd_tree  = STRtree(_nd_geoms)
+
+        # Vectorised: find all (i, j) pairs with i < j and distance ≤ threshold
+        _q_arr, _t_arr = _nd_tree.query(_nd_geoms, predicate="dwithin",
+                                         distance=_SNAP_NODE_CLUSTER_M)
+        _pair_mask = _q_arr < _t_arr
+        _close_pairs = list(zip(_q_arr[_pair_mask].tolist(),
+                                _t_arr[_pair_mask].tolist()))
+
+        # Union-find clustering
+        _uf: list[int] = list(range(len(_all_nk_list)))
+
+        def _uf_find(i: int) -> int:
+            while _uf[i] != i:
+                _uf[i] = _uf[_uf[i]]
+                i = _uf[i]
+            return i
+
+        for _i, _j in _close_pairs:
+            _ri, _rj = _uf_find(_i), _uf_find(_j)
+            if _ri != _rj:
+                _uf[_ri] = _rj
+
+        _clusters_d: dict[int, list[int]] = defaultdict(list)
+        for _i in range(len(_all_nk_list)):
+            _clusters_d[_uf_find(_i)].append(_i)
+
+        n_virtual = 0
+        for members in _clusters_d.values():
+            # Gather segments from _all_candidates (includes degree-1 nodes)
+            _all_segs: list[tuple[int, str]] = []
+            _seen_segs: set[tuple[int, str]] = set()
+            _cx = _cy = 0.0
+            for _m in members:
+                _k = _all_nk_list[_m]
+                _cx += _k[0]; _cy += _k[1]
+                for _entry in _all_candidates[_k]:
+                    if _entry not in _seen_segs:
+                        _all_segs.append(_entry)
+                        _seen_segs.add(_entry)
+            # Only process virtual nodes with 2+ distinct segment IDs
+            if len({idx for idx, _ in _all_segs}) < 2:
+                continue
+            _cx /= len(members); _cy /= len(members)
+            if len(members) == 1:
+                _k = _all_nk_list[members[0]]
+                _stage_nodes.append((node_key_to_pt[_k], _all_segs))
+            else:
+                _stage_nodes.append((Point(_cx, _cy), _all_segs))
+                n_virtual += 1
+
+        print(f"  Node clustering: {n_virtual} virtual merged nodes "
+              f"(threshold={_SNAP_NODE_CLUSTER_M} m, total={len(_stage_nodes)})")
+    # end proximity clustering
+
+    # ── Pre-extract sidewalk geometry coords for fast access ──────────────
+
+    sw_coords_cache: dict[tuple[int, str], list[tuple[float, float]]] = {}
+    for side in ("left", "right"):
+        geom_col = f"sidewalk_{side}_geometry"
+        if geom_col not in populated.columns:
+            continue
+        geom_arr = populated[geom_col].to_numpy(dtype=object)
+        for pos, g in enumerate(geom_arr):
+            if isinstance(g, BaseGeometry) and not g.is_empty:
+                sw_coords_cache[(populated.index[pos], side)] = _flatten_coords(g)
+
+    n_stage1 = 0
+    n_stage2 = 0
+    n_stage2a = 0
+    n_endpoints_moved = 0
+
+    # Track Stage 1 group membership: endpoint_key -> group_id
+    # and group_id -> [endpoint_keys]
+    ep_to_group: dict[tuple[int, str, str], int] = {}
+    group_members: dict[int, list[tuple[int, str, str]]] = {}
+    next_group_id = 0
+
+    # ── Stage 1: Angular centroid snap (same-street continuations) ────────
+
+    for node_pt, seg_entries in _stage_nodes:
+        if len(seg_entries) < 2:
+            continue
+        nx, ny = node_pt.x, node_pt.y
+
+        eps: list[tuple[int, str, str, tuple[float, float], float]] = []
+        for seg_idx, seg_end in seg_entries:
+            for side in ("left", "right"):
+                cache_key = (seg_idx, side)
+                if cache_key not in sw_coords_cache:
+                    continue
+                coords = sw_coords_cache[cache_key]
+                if len(coords) < 2:
+                    continue
+                ep = coords[0] if seg_end == "start" else coords[-1]
+                angle = math.degrees(math.atan2(ep[0] - nx, ep[1] - ny)) % 360
+                eps.append((seg_idx, seg_end, side, ep, angle))
+
+        if len(eps) < 2:
+            continue
+
+        eps.sort(key=lambda e: e[4])
+
+        # Group into angular clusters
+        corners: list[list[int]] = []
+        current: list[int] = [0]
+        for k in range(1, len(eps)):
+            if eps[k][4] - eps[current[0]][4] <= _ENDPOINT_SNAP_CORNER_ANGLE:
+                current.append(k)
+            else:
+                corners.append(current)
+                current = [k]
+        corners.append(current)
+
+        if len(corners) > 1:
+            first_ang = eps[corners[0][0]][4]
+            last_ang = eps[corners[-1][-1]][4]
+            if (360 - last_ang) + first_ang <= _ENDPOINT_SNAP_CORNER_ANGLE:
+                corners[-1].extend(corners[0])
+                corners.pop(0)
+
+        for corner_indices in corners:
+            if len(corner_indices) < 2:
+                continue
+            corner_eps = [eps[k] for k in corner_indices]
+            seg_ids = {e[0] for e in corner_eps}
+            if len(seg_ids) < 2:
+                continue
+
+            cx = sum(e[3][0] for e in corner_eps) / len(corner_eps)
+            cy = sum(e[3][1] for e in corner_eps) / len(corner_eps)
+            centroid = (cx, cy)
+
+            # Check all within max extend
+            if any(math.sqrt((centroid[0] - e[3][0]) ** 2 + (centroid[1] - e[3][1]) ** 2)
+                   > _ENDPOINT_SNAP_MAX_EXTEND_M for e in corner_eps):
+                continue
+
+            gid = next_group_id
+            next_group_id += 1
+            group_members[gid] = []
+
+            for seg_idx, seg_end, side, ep_xy, _ in corner_eps:
+                ep_key = (seg_idx, side, seg_end)
+                ep_to_group[ep_key] = gid
+                group_members[gid].append(ep_key)
+
+                d = math.sqrt((centroid[0] - ep_xy[0]) ** 2 + (centroid[1] - ep_xy[1]) ** 2)
+                if d < 0.01:
+                    continue
+                geom_col = f"sidewalk_{side}_geometry"
+                geom = populated.at[seg_idx, geom_col]
+                if not isinstance(geom, BaseGeometry) or geom.is_empty:
+                    continue
+                populated.at[seg_idx, geom_col] = _move_endpoint(geom, seg_end, centroid)  # type: ignore[index]
+                cache_key = (seg_idx, side)
+                if cache_key in sw_coords_cache:
+                    c = list(sw_coords_cache[cache_key])
+                    if seg_end == "start":
+                        c[0] = centroid
+                    else:
+                        c[-1] = centroid
+                    sw_coords_cache[cache_key] = c
+                n_endpoints_moved += 1
+
+            n_stage1 += 1
+
+    # ── Stage 2: Cross-street corner extension ────────────────────────────
+    # When a primary endpoint is moved, also move its Stage 1 group members.
+
+    for node_pt, seg_entries in _stage_nodes:
+        if len(seg_entries) < 2:
+            continue
+        nx, ny = node_pt.x, node_pt.y
+
+        seg_dirs: list[tuple[int, str, float, float, float]] = []
+        for seg_idx, seg_end in seg_entries:
+            street_geom = populated.at[seg_idx, "street_geometry"]
+            if not isinstance(street_geom, BaseGeometry) or street_geom.is_empty:
+                continue
+            coords = _flatten_coords(street_geom)
+            if len(coords) < 2:
+                continue
+            if seg_end == "start":
+                odx = coords[min(1, len(coords) - 1)][0] - coords[0][0]
+                ody = coords[min(1, len(coords) - 1)][1] - coords[0][1]
+            else:
+                odx = coords[max(-2, -len(coords))][0] - coords[-1][0]
+                ody = coords[max(-2, -len(coords))][1] - coords[-1][1]
+            length = math.sqrt(odx * odx + ody * ody)
+            if length < 0.001:
+                continue
+            odx /= length
+            ody /= length
+            bearing = math.degrees(math.atan2(odx, ody)) % 360
+            seg_dirs.append((seg_idx, seg_end, odx, ody, bearing))
+
+        # Deduplicate antiparallel edges (parallel or ~180 apart).
+        # Track ALL antiparallel pairs for Stage 2a by scanning all pairs of
+        # seg_dirs directly (O(n²) but n is small per node).
+        unique_dirs: list[tuple[int, str, float, float, float]] = []
+        antiparallel_pairs: list[
+            tuple[
+                tuple[int, str, float, float, float],
+                tuple[int, str, float, float, float],
+            ]
+        ] = []
+        seen_ap_pairs: set[tuple[int, int]] = set()
+        for entry in seg_dirs:
+            is_dup = False
+            for existing in unique_dirs:
+                diff = abs(entry[4] - existing[4]) % 360
+                if diff > 180:
+                    diff = 360 - diff
+                if diff < 20:          # parallel — deduplicate, no snap needed
+                    is_dup = True
+                    break
+                if (180 - diff) < 20:  # antiparallel — deduplicate
+                    is_dup = True
+                    break
+            if not is_dup:
+                unique_dirs.append(entry)
+        # Find all antiparallel pairs across seg_dirs (avoids missed pairs when
+        # 3+ segments share a direction cluster, e.g. two eastbound + one westbound)
+        for _pi in range(len(seg_dirs)):
+            for _pj in range(_pi + 1, len(seg_dirs)):
+                _ei, _ej = seg_dirs[_pi], seg_dirs[_pj]
+                if _ei[0] == _ej[0]:  # same segment index
+                    continue
+                _pair_key = (min(_ei[0], _ej[0]), max(_ei[0], _ej[0]))
+                if _pair_key in seen_ap_pairs:
+                    continue
+                _diff = abs(_ei[4] - _ej[4]) % 360
+                if _diff > 180:
+                    _diff = 360 - _diff
+                if (180 - _diff) < 20:
+                    antiparallel_pairs.append((_ei, _ej))
+                    seen_ap_pairs.add(_pair_key)
+
+        if len(unique_dirs) < 2:
+            continue
+
+        unique_dirs.sort(key=lambda x: x[4])
+
+        n_streets = len(unique_dirs)
+        for k in range(n_streets):
+            idx_a, end_a, dx_a, dy_a, _ = unique_dirs[k]
+            idx_b, end_b, dx_b, dy_b, _ = unique_dirs[(k + 1) % n_streets]
+            if idx_a == idx_b:
+                continue
+
+            # Find physical-right of A and physical-left of B via cross product
+            right_a: tuple[str, tuple[float, float], float] | None = None
+            for side in ("left", "right"):
+                ck = (idx_a, side)
+                if ck not in sw_coords_cache:
+                    continue
+                cds = sw_coords_cache[ck]
+                if len(cds) < 2:
+                    continue
+                ep = cds[0] if end_a == "start" else cds[-1]
+                cross_val = dx_a * (ep[1] - ny) - dy_a * (ep[0] - nx)
+                if cross_val < 0:
+                    right_a = (side, ep, _tangent_bearing(cds, end_a))
+
+            left_b: tuple[str, tuple[float, float], float] | None = None
+            for side in ("left", "right"):
+                ck = (idx_b, side)
+                if ck not in sw_coords_cache:
+                    continue
+                cds = sw_coords_cache[ck]
+                if len(cds) < 2:
+                    continue
+                ep = cds[0] if end_b == "start" else cds[-1]
+                cross_val = dx_b * (ep[1] - ny) - dy_b * (ep[0] - nx)
+                if cross_val > 0:
+                    left_b = (side, ep, _tangent_bearing(cds, end_b))
+
+            if right_a is None or left_b is None:
+                continue
+
+            side_a, ep_a, brg_a = right_a
+            side_b, ep_b, brg_b = left_b
+
+            dd = math.sqrt((ep_a[0] - ep_b[0]) ** 2 + (ep_a[1] - ep_b[1]) ** 2)
+            if dd < 0.01 or dd > _ENDPOINT_SNAP_MAX_EXTEND_M:
+                continue
+
+            meet = _line_intersect(
+                ep_a, brg_a, ep_b, brg_b,
+                max_dist=_ENDPOINT_SNAP_MAX_EXTEND_M,
+            )
+            if meet is None:
+                # Fallback: midpoint
+                meet = ((ep_a[0] + ep_b[0]) / 2, (ep_a[1] + ep_b[1]) / 2)
+
+            nd = math.sqrt((meet[0] - nx) ** 2 + (meet[1] - ny) ** 2)
+            if nd > _ENDPOINT_SNAP_MAX_EXTEND_M * 2:
+                continue
+
+            # Collect all endpoints to move: the two primaries + their group members
+            to_move: list[tuple[int, str, str]] = []
+            for s_idx, s_end, s_side in (
+                (idx_a, end_a, side_a),
+                (idx_b, end_b, side_b),
+            ):
+                ep_key = (s_idx, s_side, s_end)
+                to_move.append(ep_key)
+                # Also add Stage 1 group members
+                gid = ep_to_group.get(ep_key)
+                if gid is not None:
+                    for member in group_members[gid]:
+                        if member not in to_move:
+                            to_move.append(member)
+
+            for s_idx, s_side, s_end in to_move:
+                ck = (s_idx, s_side)
+                if ck not in sw_coords_cache:
+                    continue
+                cds = sw_coords_cache[ck]
+                cur_ep = cds[0] if s_end == "start" else cds[-1]
+                d_move = math.sqrt((meet[0] - cur_ep[0]) ** 2 + (meet[1] - cur_ep[1]) ** 2)
+                if d_move < 0.01:
+                    continue
+                if d_move > _ENDPOINT_SNAP_MAX_EXTEND_M:
+                    continue
+                geom_col = f"sidewalk_{s_side}_geometry"
+                geom = populated.at[s_idx, geom_col]
+                if not isinstance(geom, BaseGeometry) or geom.is_empty:
+                    continue
+                populated.at[s_idx, geom_col] = _move_endpoint(geom, s_end, meet)  # type: ignore[index]
+                if ck in sw_coords_cache:
+                    c = list(sw_coords_cache[ck])
+                    if s_end == "start":
+                        c[0] = meet
+                    else:
+                        c[-1] = meet
+                    sw_coords_cache[ck] = c
+                n_endpoints_moved += 1
+
+            n_stage2 += 1
+
+        # ── Stage 2a: Antiparallel outer-side snap ────────────────────────
+        # For each antiparallel pair (canonical A, duplicate B), snap the two
+        # same-physical-side endpoint pairs:
+        #   • right_of_A  ↔  left_of_B  (outer side, e.g. north at a T-top)
+        #   • left_of_A   ↔  right_of_B (inner side — usually already at 0 m)
+        # The dd < 0.01 guard skips pairs already snapped by Stage 1/2.
+
+        for _canon, _dup in antiparallel_pairs:
+            _idx_a, _end_a, _dx_a, _dy_a, _ = _canon
+            _idx_b, _end_b, _dx_b, _dy_b, _ = _dup
+
+            if _idx_a == _idx_b:
+                continue
+
+            # Iterate over both cross-sign combinations:
+            #   (a_sign=-1, b_sign=+1) → right_of_A + left_of_B
+            #   (a_sign=+1, b_sign=-1) → left_of_A  + right_of_B
+            for _a_sign, _b_sign in ((-1, +1), (+1, -1)):
+                _ep_a_info: tuple[str, tuple[float, float], float] | None = None
+                _ep_b_info: tuple[str, tuple[float, float], float] | None = None
+
+                for _side in ("left", "right"):
+                    _ck = (_idx_a, _side)
+                    if _ck not in sw_coords_cache:
+                        continue
+                    _cds = sw_coords_cache[_ck]
+                    if len(_cds) < 2:
+                        continue
+                    _ep = _cds[0] if _end_a == "start" else _cds[-1]
+                    _cv = _dx_a * (_ep[1] - ny) - _dy_a * (_ep[0] - nx)
+                    if (_a_sign < 0 and _cv < 0) or (_a_sign > 0 and _cv > 0):
+                        _ep_a_info = (_side, _ep, _tangent_bearing(_cds, _end_a))
+
+                for _side in ("left", "right"):
+                    _ck = (_idx_b, _side)
+                    if _ck not in sw_coords_cache:
+                        continue
+                    _cds = sw_coords_cache[_ck]
+                    if len(_cds) < 2:
+                        continue
+                    _ep = _cds[0] if _end_b == "start" else _cds[-1]
+                    _cv = _dx_b * (_ep[1] - ny) - _dy_b * (_ep[0] - nx)
+                    if (_b_sign < 0 and _cv < 0) or (_b_sign > 0 and _cv > 0):
+                        _ep_b_info = (_side, _ep, _tangent_bearing(_cds, _end_b))
+
+                if _ep_a_info is None or _ep_b_info is None:
+                    continue
+
+                _side_a, _ep_a, _brg_a = _ep_a_info
+                _side_b, _ep_b, _brg_b = _ep_b_info
+
+                _dd = math.sqrt(
+                    (_ep_a[0] - _ep_b[0]) ** 2 + (_ep_a[1] - _ep_b[1]) ** 2
+                )
+                if _dd < 0.01 or _dd > _ENDPOINT_SNAP_MAX_EXTEND_M:
+                    continue
+
+                _meet = _line_intersect(
+                    _ep_a, _brg_a, _ep_b, _brg_b,
+                    max_dist=_ENDPOINT_SNAP_MAX_EXTEND_M,
+                )
+                if _meet is None:
+                    _meet = (
+                        (_ep_a[0] + _ep_b[0]) / 2,
+                        (_ep_a[1] + _ep_b[1]) / 2,
+                    )
+
+                _nd = math.sqrt((_meet[0] - nx) ** 2 + (_meet[1] - ny) ** 2)
+                if _nd > _ENDPOINT_SNAP_MAX_EXTEND_M * 2:
+                    continue
+
+                _to_move: list[tuple[int, str, str]] = []
+                for _s_idx, _s_end, _s_side in (
+                    (_idx_a, _end_a, _side_a),
+                    (_idx_b, _end_b, _side_b),
+                ):
+                    _ep_key = (_s_idx, _s_side, _s_end)
+                    _to_move.append(_ep_key)
+                    _gid = ep_to_group.get(_ep_key)
+                    if _gid is not None:
+                        for _member in group_members[_gid]:
+                            if _member not in _to_move:
+                                _to_move.append(_member)
+
+                for _s_idx, _s_side, _s_end in _to_move:
+                    _ck = (_s_idx, _s_side)
+                    if _ck not in sw_coords_cache:
+                        continue
+                    _cds2 = sw_coords_cache[_ck]
+                    _cur = _cds2[0] if _s_end == "start" else _cds2[-1]
+                    _dm = math.sqrt(
+                        (_meet[0] - _cur[0]) ** 2 + (_meet[1] - _cur[1]) ** 2
+                    )
+                    if _dm < 0.01 or _dm > _ENDPOINT_SNAP_MAX_EXTEND_M:
+                        continue
+                    _gcol = f"sidewalk_{_s_side}_geometry"
+                    _geom = populated.at[_s_idx, _gcol]
+                    if not isinstance(_geom, BaseGeometry) or _geom.is_empty:
+                        continue
+                    populated.at[_s_idx, _gcol] = _move_endpoint(  # type: ignore[index]
+                        _geom, _s_end, _meet
+                    )
+                    _cl = list(sw_coords_cache[_ck])
+                    if _s_end == "start":
+                        _cl[0] = _meet
+                    else:
+                        _cl[-1] = _meet
+                    sw_coords_cache[_ck] = _cl
+                    n_endpoints_moved += 1
+
+                n_stage2a += 1
+
+    # ── Stage 3: Shapely-crosses trimming ─────────────────────────────────
+    # Vectorised: build one STRtree of all intersection-endpoint sidewalk
+    # geometries, bulk-query for crossing pairs, then trim each segment at
+    # the crossing point.  Only pairs that share an intersection node are
+    # processed.
+
+    def _to_linestring(geom: BaseGeometry) -> LineString | None:
+        """Return a LineString equivalent, merging MultiLineString if possible."""
+        if isinstance(geom, LineString):
+            return geom
+        if isinstance(geom, MultiLineString):
+            merged = _sw_linemerge(geom)
+            return merged if isinstance(merged, LineString) else None
+        return None
+
+    # Build flat list: one entry per (node_idx, seg_idx, seg_end, side)
+    # node_idx is the index into _stage_nodes (unique per virtual merged node).
+    s3_geoms:    list[BaseGeometry] = []  # raw geometry (may be Multi)
+    s3_ls:       list[LineString | None] = []  # merged LineString (or None)
+    s3_node_idx: list[int] = []           # index into _stage_nodes
+    s3_seg_idx:  list[int] = []
+    s3_seg_end:  list[str] = []
+    s3_side:     list[str] = []
+
+    for _ni, (_node_pt_s3, seg_entries) in enumerate(_stage_nodes):
+        for seg_idx, seg_end in seg_entries:
+            for side in ("left", "right"):
+                geom_col = f"sidewalk_{side}_geometry"
+                if geom_col not in populated.columns:
+                    continue
+                if (seg_idx, side) not in sw_coords_cache:
+                    continue
+                geom = populated.at[seg_idx, geom_col]
+                if not isinstance(geom, (LineString, MultiLineString)) or geom.is_empty:
+                    continue
+                s3_geoms.append(geom)
+                s3_ls.append(_to_linestring(geom))
+                s3_node_idx.append(_ni)
+                s3_seg_idx.append(seg_idx)
+                s3_seg_end.append(seg_end)
+                s3_side.append(side)
+
+    n_stage3 = 0
+    trimmed_keys: set[tuple[int, str, str]] = set()  # (seg_idx, side, end)
+
+    if s3_geoms:
+        s3_tree = STRtree(s3_geoms)
+        # Bulk query: returns (query_indices, tree_indices) for all crossing pairs
+        q_idx, t_idx = s3_tree.query(s3_geoms, predicate="crosses")
+
+        for qi, ti in zip(q_idx.tolist(), t_idx.tolist()):
+            if ti <= qi:
+                continue  # process each unordered pair once
+            if s3_node_idx[qi] != s3_node_idx[ti]:
+                continue  # different intersection nodes (or virtual merged nodes)
+            if s3_seg_idx[qi] == s3_seg_idx[ti]:
+                continue  # same street segment
+
+            # Confirm crossing and get intersection point (bulk query may use
+            # bbox overlap under the hood for some predicates)
+            geom_q = s3_geoms[qi]
+            geom_t = s3_geoms[ti]
+            crossing_pt = geom_q.intersection(geom_t)
+            if not isinstance(crossing_pt, Point):
+                continue  # degenerate (overlap/multipoint)
+
+            for arr_i in (qi, ti):
+                ls = s3_ls[arr_i]
+                if ls is None:
+                    continue  # MultiLineString that couldn't be merged — skip
+                seg_idx = s3_seg_idx[arr_i]
+                seg_end = s3_seg_end[arr_i]
+                side    = s3_side[arr_i]
+
+                trim_key = (seg_idx, side, seg_end)
+                if trim_key in trimmed_keys:
+                    continue
+
+                total_len = ls.length
+                if total_len < 0.01:
+                    continue
+
+                dist_along = ls.project(crossing_pt)
+                dist_from_ep = (
+                    total_len - dist_along if seg_end == "end" else dist_along
+                )
+                if dist_from_ep > _ENDPOINT_SNAP_MAX_EXTEND_M:
+                    continue  # crossing too far from the relevant endpoint
+
+                if seg_end == "end":
+                    if dist_along < 0.01:
+                        continue
+                    new_geom: BaseGeometry = _sw_substring(ls, 0.0, dist_along)
+                else:
+                    if dist_along > total_len - 0.01:
+                        continue
+                    new_geom = _sw_substring(ls, dist_along, total_len)
+
+                if new_geom is None or new_geom.is_empty:
+                    continue
+
+                geom_col = f"sidewalk_{side}_geometry"
+                populated.at[seg_idx, geom_col] = new_geom  # type: ignore[index]
+                trimmed_keys.add(trim_key)
+                sw_coords_cache[(seg_idx, side)] = _flatten_coords(new_geom)
+                # Keep s3_ls in sync so a subsequent pair sees the trimmed geom
+                s3_ls[arr_i] = new_geom if isinstance(new_geom, LineString) else None
+                n_endpoints_moved += 1
+
+            n_stage3 += 1
+
+    print(f"Endpoint snapping: {n_stage1} same-street, "
+          f"{n_stage2} cross-street, "
+          f"{n_stage2a} antiparallel-outer, "
+          f"{n_stage3} crosses-trimmed, "
+          f"{n_endpoints_moved} endpoints moved.")
+    return populated
 
 
 _CURB_RAMP_PROXIMITY_M   = 20.0   # fallback: sidewalk endpoint → intersection node distance
@@ -3102,9 +3949,12 @@ def _assign_curb_ramp_geometries(
         mask = populated[flag_col] == True  # noqa: E712
         masked_idxs = populated.index[mask]
         masked_geoms = populated.loc[mask, node_col].to_numpy(dtype=object)
+        _valid_geom_mask = np.asarray(
+            shapely.is_geometry(masked_geoms) & ~shapely.is_empty(masked_geoms), dtype=bool
+        )
+        masked_idxs  = masked_idxs[_valid_geom_mask]
+        masked_geoms = masked_geoms[_valid_geom_mask]
         for idx, geom in zip(masked_idxs, masked_geoms):
-            if not isinstance(geom, BaseGeometry) or geom.is_empty:
-                continue
             pt = cast(Point, geom)
             key = (round(pt.x, 1), round(pt.y, 1))
             node_to_segs[key].append((idx, position))
@@ -3163,18 +4013,29 @@ def _assign_curb_ramp_geometries(
     n_fw_ramp_direct = 0
 
     if _retro_int_tree is not None and "highway" in populated.columns:
-        _hw_arr = populated["highway"].to_numpy(dtype=object)
-        for fw_idx, hw_val in tqdm(zip(populated.index, _hw_arr), total=len(_hw_arr),
-                                   desc="Footway retroactive", unit="seg"):
-            if str(hw_val) not in _FW_HW_RETRO:
-                continue
-            fw_geom = populated.geometry.loc[fw_idx]
+        # Pre-filter to footway-type rows to avoid iterating all segments.
+        _fw_retro_mask = populated["highway"].isin(_FW_HW_RETRO)
+        _fw_retro_idxs = populated.index[_fw_retro_mask]
+        _fw_retro_geoms = populated.geometry[_fw_retro_mask].to_numpy(dtype=object)
+        _fw_left_sw_arr = (
+            populated["sidewalk_left_geometry"][_fw_retro_mask].to_numpy(dtype=object)
+            if "sidewalk_left_geometry" in populated.columns
+            else np.full(len(_fw_retro_idxs), None)
+        )
+        _fw_right_sw_arr = (
+            populated["sidewalk_right_geometry"][_fw_retro_mask].to_numpy(dtype=object)
+            if "sidewalk_right_geometry" in populated.columns
+            else np.full(len(_fw_retro_idxs), None)
+        )
+        for _fi, fw_idx in enumerate(tqdm(_fw_retro_idxs, total=len(_fw_retro_idxs),
+                                          desc="Footway retroactive", unit="seg")):
+            fw_geom = _fw_retro_geoms[_fi]
             if not isinstance(fw_geom, BaseGeometry) or fw_geom.is_empty:
                 continue
             # Skip footways that already received a sidewalk geometry match
             # during the initial pass — the standard logic handles those.
-            _left_sw  = populated.at[fw_idx, "sidewalk_left_geometry"]  if "sidewalk_left_geometry"  in populated.columns else None
-            _right_sw = populated.at[fw_idx, "sidewalk_right_geometry"] if "sidewalk_right_geometry" in populated.columns else None
+            _left_sw  = _fw_left_sw_arr[_fi]
+            _right_sw = _fw_right_sw_arr[_fi]
             if isinstance(_left_sw, BaseGeometry) or isinstance(_right_sw, BaseGeometry):
                 continue
             fw_bearing = _retro_bearing(fw_geom)
@@ -3413,14 +4274,21 @@ def _assign_curb_ramp_geometries(
             geom_col = f"sidewalk_{side}_geometry"
             if geom_col not in populated.columns:
                 continue
+            # Build has_geom and coords cache once per side (shared by start + end).
+            _geom_arr = populated[geom_col].to_numpy(dtype=object)
+            has_geom = pd.Series(
+                [isinstance(g, BaseGeometry) and not g.is_empty for g in _geom_arr],
+                index=populated.index, dtype=bool,
+            )
+            _coords_map: dict = {
+                idx: _flatten_coords(g)
+                for idx, g in zip(populated.index[has_geom], _geom_arr[has_geom.to_numpy()])
+            }
             for position in ("start", "end"):
                 ramp_col = f"sidewalk_{side}_curbramp_{position}_1_geometry"
-                has_geom  = pd.Series([isinstance(g, BaseGeometry) and not g.is_empty for g in populated[geom_col].values],
-                                      index=populated.index, dtype=bool)
                 ramp_empty = populated[ramp_col].isna()
                 for idx in populated.index[has_geom & ramp_empty]:
-                    geom = cast(BaseGeometry | None, populated.at[idx, geom_col])
-                    coords = _flatten_coords(geom) if isinstance(geom, BaseGeometry) else []
+                    coords = _coords_map.get(idx)
                     if not coords:
                         continue
                     pt = Point(coords[0] if position == "start" else coords[-1])

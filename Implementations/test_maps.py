@@ -187,8 +187,8 @@ def _sw_attrs_from_row(row, side):
     ]
 
 
-def _is_buffered(val):
-    """Return True if a buffered column value is truthy (True, 'yes', non-empty string)."""
+def _is_offset(val):
+    """Return True if an offset column value is truthy (True, 'yes', non-empty string)."""
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return False
     if isinstance(val, bool):
@@ -256,15 +256,15 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
     def in_bbox(geom):
         return geom is not None and bbox.intersects(geom)
 
-    def draw_sidewalk(coords, row, side, label, target_sep, target_buf):
+    def draw_sidewalk(coords, row, side, label, target_sep, target_off):
         presence = row.get(f'sidewalk_{side}_presence', '') if side else ''
         width    = row.get(f'sidewalk_{side}_width', '')    if side else ''
-        buffered    = _is_buffered(row.get(f'sidewalk_{side}_buffered')) if side else False
-        base_color  = '#add8e6' if buffered else '#00008b'
+        is_offset   = _is_offset(row.get(f'sidewalk_{side}_offset')) if side else False
+        base_color  = '#add8e6' if is_offset else '#00008b'
         incline_raw = row.get(f'sidewalk_{side}_incline') if side else row.get('street_incline')
         color       = _seg_color(base_color, incline_raw)
-        kind        = 'buffered' if buffered else 'separate'
-        target   = target_buf if buffered else target_sep
+        kind        = 'offset' if is_offset else 'separate'
+        target   = target_off if is_offset else target_sep
         attrs    = _sw_attrs_from_row(row, side) if side else [
             ('Name',        row.get('name')),
             ('Highway',     row.get('highway')),
@@ -278,12 +278,15 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
             ('Incline',     row.get('street_incline')),
             ('Access',      row.get('access')),
         ]
-        folium.PolyLine(
+        _sw_layer = folium.PolyLine(
             coords, color=color, weight=2, opacity=0.85,
             tooltip=f"Sidewalk {label} [{kind}]: presence={presence}, width={width}",
             popup=make_popup(f'Sidewalk ({label}) [{kind}]', attrs)
         ).add_to(target)
         add_endpoints(coords, color, target)
+        _sw_id = str(row.get(f'sidewalk_{side}_grid_ID') or '') if side else str(row.get('street_grid_id') or '')
+        if _sw_id and _sw_id not in _seg_index:
+            _seg_index[_sw_id] = {'v': _sw_layer.get_name(), 'c': coords[len(coords) // 2], 'ow': 2, 'oc': color}
 
     # -- map + feature groups
     m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom,
@@ -291,9 +294,9 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
 
     fg_streets   = folium.FeatureGroup(name='Streets',              show=True)
     fg_sw_sep    = folium.FeatureGroup(name='Sidewalks – separate', show=True)
-    fg_sw_buf    = folium.FeatureGroup(name='Sidewalks – buffered', show=True)
+    fg_sw_off    = folium.FeatureGroup(name='Sidewalks – offset', show=True)
     fg_bk_sep    = folium.FeatureGroup(name='Bikeways – separate',  show=True)
-    fg_bk_buf    = folium.FeatureGroup(name='Bikeways – buffered',  show=True)
+    fg_bk_off    = folium.FeatureGroup(name='Bikeways – offset',  show=True)
     fg_nodes         = folium.FeatureGroup(name='Intersection Nodes',   show=True)
     fg_curbramps     = folium.FeatureGroup(name='Curb Ramps',           show=True)
     fg_crosswalks    = folium.FeatureGroup(name='Crosswalks',            show=True)
@@ -313,9 +316,9 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
     counts = {
         'street': 0,
         'sidewalk_separate': 0,
-        'sidewalk_buffered': 0,
+        'sidewalk_offset': 0,
         'bikeway_separate': 0,
-        'bikeway_buffered': 0,
+        'bikeway_offset': 0,
         'curbramp': 0,
         'crosswalk': 0,
         'curb_return': 0,
@@ -391,6 +394,8 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
         pbar.update(1)
 
         # ── Stage 5: build map elements (one step per row) ────────────────────
+        _seg_index:  dict[str, dict] = {}
+        _node_index: dict[str, dict] = {}
         pbar.set_description(f'{output_name} · building')
         for row in data.to_dict('records'):
             hw           = str(row.get('highway') or '').strip().lower()
@@ -403,11 +408,11 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
                 if coords:
                     name = row.get('name', '') or ''
                     if is_cycleway:
-                        bk_buf   = _is_buffered(row.get('bikeway_left_1_buffered') or row.get('bikeway_right_1_buffered'))
+                        bk_buf   = _is_offset(row.get('bikeway_left_1_offset') or row.get('bikeway_right_1_offset'))
                         bk_color = '#90ee90' if bk_buf else '#006400'
-                        bk_kind  = 'buffered' if bk_buf else 'separate'
-                        bk_target = fg_bk_buf if bk_buf else fg_bk_sep
-                        folium.PolyLine(
+                        bk_kind  = 'offset' if bk_buf else 'separate'
+                        bk_target = fg_bk_off if bk_buf else fg_bk_sep
+                        _cy_layer = folium.PolyLine(
                             coords, color=bk_color, weight=2, opacity=0.85,
                             tooltip=f"Bikeway [separate cycleway]: {name or '(unnamed)'}",
                             popup=make_popup(f'Bikeway (separate cycleway): {name or "(unnamed)"}', [
@@ -418,12 +423,15 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
                             ])
                         ).add_to(bk_target)
                         add_endpoints(coords, bk_color, bk_target)
-                        counts['bikeway_buffered' if bk_buf else 'bikeway_separate'] += 1
+                        counts['bikeway_offset' if bk_buf else 'bikeway_separate'] += 1
+                        _cy_id = str(row.get('street_grid_id') or '')
+                        if _cy_id and _cy_id not in _seg_index:
+                            _seg_index[_cy_id] = {'v': _cy_layer.get_name(), 'c': coords[len(coords) // 2], 'ow': 2, 'oc': bk_color}
                     elif is_footway:
-                        is_buf = _is_buffered(row.get('sidewalk_buffered', False))
+                        is_buf = _is_offset(row.get('sidewalk_offset', False))
                         draw_sidewalk(coords, row, None, f'footway – {name or "(unnamed)"}',
-                                      fg_sw_sep, fg_sw_buf)
-                        counts['sidewalk_buffered' if is_buf else 'sidewalk_separate'] += 1
+                                      fg_sw_sep, fg_sw_off)
+                        counts['sidewalk_offset' if is_buf else 'sidewalk_separate'] += 1
                     else:
                         start_is_int = bool(row.get('start_node_is_intersection_node'))
                         end_is_int   = bool(row.get('end_node_is_intersection_node'))
@@ -447,7 +455,7 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
                             ('End node intersection',   'yes' if end_is_int else 'no'),
                         ]
                         street_color = _seg_color('red', row.get('street_incline'))
-                        folium.PolyLine(
+                        _st_layer = folium.PolyLine(
                             coords, color=street_color, weight=3, opacity=0.85,
                             tooltip=(f"Street: {name} ({hw}) | "
                                      f"start={'⬟' if start_is_int else '·'} "
@@ -456,25 +464,44 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
                         ).add_to(fg_streets)
                         add_endpoints(coords, street_color, fg_streets)
                         counts['street'] += 1
+                        _st_id = str(row.get('street_grid_id') or '')
+                        if _st_id and _st_id not in _seg_index:
+                            _seg_index[_st_id] = {'v': _st_layer.get_name(), 'c': coords[len(coords) // 2], 'ow': 3, 'oc': street_color}
 
                         # Intersection nodes (dark red)
                         _NODE_COLOR = '#8b0000'
                         if start_is_int:
-                            folium.CircleMarker(
+                            _sn_id = row.get('start_node_id')
+                            _sn_layer = folium.CircleMarker(
                                 location=coords[0], radius=5,
                                 color=_NODE_COLOR, fill=True,
                                 fill_color=_NODE_COLOR, fill_opacity=1.0, weight=1,
-                                tooltip=f"Intersection node (start): {row.get('start_node_id')}",
+                                tooltip=f"Intersection node (start): {_sn_id}",
+                                popup=make_popup(f'Intersection Node: {_sn_id}', [
+                                    ('Node ID',  _sn_id),
+                                    ('Position', 'start'),
+                                    ('Street',   row.get('name')),
+                                ])
                             ).add_to(fg_nodes)
                             counts['intersection_node'] += 1
+                            if _sn_id and str(_sn_id) not in _node_index:
+                                _node_index[str(_sn_id)] = {'v': _sn_layer.get_name(), 'c': list(coords[0]), 'ow': 1, 'oc': _NODE_COLOR}
                         if end_is_int:
-                            folium.CircleMarker(
+                            _en_id = row.get('end_node_id')
+                            _en_layer = folium.CircleMarker(
                                 location=coords[-1], radius=5,
                                 color=_NODE_COLOR, fill=True,
                                 fill_color=_NODE_COLOR, fill_opacity=1.0, weight=1,
-                                tooltip=f"Intersection node (end): {row.get('end_node_id')}",
+                                tooltip=f"Intersection node (end): {_en_id}",
+                                popup=make_popup(f'Intersection Node: {_en_id}', [
+                                    ('Node ID',  _en_id),
+                                    ('Position', 'end'),
+                                    ('Street',   row.get('name')),
+                                ])
                             ).add_to(fg_nodes)
                             counts['intersection_node'] += 1
+                            if _en_id and str(_en_id) not in _node_index:
+                                _node_index[str(_en_id)] = {'v': _en_layer.get_name(), 'c': list(coords[-1]), 'ow': 1, 'oc': _NODE_COLOR}
 
             # Sidewalks (blue)
             for side in ('left', 'right'):
@@ -482,16 +509,16 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
                 if in_bbox(sw_geom):
                     coords = geom_to_latlons(sw_geom)
                     if coords:
-                        is_sw_buf = _is_buffered(row.get(f'sidewalk_{side}_buffered'))
-                        draw_sidewalk(coords, row, side, side, fg_sw_sep, fg_sw_buf)
-                        counts['sidewalk_buffered' if is_sw_buf else 'sidewalk_separate'] += 1
+                        is_sw_buf = _is_offset(row.get(f'sidewalk_{side}_offset'))
+                        draw_sidewalk(coords, row, side, side, fg_sw_sep, fg_sw_off)
+                        counts['sidewalk_offset' if is_sw_buf else 'sidewalk_separate'] += 1
 
             # Bikeways (green)
             for side in ('left', 'right'):
-                bk_buffered = _is_buffered(row.get(f'bikeway_{side}_buffered'))
-                bk_color    = '#90ee90' if bk_buffered else '#006400'
-                bk_kind     = 'buffered' if bk_buffered else 'separate'
-                bk_target   = fg_bk_buf if bk_buffered else fg_bk_sep
+                bk_is_offset = _is_offset(row.get(f'bikeway_{side}_offset'))
+                bk_color     = '#90ee90' if bk_is_offset else '#006400'
+                bk_kind      = 'offset' if bk_is_offset else 'separate'
+                bk_target    = fg_bk_off if bk_is_offset else fg_bk_sep
                 for num in (1, 2):
                     bk_geom = row.get(f'_p_bikeway_{side}_{num}_geometry')
                     if in_bbox(bk_geom):
@@ -516,13 +543,16 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
                                 ('Street name', row.get('name')),
                             ]
                             bk_draw_color = _seg_color(bk_color, row.get(f'bikeway_{side}_{num}_incline'))
-                            folium.PolyLine(
+                            _bk_layer = folium.PolyLine(
                                 coords, color=bk_draw_color, weight=2, opacity=0.85,
                                 tooltip=f"Bikeway {side}-{num} [{bk_kind}]: {bk_type}",
                                 popup=make_popup(f'Bikeway ({side}-{num}) [{bk_kind}]', bk_attrs)
                             ).add_to(bk_target)
                             add_endpoints(coords, bk_draw_color, bk_target)
-                            counts['bikeway_buffered' if bk_buffered else 'bikeway_separate'] += 1
+                            counts['bikeway_offset' if bk_is_offset else 'bikeway_separate'] += 1
+                            _bk_id = str(row.get(f'bikeway_{side}_{num}_grid_id') or '')
+                            if _bk_id and _bk_id not in _seg_index:
+                                _seg_index[_bk_id] = {'v': _bk_layer.get_name(), 'c': coords[len(coords) // 2], 'ow': 2, 'oc': bk_draw_color}
 
             # Curb Ramps (orange)
             for side in _CURBRAMP_SIDES:
@@ -635,7 +665,7 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
 
         # ── Stage 6: assemble + save ──────────────────────────────────────────
         pbar.set_description(f'{output_name} · saving')
-        for fg in (fg_bbox, fg_streets, fg_bk_sep, fg_bk_buf, fg_sw_sep, fg_sw_buf, fg_curbramps, fg_crosswalks, fg_curb_returns, fg_traffic_calm, fg_nodes):
+        for fg in (fg_bbox, fg_streets, fg_bk_sep, fg_bk_off, fg_sw_sep, fg_sw_off, fg_curbramps, fg_crosswalks, fg_curb_returns, fg_traffic_calm, fg_nodes):
             fg.add_to(m)
 
         folium.Marker(
@@ -647,9 +677,9 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
         map_var      = m.get_name()
         js_street    = fg_streets.get_name()
         js_sw_sep    = fg_sw_sep.get_name()
-        js_sw_buf    = fg_sw_buf.get_name()
+        js_sw_buf    = fg_sw_off.get_name()
         js_bk_sep    = fg_bk_sep.get_name()
-        js_bk_buf    = fg_bk_buf.get_name()
+        js_bk_buf    = fg_bk_off.get_name()
         js_curbramps    = fg_curbramps.get_name()
         js_crosswalks   = fg_crosswalks.get_name()
         js_curb_returns = fg_curb_returns.get_name()
@@ -703,7 +733,7 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
     <input type="checkbox" id="cb_sw_buf" checked
            onchange="toggleFG('{js_sw_buf}', this.checked)">
     <span style="color:#add8e6;font-size:18px;line-height:1">&#9644;</span>
-    Sidewalks – buffered ({counts['sidewalk_buffered']})
+    Sidewalks – offset ({counts['sidewalk_offset']})
   </label>
 
   <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
@@ -717,7 +747,7 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
     <input type="checkbox" id="cb_bk_buf" checked
            onchange="toggleFG('{js_bk_buf}', this.checked)">
     <span style="color:#90ee90;font-size:18px;line-height:1">&#9644;</span>
-    Bikeways – buffered ({counts['bikeway_buffered']})
+    Bikeways – offset ({counts['bikeway_offset']})
   </label>
 
   <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
@@ -756,6 +786,72 @@ function toggleFG(fgName, show) {{
 """
 
         m.get_root().html.add_child(folium.Element(legend_html))  # type: ignore[attr-defined]
+
+        _search_html = f"""
+<div id="px-search" style="
+    position:fixed;top:70px;right:10px;z-index:9999;
+    background:white;padding:10px 14px;border:2px solid #aaa;
+    border-radius:6px;font-size:13px;font-family:sans-serif;line-height:1.6;">
+  <b style="font-size:14px">Search</b><br>
+  <div style="display:flex;gap:4px;margin:6px 0 4px;">
+    <button id="px-mode-seg" onclick="pxSetMode('seg')"
+            style="flex:1;padding:3px 8px;border:1px solid #888;border-radius:4px;cursor:pointer;background:#1a73e8;color:white;font-size:12px;">
+      Segment ID
+    </button>
+    <button id="px-mode-node" onclick="pxSetMode('node')"
+            style="flex:1;padding:3px 8px;border:1px solid #888;border-radius:4px;cursor:pointer;background:white;color:#333;font-size:12px;">
+      Node ID
+    </button>
+  </div>
+  <div style="display:flex;gap:4px;">
+    <input id="px-search-input" type="text" placeholder="e.g. 12_34_0"
+           style="flex:1;padding:4px 6px;border:1px solid #ccc;border-radius:4px;font-size:12px;min-width:140px;"
+           onkeydown="if(event.key==='Enter')pxSearch()">
+    <button onclick="pxSearch()"
+            style="padding:4px 10px;border:1px solid #888;border-radius:4px;cursor:pointer;background:#f5f5f5;font-size:12px;">
+      Go
+    </button>
+  </div>
+  <div id="px-search-status" style="margin-top:5px;font-size:11px;color:#555;min-height:14px;"></div>
+</div>
+<script>
+var _pxMode = 'seg';
+var _pxSegIndex  = {json.dumps(_seg_index)};
+var _pxNodeIndex = {json.dumps(_node_index)};
+var _pxTimer = null;
+function pxSetMode(mode) {{
+  _pxMode = mode;
+  var s = document.getElementById('px-mode-seg');
+  var n = document.getElementById('px-mode-node');
+  s.style.background = mode==='seg'  ? '#1a73e8' : 'white';
+  s.style.color       = mode==='seg'  ? 'white'   : '#333';
+  n.style.background = mode==='node' ? '#1a73e8' : 'white';
+  n.style.color       = mode==='node' ? 'white'   : '#333';
+  document.getElementById('px-search-input').placeholder = mode==='seg' ? 'e.g. 12_34_0' : 'e.g. 123456789';
+  document.getElementById('px-search-status').textContent = '';
+}}
+function pxSearch() {{
+  var id = document.getElementById('px-search-input').value.trim();
+  if (!id) return;
+  var idx = _pxMode === 'seg' ? _pxSegIndex : _pxNodeIndex;
+  var entry = idx[id];
+  var el = document.getElementById('px-search-status');
+  if (!entry) {{ el.style.color='#c00'; el.textContent='Not found: '+id; return; }}
+  el.style.color='#555'; el.textContent='\u2192 Found: '+id;
+  var mapObj = window['{map_var}'];
+  mapObj.flyTo(entry.c, 20);
+  var layer = window[entry.v];
+  if (!layer) return;
+  if (_pxTimer) clearTimeout(_pxTimer);
+  try {{ layer.setStyle({{color:'#ffff00', weight: entry.ow * 2.5}}); }} catch(e) {{}}
+  _pxTimer = setTimeout(function() {{
+    try {{ layer.setStyle({{color: entry.oc, weight: entry.ow}}); }} catch(e) {{}}
+  }}, 2500);
+  try {{ if (typeof layer.openPopup === 'function') layer.openPopup(entry.c); }} catch(e) {{}}
+}}
+</script>
+"""
+        m.get_root().html.add_child(folium.Element(_search_html))  # type: ignore[attr-defined]
 
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         out_path = os.path.join(OUTPUT_DIR, f"{output_name}.html")
