@@ -1188,7 +1188,7 @@ def _find_coincident_segment(
     tc_x, tc_y = tc_point.x, tc_point.y
     for idx in candidate_idxs:
         geom: BaseGeometry = edges_reset.geometry.iloc[idx]  # type: ignore[assignment]
-        coords_arr = np.array(list(geom.coords), dtype=np.float64)
+        coords_arr = shapely.get_coordinates(geom)
         dists = np.sqrt((coords_arr[:, 0] - tc_x) ** 2 + (coords_arr[:, 1] - tc_y) ** 2)
         min_d = float(dists.min())
         if min_d <= _TC_COINCIDENCE_THRESHOLD_M and min_d < best_dist:
@@ -1877,6 +1877,15 @@ def _populate_separate_facilities(
     matched edge is written, offset is set to False.
     - collision check during proximity matching is row-scoped per spec step 4
     """
+    def _set_cell(idx: int, col: str, value: object) -> None:
+        """Set a single cell, handling list/tuple values that ``pd.DataFrame.at``
+        rejects with 'Must have equal len keys and value when setting with an
+        iterable'.  Falls back to direct numpy array assignment."""
+        try:
+            populated.at[idx, col] = value  # type: ignore[index]
+        except ValueError:
+            populated[col].values[populated.index.get_loc(idx)] = value  # type: ignore[index]
+
     hw      = edges_reset.get("highway", pd.Series(dtype=object))
     bicycle = edges_reset.get("bicycle", pd.Series(dtype=object))
     foot    = edges_reset.get("foot",    pd.Series(dtype=object))
@@ -2158,13 +2167,13 @@ def _populate_separate_facilities(
             n_bike_merged += 1
         else:
             # New facility — write all attributes
-            populated.at[road_idx, f"{prefix}_type"]      = cy_highway_list[cy_pos]  # type: ignore[index]
-            populated.at[road_idx, f"{prefix}_surface"]   = cy_surface_list[cy_pos]  # type: ignore[index]
-            populated.at[road_idx, f"{prefix}_width"]     = _parse_float_tag(cy_width_list[cy_pos])  # type: ignore[index]
-            populated.at[road_idx, f"{prefix}_permitted"] = cy_bicycle_list[cy_pos]  # type: ignore[index]
-            populated.at[road_idx, f"{prefix}_incline"]   = _parse_incline(cy_incline_list[cy_pos])  # type: ignore[index]
-            populated.at[road_idx, f"{prefix}_geometry"]  = cy_geom  # type: ignore[index]
-            populated.at[road_idx, f"{prefix}_offset"]  = False  # type: ignore[index]
+            _set_cell(road_idx, f"{prefix}_type",      cy_highway_list[cy_pos])
+            _set_cell(road_idx, f"{prefix}_surface",   cy_surface_list[cy_pos])
+            _set_cell(road_idx, f"{prefix}_width",     _parse_float_tag(cy_width_list[cy_pos]))
+            _set_cell(road_idx, f"{prefix}_permitted", cy_bicycle_list[cy_pos])
+            _set_cell(road_idx, f"{prefix}_incline",   _parse_incline(cy_incline_list[cy_pos]))
+            _set_cell(road_idx, f"{prefix}_geometry",  cy_geom)
+            _set_cell(road_idx, f"{prefix}_offset",    False)
             bike_slots_used.add((road_idx, side, slot))
             _is_centerline(cy_geom, cast(BaseGeometry, road_geom), road_idx, prefix, populated)
             n_bike_matched += 1
@@ -2221,13 +2230,15 @@ def _populate_separate_facilities(
             covered = eg.intersection(search_buf).length
             if covered / max(eg.length, 1e-6) >= _SIDEWALK_DEDUP_THRESHOLD:
                 return True
-            # Shared-endpoints check
+            # Shared-endpoints check (raw coord arithmetic avoids Point construction)
             eg_pts = _flatten_coords(eg)
             if new_pts and eg_pts:
-                ns, ne = Point(new_pts[0]), Point(new_pts[-1])
-                es, ee = Point(eg_pts[0]), Point(eg_pts[-1])
-                if ((ns.distance(es) < 0.5 and ne.distance(ee) < 0.5) or
-                        (ns.distance(ee) < 0.5 and ne.distance(es) < 0.5)):
+                ns, ne = new_pts[0], new_pts[-1]
+                es, ee = eg_pts[0], eg_pts[-1]
+                if ((math.hypot(ns[0]-es[0], ns[1]-es[1]) < 0.5 and
+                     math.hypot(ne[0]-ee[0], ne[1]-ee[1]) < 0.5) or
+                    (math.hypot(ns[0]-ee[0], ns[1]-ee[1]) < 0.5 and
+                     math.hypot(ne[0]-es[0], ne[1]-es[1]) < 0.5)):
                     return True
         return False
 
@@ -2373,13 +2384,13 @@ def _populate_separate_facilities(
             n_foot_merged += 1
         else:
             # New slot — write all attributes
-            populated.at[road_idx, f"{prefix}_presence"] = "separate"  # type: ignore[index]
-            populated.at[road_idx, f"{prefix}_surface"]  = fw_surface_list[fw_pos]  # type: ignore[index]
-            populated.at[road_idx, f"{prefix}_width"]    = _parse_float_tag(fw_width_list[fw_pos])  # type: ignore[index]
-            populated.at[road_idx, f"{prefix}_incline"]  = _parse_incline(fw_incline_list[fw_pos])  # type: ignore[index]
-            populated.at[road_idx, f"{prefix}_quality"]  = fw_smooth_list[fw_pos]  # type: ignore[index]
-            populated.at[road_idx, f"{prefix}_geometry"] = fw_geom  # type: ignore[index]
-            populated.at[road_idx, f"{prefix}_offset"] = False  # type: ignore[index]
+            _set_cell(road_idx, f"{prefix}_presence", "separate")
+            _set_cell(road_idx, f"{prefix}_surface",  fw_surface_list[fw_pos])
+            _set_cell(road_idx, f"{prefix}_width",    _parse_float_tag(fw_width_list[fw_pos]))
+            _set_cell(road_idx, f"{prefix}_incline",  _parse_incline(fw_incline_list[fw_pos]))
+            _set_cell(road_idx, f"{prefix}_quality",  fw_smooth_list[fw_pos])
+            _set_cell(road_idx, f"{prefix}_geometry", fw_geom)
+            _set_cell(road_idx, f"{prefix}_offset",   False)
             foot_slots_used.add(slot_key)
             if _is_centerline(fw_geom, cast(BaseGeometry, road_geom), road_idx, prefix, populated):
                 _dbg_centerline += 1
@@ -2565,11 +2576,10 @@ def _populate_separate_facilities(
                     n_suppressed_intersection += 1
                     continue
 
-            # Roundabout suppression: OSM junction=roundabout segments form a
-            # circular ring; offsetting them inward produces geometry in the
-            # middle of the intersection island that has no physical sidewalk.
-            # Skip offset entirely for any segment on a roundabout.
-            if kind == "sidewalk" and "junction" in populated.columns:
+            # Roundabout suppression: roundabout segments get no offset
+            # geometry at all (neither side).  The real sidewalks are on the
+            # approaching streets, which snap to each other at each corner.
+            if "junction" in populated.columns:
                 junction_val = populated.at[idx, "junction"]
                 if isinstance(junction_val, str) and junction_val.lower() == "roundabout":
                     n_suppressed_intersection += 1
@@ -3194,6 +3204,15 @@ def _snap_offset_endpoints(
             coords[-1] = new_xy
         return LineString(coords)
 
+    def _to_linestring(geom: BaseGeometry) -> "LineString | None":
+        """Return a LineString equivalent, merging MultiLineString if possible."""
+        if isinstance(geom, LineString):
+            return geom
+        if isinstance(geom, MultiLineString):
+            merged = _sw_linemerge(geom)
+            return merged if isinstance(merged, LineString) else None
+        return None
+
     # ── Build intersection-node -> segment mapping ────────────────────────
     # Scan ALL start/end nodes (no is_intersection flag filter).  Only nodes
     # shared by 2+ distinct segment IDs are kept — this captures true
@@ -3201,6 +3220,16 @@ def _snap_offset_endpoints(
 
     node_to_segs: dict[tuple[float, float], list[tuple[int, str]]] = defaultdict(list)
     node_key_to_pt: dict[tuple[float, float], Point] = {}
+
+    # Identify roundabout segments early so they can be excluded from node
+    # clustering.  Roundabout arcs chain adjacent entry nodes together, and
+    # including them in the proximity clustering causes ALL roundabout entries
+    # to merge into one super-node, producing wrong centroid snaps.
+    _roundabout_idxs: set[int] = set()
+    if "junction" in populated.columns:
+        _junc = populated["junction"]
+        _is_ra = _junc.notna() & _junc.astype(str).str.lower().eq("roundabout")
+        _roundabout_idxs = set(int(i) for i in populated.index[_is_ra])
 
     # _all_candidates: node_key -> [(seg_idx, position)]
     _all_candidates: dict[tuple[float, float], list[tuple[int, str]]] = defaultdict(list)
@@ -3227,6 +3256,8 @@ def _snap_offset_endpoints(
         ys = np.round(shapely.get_y(valid_geoms), 1)
 
         for seg_idx, x, y, geom in zip(valid_idx, xs, ys, valid_geoms):
+            if int(seg_idx) in _roundabout_idxs:
+                continue
             key: tuple[float, float] = (float(x), float(y))
             _all_candidates[key].append((int(seg_idx), position))
             if key not in node_key_to_pt:
@@ -3247,6 +3278,17 @@ def _snap_offset_endpoints(
     # merging.  The actual node geometry data in `populated` is NOT modified.
 
     _SNAP_NODE_CLUSTER_M = 7.5
+
+    # Collect rounded-key positions of ALL roundabout segment nodes so we can
+    # prevent adjacent roundabout entry nodes from clustering together.
+    _ra_node_keys: set[tuple[float, float]] = set()
+    for _ra_idx in _roundabout_idxs:
+        for _nc in ("start_node_geometry", "end_node_geometry"):
+            if _nc not in populated.columns:
+                continue
+            _rg = populated.at[_ra_idx, _nc]
+            if isinstance(_rg, BaseGeometry) and not _rg.is_empty and hasattr(_rg, "x"):
+                _ra_node_keys.add((round(_rg.x, 1), round(_rg.y, 1)))  # type: ignore[union-attr]
 
     # Use all nodes (node_key_to_pt), not just multi-segment nodes (node_to_segs)
     _all_nk_list = list(node_key_to_pt.keys())
@@ -3273,6 +3315,11 @@ def _snap_offset_endpoints(
             return i
 
         for _i, _j in _close_pairs:
+            # Don't merge two roundabout-entry nodes: each entry should stay
+            # separate so its approaching street is snapped independently.
+            if (_all_nk_list[_i] in _ra_node_keys
+                    and _all_nk_list[_j] in _ra_node_keys):
+                continue
             _ri, _rj = _uf_find(_i), _uf_find(_j)
             if _ri != _rj:
                 _uf[_ri] = _rj
@@ -3388,8 +3435,9 @@ def _snap_offset_endpoints(
             centroid = (cx, cy)
 
             # Check all within max extend
-            if any(math.sqrt((centroid[0] - e[3][0]) ** 2 + (centroid[1] - e[3][1]) ** 2)
-                   > _ENDPOINT_SNAP_MAX_EXTEND_M for e in corner_eps):
+            _snap_max_sq = _ENDPOINT_SNAP_MAX_EXTEND_M * _ENDPOINT_SNAP_MAX_EXTEND_M
+            if any((centroid[0] - e[3][0]) ** 2 + (centroid[1] - e[3][1]) ** 2
+                   > _snap_max_sq for e in corner_eps):
                 continue
 
             gid = next_group_id
@@ -3401,8 +3449,10 @@ def _snap_offset_endpoints(
                 ep_to_group[ep_key] = gid
                 group_members[gid].append(ep_key)
 
-                d = math.sqrt((centroid[0] - ep_xy[0]) ** 2 + (centroid[1] - ep_xy[1]) ** 2)
-                if d < 0.01:
+                if seg_idx in _roundabout_idxs:
+                    continue
+                _dsq = (centroid[0] - ep_xy[0]) ** 2 + (centroid[1] - ep_xy[1]) ** 2
+                if _dsq < 0.0001:  # 0.01² = 0.0001
                     continue
                 geom_col = f"sidewalk_{side}_geometry"
                 geom = populated.at[seg_idx, geom_col]
@@ -3431,6 +3481,8 @@ def _snap_offset_endpoints(
 
         seg_dirs: list[tuple[int, str, float, float, float]] = []
         for seg_idx, seg_end in seg_entries:
+            if seg_idx in _roundabout_idxs:
+                continue
             street_geom = populated.at[seg_idx, "street_geometry"]
             if not isinstance(street_geom, BaseGeometry) or street_geom.is_empty:
                 continue
@@ -3714,15 +3766,6 @@ def _snap_offset_endpoints(
     # the crossing point.  Only pairs that share an intersection node are
     # processed.
 
-    def _to_linestring(geom: BaseGeometry) -> LineString | None:
-        """Return a LineString equivalent, merging MultiLineString if possible."""
-        if isinstance(geom, LineString):
-            return geom
-        if isinstance(geom, MultiLineString):
-            merged = _sw_linemerge(geom)
-            return merged if isinstance(merged, LineString) else None
-        return None
-
     # Build flat list: one entry per (node_idx, seg_idx, seg_end, side)
     # node_idx is the index into _stage_nodes (unique per virtual merged node).
     s3_geoms:    list[BaseGeometry] = []  # raw geometry (may be Multi)
@@ -3734,6 +3777,8 @@ def _snap_offset_endpoints(
 
     for _ni, (_node_pt_s3, seg_entries) in enumerate(_stage_nodes):
         for seg_idx, seg_end in seg_entries:
+            if seg_idx in _roundabout_idxs:
+                continue
             for side in ("left", "right"):
                 geom_col = f"sidewalk_{side}_geometry"
                 if geom_col not in populated.columns:
@@ -3819,10 +3864,297 @@ def _snap_offset_endpoints(
 
             n_stage3 += 1
 
+    # ── Stage 2b: Backward-probe crosses trimming ─────────────────────────
+    # Runs AFTER Stage 3 so that endpoints moved by crosses-trimming are in
+    # their final positions when probes are built.  This lets Stage 2b detect
+    # cases where a moved endpoint now lies on another segment's body.
+    #
+    # For each endpoint P on segment A (side s, end e):
+    #   1. Build a short probe extending OUTWARD from P (backward, away from
+    #      the segment interior) by _ENDPOINT_SNAP_MAX_EXTEND_M, plus a
+    #      small extra buffer so the probe endpoint is past any nearby segment.
+    #   2. Use STRtree + predicate="crosses" to find sidewalk segments B that
+    #      the probe crosses.
+    #   3. For each crossing: find the intersection point C.
+    #   4. If C is within _ENDPOINT_SNAP_MAX_EXTEND_M of one end of B, trim
+    #      that end of B to C (using shapely substring) and move P to C.
+
+    n_stage2b = 0
+    _PROBE_EXTRA_M = 1.0  # extend probe slightly past P so crossing is interior
+
+    # Build probes for every endpoint currently in sw_coords_cache
+    _s2b_probe_geoms: list[LineString] = []
+    # Each key stores (seg_idx, side, seg_end, ep_at_build_time) so that the
+    # cross_dist_from_P guard can compare against the *original* probe endpoint
+    # even if sw_coords_cache is updated by earlier Stage 2b iterations.
+    _s2b_probe_keys: list[tuple[int, str, str, tuple[float, float]]] = []
+
+    for (seg_idx, side), cds in sw_coords_cache.items():
+        if seg_idx in _roundabout_idxs:
+            continue
+        if len(cds) < 2:
+            continue
+        for seg_end in ("start", "end"):
+            ep = cds[0] if seg_end == "start" else cds[-1]
+            # Tangent direction pointing INTO the segment from this endpoint
+            if seg_end == "start":
+                t_dx = cds[1][0] - cds[0][0]
+                t_dy = cds[1][1] - cds[0][1]
+            else:
+                t_dx = cds[-2][0] - cds[-1][0]
+                t_dy = cds[-2][1] - cds[-1][1]
+            t_len = math.sqrt(t_dx * t_dx + t_dy * t_dy)
+            if t_len < 0.001:
+                continue
+            t_dx /= t_len
+            t_dy /= t_len
+            # Probe: from MAX_EXTEND_M behind P to PROBE_EXTRA_M past P
+            probe_back = (ep[0] - t_dx * _ENDPOINT_SNAP_MAX_EXTEND_M,
+                          ep[1] - t_dy * _ENDPOINT_SNAP_MAX_EXTEND_M)
+            probe_fwd  = (ep[0] + t_dx * _PROBE_EXTRA_M,
+                          ep[1] + t_dy * _PROBE_EXTRA_M)
+            _s2b_probe_geoms.append(LineString([probe_back, probe_fwd]))
+            _s2b_probe_keys.append((seg_idx, side, seg_end, ep))
+
+    # Build STRtree of all current sidewalk geometries
+    _s2b_sw_geoms: list[LineString] = []
+    _s2b_sw_keys: list[tuple[int, str]] = []
+    for (s_idx, s_side), cds in sw_coords_cache.items():
+        if len(cds) >= 2:
+            _s2b_sw_geoms.append(LineString(cds))
+            _s2b_sw_keys.append((s_idx, s_side))
+
+    if _s2b_probe_geoms and _s2b_sw_geoms:
+        _s2b_tree = STRtree(np.array(_s2b_sw_geoms, dtype=object))
+        _s2b_qi, _s2b_ti = _s2b_tree.query(
+            np.array(_s2b_probe_geoms, dtype=object), predicate="crosses"
+        )
+
+        for qi, ti in zip(_s2b_qi.tolist(), _s2b_ti.tolist()):
+            probe_seg_idx, probe_side, probe_end, probe_ep = _s2b_probe_keys[qi]
+            target_seg_idx, target_side = _s2b_sw_keys[ti]
+
+            if probe_seg_idx == target_seg_idx:
+                continue
+            if target_seg_idx in _roundabout_idxs:
+                continue
+
+            probe_geom = _s2b_probe_geoms[qi]
+            target_cds = sw_coords_cache.get((target_seg_idx, target_side))
+            if not target_cds or len(target_cds) < 2:
+                continue
+
+            target_ls = LineString(target_cds)
+            ix = probe_geom.intersection(target_ls)
+            if ix.is_empty:
+                continue
+            # Resolve to a single point
+            if hasattr(ix, "geoms"):
+                pts = [g for g in ix.geoms if hasattr(g, "x")]
+                if not pts:
+                    continue
+                cross_pt: tuple[float, float] = (pts[0].x, pts[0].y)
+            elif hasattr(ix, "x"):
+                cross_pt = (ix.x, ix.y)
+            else:
+                continue
+
+            # Guard: crossing must be very close to P (the probe's source endpoint
+            # at build time).  A 12 m backward probe will geometrically cross many
+            # perpendicular sidewalks far from P — those are false positives.
+            # We use probe_ep (captured at build time) rather than the current cache
+            # value, because sw_coords_cache may have been updated by earlier
+            # iterations in this same Stage 2b loop.
+            _d_from_P = math.sqrt(
+                (cross_pt[0] - probe_ep[0]) ** 2 + (cross_pt[1] - probe_ep[1]) ** 2
+            )
+            if _d_from_P > _PROBE_EXTRA_M + 0.5:
+                continue
+
+            # Determine which end of the target to trim
+            t_start = target_cds[0]
+            t_end   = target_cds[-1]
+            d_start = math.sqrt((cross_pt[0]-t_start[0])**2 + (cross_pt[1]-t_start[1])**2)
+            d_end   = math.sqrt((cross_pt[0]-t_end[0])**2   + (cross_pt[1]-t_end[1])**2)
+
+            if d_start < d_end and d_start <= _ENDPOINT_SNAP_MAX_EXTEND_M and d_start > 0.01:
+                trim_end = "start"
+            elif d_end <= d_start and d_end <= _ENDPOINT_SNAP_MAX_EXTEND_M and d_end > 0.01:
+                trim_end = "end"
+            else:
+                continue
+
+            # Trim the target segment with substring
+            tgt_geom_col = f"sidewalk_{target_side}_geometry"
+            tgt_geom = populated.at[target_seg_idx, tgt_geom_col]
+            if not isinstance(tgt_geom, BaseGeometry) or tgt_geom.is_empty:
+                continue
+            tgt_ls_full = _to_linestring(tgt_geom)
+            if tgt_ls_full is None or tgt_ls_full.length < 0.1:
+                continue
+            t_proj = tgt_ls_full.project(Point(cross_pt))
+            if trim_end == "start":
+                trimmed = _sw_substring(tgt_ls_full, t_proj, tgt_ls_full.length)
+            else:
+                trimmed = _sw_substring(tgt_ls_full, 0, t_proj)
+            if trimmed is None or trimmed.is_empty or trimmed.length < 0.1:
+                continue
+
+            populated.at[target_seg_idx, tgt_geom_col] = trimmed  # type: ignore[index]
+            new_cds = [(c[0], c[1]) for c in trimmed.coords]
+            sw_coords_cache[(target_seg_idx, target_side)] = new_cds
+            n_endpoints_moved += 1
+
+            # Snap the probe's own endpoint to the crossing (may be sub-centimetre)
+            probe_geom_col = f"sidewalk_{probe_side}_geometry"
+            probe_obj = populated.at[probe_seg_idx, probe_geom_col]
+            if isinstance(probe_obj, BaseGeometry) and not probe_obj.is_empty:
+                pr_cds = sw_coords_cache.get((probe_seg_idx, probe_side))
+                if pr_cds:
+                    cur_ep = pr_cds[0] if probe_end == "start" else pr_cds[-1]
+                    d_ep = math.sqrt((cross_pt[0]-cur_ep[0])**2 + (cross_pt[1]-cur_ep[1])**2)
+                    if 0.01 < d_ep <= _ENDPOINT_SNAP_MAX_EXTEND_M:
+                        populated.at[probe_seg_idx, probe_geom_col] = _move_endpoint(  # type: ignore[index]
+                            probe_obj, probe_end, cross_pt
+                        )
+                        cl = list(pr_cds)
+                        if probe_end == "start":
+                            cl[0] = cross_pt
+                        else:
+                            cl[-1] = cross_pt
+                        sw_coords_cache[(probe_seg_idx, probe_side)] = cl
+                        n_endpoints_moved += 1
+
+            n_stage2b += 1
+
+    # ── Stage RA: Roundabout corner snap ──────────────────────────────────
+    # At each roundabout corner (between two adjacent entry streets), snap
+    # the two closest sidewalk endpoints to their midpoint so they share a
+    # single curb-ramp position.
+    n_stage_ra = 0
+
+    if _roundabout_idxs:
+        # Build graph of roundabout segment connectivity: node_id -> {neighbour_ids}
+        _ra_graph: dict[object, set[object]] = defaultdict(set)
+        _ra_node_ids: set[object] = set()
+        for _ra_idx in _roundabout_idxs:
+            _sn = populated.at[_ra_idx, "start_node_id"]
+            _en = populated.at[_ra_idx, "end_node_id"]
+            _ra_graph[_sn].add(_en)
+            _ra_graph[_en].add(_sn)
+            _ra_node_ids.add(_sn)
+            _ra_node_ids.add(_en)
+
+        # Find entry nodes: roundabout nodes also touched by non-roundabout segments
+        _ra_entry_segs: dict[object, list[tuple[int, str]]] = defaultdict(list)
+        _non_ra_mask = ~populated.index.isin(list(_roundabout_idxs))
+        for _node_col, _pos in (("start_node_id", "start"), ("end_node_id", "end")):
+            if _node_col not in populated.columns:
+                continue
+            _in_ra = populated[_node_col].isin(_ra_node_ids) & _non_ra_mask
+            for _idx in populated.index[_in_ra]:
+                _nid = populated.at[_idx, _node_col]
+                _ra_entry_segs[_nid].append((int(_idx), _pos))
+
+        # BFS from each entry node through roundabout-only nodes to find
+        # adjacent entry node pairs.
+        _ra_processed_pairs: set[frozenset[object]] = set()
+
+        for _entry_a in list(_ra_entry_segs.keys()):
+            _visited: set[object] = {_entry_a}
+            _queue = list(_ra_graph.get(_entry_a, set()))
+            while _queue:
+                _cur = _queue.pop(0)
+                if _cur in _visited:
+                    continue
+                _visited.add(_cur)
+                if _cur in _ra_entry_segs:
+                    # Found adjacent entry node — deduplicate the pair
+                    _pk2 = frozenset((_entry_a, _cur))
+                    if _pk2 in _ra_processed_pairs:
+                        continue
+                    _ra_processed_pairs.add(_pk2)
+
+                    # Collect sidewalk endpoints from approaching streets
+                    _eps_a: list[tuple[int, str, str, tuple[float, float]]] = []
+                    _eps_b: list[tuple[int, str, str, tuple[float, float]]] = []
+
+                    for _seg_idx, _seg_end in _ra_entry_segs[_entry_a]:
+                        for _sw_side in ("left", "right"):
+                            _cds = sw_coords_cache.get((_seg_idx, _sw_side))
+                            if not _cds:
+                                continue
+                            _ep = _cds[0] if _seg_end == "start" else _cds[-1]
+                            _eps_a.append((_seg_idx, _sw_side, _seg_end, _ep))
+
+                    for _seg_idx, _seg_end in _ra_entry_segs[_cur]:
+                        for _sw_side in ("left", "right"):
+                            _cds = sw_coords_cache.get((_seg_idx, _sw_side))
+                            if not _cds:
+                                continue
+                            _ep = _cds[0] if _seg_end == "start" else _cds[-1]
+                            _eps_b.append((_seg_idx, _sw_side, _seg_end, _ep))
+
+                    if not _eps_a or not _eps_b:
+                        continue
+
+                    # Find closest pair across the two entry nodes
+                    _best_d = float("inf")
+                    _best_a: tuple[int, str, str, tuple[float, float]] | None = None
+                    _best_b: tuple[int, str, str, tuple[float, float]] | None = None
+                    for _a in _eps_a:
+                        for _b in _eps_b:
+                            _d = math.sqrt((_a[3][0] - _b[3][0]) ** 2
+                                           + (_a[3][1] - _b[3][1]) ** 2)
+                            if _d < _best_d:
+                                _best_d = _d
+                                _best_a = _a
+                                _best_b = _b
+
+                    if (_best_a is None or _best_b is None
+                            or _best_d > _ENDPOINT_SNAP_MAX_EXTEND_M):
+                        continue
+
+                    # Snap both to midpoint
+                    _mid = ((_best_a[3][0] + _best_b[3][0]) / 2,
+                            (_best_a[3][1] + _best_b[3][1]) / 2)
+
+                    for _ep_info in (_best_a, _best_b):
+                        _seg_idx, _sw_side, _seg_end, _ep_xy = _ep_info
+                        _geom_col = f"sidewalk_{_sw_side}_geometry"
+                        _g = populated.at[_seg_idx, _geom_col]
+                        if not isinstance(_g, BaseGeometry) or _g.is_empty:
+                            continue
+                        _dsq = ((_mid[0] - _ep_xy[0]) ** 2
+                                + (_mid[1] - _ep_xy[1]) ** 2)
+                        if _dsq < 0.0001:
+                            continue
+                        populated.at[_seg_idx, _geom_col] = _move_endpoint(  # type: ignore[index]
+                            _g, _seg_end, _mid
+                        )
+                        _cached = sw_coords_cache.get((_seg_idx, _sw_side))
+                        if _cached:
+                            _cl = list(_cached)
+                            if _seg_end == "start":
+                                _cl[0] = _mid
+                            else:
+                                _cl[-1] = _mid
+                            sw_coords_cache[(_seg_idx, _sw_side)] = _cl
+                        n_endpoints_moved += 1
+
+                    n_stage_ra += 1
+                else:
+                    # Intermediate roundabout-only node: keep searching
+                    for _nb in _ra_graph[_cur]:
+                        if _nb not in _visited:
+                            _queue.append(_nb)
+
     print(f"Endpoint snapping: {n_stage1} same-street, "
           f"{n_stage2} cross-street, "
           f"{n_stage2a} antiparallel-outer, "
+          f"{n_stage2b} probe-crosses, "
           f"{n_stage3} crosses-trimmed, "
+          f"{n_stage_ra} roundabout-corners, "
           f"{n_endpoints_moved} endpoints moved.")
     return populated
 
@@ -3909,7 +4241,9 @@ def _assign_curb_ramp_geometries(
         coords = _flatten_coords(geom)
         if not coords:
             return "start"
-        return "start" if Point(coords[0]).distance(ref) <= Point(coords[-1]).distance(ref) else "end"
+        d_start = math.hypot(coords[0][0] - ref.x, coords[0][1] - ref.y)
+        d_end = math.hypot(coords[-1][0] - ref.x, coords[-1][1] - ref.y)
+        return "start" if d_start <= d_end else "end"
 
     def _snap_endpoint(geom: BaseGeometry, which: str, new_pt: Point) -> BaseGeometry:
         """Return a copy of *geom* with the start or end coordinate moved to *new_pt*."""
@@ -4269,6 +4603,8 @@ def _assign_curb_ramp_geometries(
     # ── Fallback: proximity-based for slots still empty ───────────────────────
     all_node_pts = list(node_key_to_pt.values())
     if all_node_pts:
+        # Pre-extract node coordinates as a numpy array for batch distance checks
+        _node_coords = np.array([(p.x, p.y) for p in all_node_pts], dtype=np.float64)
         intersect_tree = STRtree(all_node_pts)
         for side in ("left", "right"):
             geom_col = f"sidewalk_{side}_geometry"
@@ -4287,17 +4623,40 @@ def _assign_curb_ramp_geometries(
             for position in ("start", "end"):
                 ramp_col = f"sidewalk_{side}_curbramp_{position}_1_geometry"
                 ramp_empty = populated[ramp_col].isna()
-                for idx in populated.index[has_geom & ramp_empty]:
+                candidate_idxs = populated.index[has_geom & ramp_empty]
+                if len(candidate_idxs) == 0:
+                    continue
+
+                # Batch-build endpoint points and buffers
+                _ep_coords_list = []
+                _valid_indices = []
+                for idx in candidate_idxs:
                     coords = _coords_map.get(idx)
                     if not coords:
                         continue
-                    pt = Point(coords[0] if position == "start" else coords[-1])
-                    nearby = intersect_tree.query(pt.buffer(_CURB_RAMP_PROXIMITY_M))
-                    if len(nearby) > 0 and any(
-                        all_node_pts[k].distance(pt) <= _CURB_RAMP_PROXIMITY_M for k in nearby
-                    ):
-                        populated.at[idx, ramp_col] = pt  # type: ignore[index]
-                        n_assigned += 1
+                    _ep_coords_list.append(coords[0] if position == "start" else coords[-1])
+                    _valid_indices.append(idx)
+
+                if not _ep_coords_list:
+                    continue
+
+                _ep_xy = np.array(_ep_coords_list, dtype=np.float64)
+                _ep_pts = shapely.points(_ep_xy[:, 0], _ep_xy[:, 1])
+
+                # Batch query: dwithin returns (input_idx, tree_idx) pairs
+                # where each point is within _CURB_RAMP_PROXIMITY_M of a tree geometry
+                _tree_hits_l, _tree_hits_r = intersect_tree.query(
+                    _ep_pts, predicate="dwithin", distance=_CURB_RAMP_PROXIMITY_M
+                )
+
+                # Unique input indices that had at least one hit
+                _hit_set: set[int] = set(_tree_hits_l.tolist())
+
+                for _qi in _hit_set:
+                    idx = _valid_indices[_qi]
+                    pt = Point(_ep_coords_list[_qi])
+                    populated.at[idx, ramp_col] = pt  # type: ignore[index]
+                    n_assigned += 1
 
     print(f"Curb ramp geometries assigned: {n_assigned} ramps, {n_snapped} endpoint snaps, "
           f"{n_fw_slot_filled} footway slots filled, {n_fw_ramp_direct} footway direct ramps")
