@@ -10,7 +10,7 @@ You are a senior developer helping me implement this feature of a larger project
 **Uncertainty Strategy:** ALWAYS ask questions before writing code. These questions should be used to highlight design decisions that are ambiguously justified by logic or that are matters of taste.When recommending approaches, order them by complexity of implementation.
 
 ## Correction History Protocol
-WHENEVER you create a diagnostic script, document the script with comments on the error and the solution in the /notesforrobot folder. ALSO document the problem solving process you used to revise a diagnostic script that led to the optimal solution being uncovered. 
+WHENEVER you create a diagnostic script, document the script with comments on the error and the solution in the /notesforrobot folder. ALSO document the problem solving process you used to revise a diagnostic script that led to the optimal solution being uncovered. MAKE SURE to discuss which user prompts were most useful in uncovering the solution.
 
 **Plan Document Etiquette:** DO NOT use the superpowers:writing-plans skill, start implementing after a design is approved. After a feature is implemented, check the /docs folder for intermediate implementation docs and consolidate them to the readme.md.
 

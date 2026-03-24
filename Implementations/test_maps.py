@@ -3,13 +3,16 @@ import os
 import json
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import cast
+from typing import Any, cast
+
+import numpy as np
 
 from tqdm import tqdm
 
 import pandas as pd
 import folium
 from pyproj import Transformer
+import shapely
 from shapely import wkt
 from shapely.geometry import shape, box, Point, LineString, MultiLineString, MultiPoint, MultiPolygon, Polygon
 from shapely.geometry.base import BaseGeometry
@@ -69,6 +72,21 @@ _CURBRAMP_SIDES     = ('left', 'right')
 _CURBRAMP_POSITIONS = ('start', 'end')
 _CURBRAMP_INDICES   = (1, 2, 3)
 
+# Pre-computed column name tuples for the 12 curb-ramp combinations.
+# Each entry: (side, position, index, parsed_geom_col, id_col, returnloc_col,
+#              returnposition_col, condition_score_col)
+_CURBRAMP_SPECS: list[tuple[str, str, int, str, str, str, str, str]] = [
+    (s, p, i,
+     f'_p_sidewalk_{s}_curbramp_{p}_{i}_geometry',
+     f'sidewalk_{s}_curbramp_{p}_{i}_ID',
+     f'sidewalk_{s}_curbramp_{p}_{i}_returnloc',
+     f'sidewalk_{s}_curbramp_{p}_{i}_returnposition',
+     f'sidewalk_{s}_curbramp_{p}_{i}_condition_score')
+    for s in _CURBRAMP_SIDES
+    for p in _CURBRAMP_POSITIONS
+    for i in _CURBRAMP_INDICES
+]
+
 # ── PARQUET CACHE ──────────────────────────────────────────────────────────────
 _parquet_cache: dict[str, pd.DataFrame] = {}
 
@@ -121,6 +139,45 @@ def _utm_to_latlon(x, y):
     return [lat, lon]
 
 
+def parse_geom_series(series: pd.Series) -> pd.Series:
+    """Vectorized geometry parsing using shapely bulk ops where possible.
+
+    Detects column format from the first non-null value and dispatches to
+    shapely.from_wkb (bytes) or shapely.from_wkt (WKT strings).  Falls back
+    to row-by-row parse_geom for GeoJSON / WKB-hex / mixed formats.
+    """
+    non_null = series.dropna()
+    if non_null.empty:
+        return pd.Series([None] * len(series), index=series.index, dtype=object)
+
+    first = non_null.iloc[0]
+    # to_numpy(dtype=object) gives a plain ndarray and converts NaN → None
+    arr: 'np.ndarray[Any, np.dtype[np.object_]]' = series.to_numpy(dtype=object)
+
+    # WKB bytes — typical for parquet-stored geometries
+    if isinstance(first, bytes):
+        return pd.Series(
+            shapely.from_wkb(arr, on_invalid='warn'),  # type: ignore[arg-type]
+            index=series.index, dtype=object,
+        )
+
+    # Already shapely geometry objects
+    if hasattr(first, 'geom_type'):
+        return series
+
+    # WKT strings
+    if isinstance(first, str):
+        _WKT_PREFIXES = ('POINT', 'LINESTRING', 'POLYGON', 'MULTI', 'GEOMETRYCOLLECTION', 'LINEARRING')
+        if first.strip().upper().startswith(_WKT_PREFIXES):
+            return pd.Series(
+                shapely.from_wkt(arr, on_invalid='warn'),  # type: ignore[arg-type]
+                index=series.index, dtype=object,
+            )
+
+    # Fallback: row-by-row for GeoJSON / WKB-hex / mixed formats
+    return series.apply(parse_geom)  # type: ignore[arg-type]
+
+
 def geom_to_latlons(geom: BaseGeometry | None) -> list[list[float]]:
     """Batch-transform all coords of a LineString/MultiLineString (UTM → WGS84).
 
@@ -129,16 +186,14 @@ def geom_to_latlons(geom: BaseGeometry | None) -> list[list[float]]:
     if geom is None:
         return []
     if isinstance(geom, LineString):
-        raw = list(geom.coords)
+        arr = np.array(geom.coords)
     elif isinstance(geom, MultiLineString):
-        raw = [c for line in geom.geoms for c in line.coords]
+        arr = np.vstack([np.array(line.coords) for line in geom.geoms])
     else:
         return []
-    if not raw:
+    if not len(arr):
         return []
-    xs = [c[0] for c in raw]
-    ys = [c[1] for c in raw]
-    lons, lats = _to_wgs.transform(xs, ys)
+    lons, lats = _to_wgs.transform(arr[:, 0], arr[:, 1])
     return [[lat, lon] for lat, lon in zip(lats, lons)]
 
 
@@ -227,6 +282,22 @@ def _parse_incline(val) -> float | None:
         return abs(float(s))
     except ValueError:
         return None
+
+
+def _parse_incline_series(series: pd.Series) -> pd.Series:
+    """Vectorized version of _parse_incline — returns absolute float values, NaN for unparseable."""
+    numeric = pd.to_numeric(series, errors='coerce').abs()
+    needs_parse = numeric.isna() & series.notna()
+    if needs_parse.any():
+        cleaned = (
+            series[needs_parse].astype(str)
+            .str.strip()
+            .str.replace('%', '', regex=False)
+            .str.replace('+', '', regex=False)
+        )
+        numeric = numeric.copy()
+        numeric[needs_parse] = pd.to_numeric(cleaned, errors='coerce').abs()
+    return numeric
 
 
 def _blend_with_black(hex_color: str, opacity: float) -> str:
@@ -350,8 +421,11 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
               position=bar_pos, leave=True, unit='step') as pbar:
 
         # ── Stage 1: filter to bbox ───────────────────────────────────────────
-        _parsed_street = data['street_geometry'].apply(parse_geom)  # type: ignore[arg-type]
-        _in_bbox_mask  = _parsed_street.apply(lambda g: g is not None and bbox.intersects(g))  # type: ignore[arg-type]
+        _parsed_street = parse_geom_series(data['street_geometry'])
+        _in_bbox_mask  = pd.Series(
+            shapely.intersects(_parsed_street.to_numpy(dtype=object), bbox),  # type: ignore[arg-type]
+            index=data.index,
+        ).astype(bool)
         data = data.loc[_in_bbox_mask].copy()
         data['_street_geom'] = _parsed_street[_in_bbox_mask]
         _present_geom_cols = [c for c in _geom_cols_to_parse if c in data.columns]
@@ -364,9 +438,7 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
         _incline_vals: list[float] = []
         for _icol in _INCLINE_COLS:
             if _icol in data.columns:
-                _incline_vals.extend(
-                    v for v in data[_icol].apply(_parse_incline) if v is not None
-                )
+                _incline_vals.extend(_parse_incline_series(data[_icol]).dropna().tolist())
         _incline_min = min(_incline_vals) if _incline_vals else 0.0
         _incline_max = max(_incline_vals) if _incline_vals else 1.0
 
@@ -379,11 +451,19 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
 
         pbar.update(1)
 
-        # ── Stage 3: pre-parse geometry columns (one step per column) ─────────
-        for _col in _present_geom_cols:
-            pbar.set_description(f'{output_name} · {_col}')
-            data[f'_p_{_col}'] = data[_col].apply(parse_geom)  # type: ignore[arg-type]
-            pbar.update(1)
+        # ── Stage 3: pre-parse geometry columns (parallel, one thread per col) ──
+        pbar.set_description(f'{output_name} · geometry cols')
+        _col_results: dict[str, pd.Series] = {}
+        with ThreadPoolExecutor() as _geom_ex:
+            _geom_futures = {
+                _geom_ex.submit(parse_geom_series, data[col]): col
+                for col in _present_geom_cols
+            }
+            for _f in as_completed(_geom_futures):
+                _col_results[_geom_futures[_f]] = _f.result()
+                pbar.update(1)
+        for _col, _result in _col_results.items():
+            data[f'_p_{_col}'] = _result
 
         # ── Stage 4: pre-parse feature list columns ───────────────────────────
         pbar.set_description(f'{output_name} · feature lists')
@@ -555,37 +635,35 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
                                 _seg_index[_bk_id] = {'v': _bk_layer.get_name(), 'c': coords[len(coords) // 2], 'ow': 2, 'oc': bk_draw_color}
 
             # Curb Ramps (orange)
-            for side in _CURBRAMP_SIDES:
-                for position in _CURBRAMP_POSITIONS:
-                    for index in _CURBRAMP_INDICES:
-                        geom_col = _curbramp_col(side, position, index, 'geometry')
-                        ramp_geom = row.get(f'_p_{geom_col}')
-                        if ramp_geom is None or not in_bbox(ramp_geom):
-                            continue
-                        if ramp_geom.geom_type != 'Point':
-                            continue
-                        ramp_point = cast(Point, ramp_geom)
-                        lat_lon    = _utm_to_latlon(ramp_point.x, ramp_point.y)
-                        ramp_attrs = [
-                            ('Ramp ID',          row.get(_curbramp_col(side, position, index, 'ID'))),
-                            ('Side',             side),
-                            ('Position',         position),
-                            ('Index',            index),
-                            ('Return direction', row.get(_curbramp_col(side, position, index, 'returnloc'))),
-                            ('Return position',  row.get(_curbramp_col(side, position, index, 'returnposition'))),
-                            ('Condition score',  row.get(_curbramp_col(side, position, index, 'condition_score'))),
-                            ('Street name',      row.get('name')),
-                        ]
-                        folium.CircleMarker(
-                            location=lat_lon, radius=5,
-                            color='orange', fill=True, fill_color='orange',
-                            fill_opacity=0.9, weight=1,
-                            tooltip=(f"Curb ramp {side}-{position}-{index}: "
-                                     f"returnloc={row.get(_curbramp_col(side, position, index, 'returnloc'))}, "
-                                     f"returnpos={row.get(_curbramp_col(side, position, index, 'returnposition'))}"),
-                            popup=make_popup(f'Curb Ramp ({side} {position} #{index})', ramp_attrs)
-                        ).add_to(fg_curbramps)
-                        counts['curbramp'] += 1
+            for side, position, index, p_geom_col, id_col, rloc_col, rpos_col, cond_col in _CURBRAMP_SPECS:
+                ramp_geom = row.get(p_geom_col)
+                if ramp_geom is None or not in_bbox(ramp_geom):
+                    continue
+                if ramp_geom.geom_type != 'Point':
+                    continue
+                ramp_point = cast(Point, ramp_geom)
+                lat_lon    = _utm_to_latlon(ramp_point.x, ramp_point.y)
+                rloc       = row.get(rloc_col)
+                rpos       = row.get(rpos_col)
+                ramp_attrs = [
+                    ('Ramp ID',          row.get(id_col)),
+                    ('Side',             side),
+                    ('Position',         position),
+                    ('Index',            index),
+                    ('Return direction', rloc),
+                    ('Return position',  rpos),
+                    ('Condition score',  row.get(cond_col)),
+                    ('Street name',      row.get('name')),
+                ]
+                folium.CircleMarker(
+                    location=lat_lon, radius=5,
+                    color='orange', fill=True, fill_color='orange',
+                    fill_opacity=0.9, weight=1,
+                    tooltip=(f"Curb ramp {side}-{position}-{index}: "
+                             f"returnloc={rloc}, returnpos={rpos}"),
+                    popup=make_popup(f'Curb Ramp ({side} {position} #{index})', ramp_attrs)
+                ).add_to(fg_curbramps)
+                counts['curbramp'] += 1
 
             # Crosswalks (magenta)
             for cw_pos in ('start', 'end'):
@@ -853,6 +931,31 @@ function pxSearch() {{
 """
         m.get_root().html.add_child(folium.Element(_search_html))  # type: ignore[attr-defined]
 
+        # --- Click-to-show-coordinates widget (bottom-right) ---
+        _coord_html = f"""
+<div id="px-coords" style="
+    position:fixed;bottom:30px;right:30px;z-index:9999;
+    background:rgba(255,255,255,0.92);padding:6px 12px;border-radius:6px;
+    font:12px/1.4 monospace;color:#333;box-shadow:0 1px 4px rgba(0,0,0,0.2);
+    pointer-events:none;display:none;">
+</div>
+<script>
+document.addEventListener('DOMContentLoaded', function() {{
+  var box = document.getElementById('px-coords');
+  var map = window['{map_var}'];
+  if (!map) return;
+  map.on('click', function(e) {{
+    box.style.display = 'block';
+    box.textContent = e.latlng.lat.toFixed(7) + ', ' + e.latlng.lng.toFixed(7);
+  }});
+  map.on('contextmenu', function() {{
+    box.style.display = 'none';
+  }});
+}});
+</script>
+"""
+        m.get_root().html.add_child(folium.Element(_coord_html))  # type: ignore[attr-defined]
+
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         out_path = os.path.join(OUTPUT_DIR, f"{output_name}.html")
         m.save(out_path)
@@ -861,274 +964,632 @@ function pxSearch() {{
     return out_path
 
 
-# ── INTERSECTION HULL MAP ──────────────────────────────────────────────────────
-_HULL_FALLBACK_R      = 15.0   # circle radius when < 3 non-collinear points
-_DEFAULT_LANE_WIDTH_M = 3.5
-_DEFAULT_BIKE_WIDTH_M = 1.5
+# ── COUNTY MAP (DuckDB WASM) ────────────────────────────────────────────────────
+# Serve the Output/ directory with `python -m http.server 8080 --bind 127.0.0.1` and open
+# http://localhost:8080/test_maps/<output_name>.html
+# DuckDB WASM queries the parquet directly via HTTP range requests.
+_COUNTY_MAP_TEMPLATE = """\
+<!-- Serve: cd Output && python -m http.server 8080 --bind 127.0.0.1 -->
+<!-- Open:  http://localhost:8080/test_maps/%%TITLE%%.html   -->
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>%%TITLE%%</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+#map { width: 100%; height: 100vh; }
+#status {
+  position: fixed; top: 10px; left: 50%; transform: translateX(-50%);
+  z-index: 9999; background: white; padding: 5px 14px;
+  border: 1px solid #ccc; border-radius: 4px;
+  font-family: sans-serif; font-size: 12px; white-space: nowrap;
+  pointer-events: none;
+}
+#error-banner {
+  display: none; position: fixed; top: 0; left: 0; right: 0;
+  background: #b00; color: white; padding: 10px 16px;
+  z-index: 10000; font-family: sans-serif; font-size: 13px; text-align: center;
+}
+#legend {
+  position: fixed; bottom: 30px; left: 30px; z-index: 9999;
+  background: white; padding: 10px 14px; border: 2px solid #aaa;
+  border-radius: 6px; font-size: 13px; font-family: sans-serif; line-height: 1.9;
+}
+#px-search {
+  position: fixed; top: 70px; right: 10px; z-index: 9999;
+  background: white; padding: 10px 14px; border: 2px solid #aaa;
+  border-radius: 6px; font-size: 13px; font-family: sans-serif; line-height: 1.6;
+}
+</style>
+</head>
+<body>
+<div id="error-banner"></div>
+<div id="status">Initializing DuckDB WASM\u2026</div>
+<div id="map"></div>
 
-
-def _hull_parse_numeric(val, default: float) -> float:
-    if val is None or (isinstance(val, float) and pd.isna(val)):
-        return default
-    try:
-        return float(str(val).split()[0])
-    except (ValueError, TypeError):
-        return default
-
-
-def _hull_sidewalk_offset(row: dict, default_lane_w: float = _DEFAULT_LANE_WIDTH_M) -> float:
-    """Mirrors ProximityModel._sidewalk_max_offset_m for a plain dict row."""
-    lanes      = _hull_parse_numeric(row.get('lanes'),      2.0)
-    lane_width = _hull_parse_numeric(row.get('lane_width'), default_lane_w)
-    half_road  = (lanes * lane_width) / 2.0
-    max_offset = 0.0
-    for s in ('left', 'right'):
-        bike_w = 0.0
-        for slot in ('1', '2'):
-            w   = row.get(f'bikeway_{s}_{slot}_width')
-            typ = row.get(f'bikeway_{s}_{slot}_type')
-            na_w   = w is None or (isinstance(w, float) and pd.isna(w))
-            na_typ = typ is None or (isinstance(typ, float) and pd.isna(typ)) or str(typ).strip() in ('', 'nan', 'None')
-            if not na_w:
-                bike_w += _hull_parse_numeric(w, 0.0)
-            elif not na_typ:
-                bike_w += _DEFAULT_BIKE_WIDTH_M
-        max_offset = max(max_offset, half_road + bike_w)
-    return max_offset if max_offset > 0 else _HULL_FALLBACK_R
-
-
-def _build_intersection_hull(node_pt: Point,
-                              approaches: list[tuple[float, float]]) -> Polygon:
-    """Mirrors ProximityModel hull construction (Phase 1 + 2 + 3).
-
-    approaches: list of (bearing_deg, offset_m) — one per connected road segment.
-    Returns a Polygon (buffered circle if degenerate).
-    """
-    hull_pts: list[Point] = []
-
-    # Phase 1 — project one point per approach
-    for bearing_deg, offset in approaches:
-        b_rad = math.radians(bearing_deg)
-        hull_pts.append(Point(
-            node_pt.x + math.sin(b_rad) * offset,
-            node_pt.y + math.cos(b_rad) * offset,
-        ))
-
-    # Phase 2 — bisector corner fill
-    if len(approaches) >= 2:
-        sorted_app = sorted(approaches, key=lambda x: x[0])
-        n = len(sorted_app)
-        for i in range(n):
-            b1, o1 = sorted_app[i]
-            b2, o2 = sorted_app[(i + 1) % n]
-            if b2 <= b1:
-                b2 += 360.0
-            gap      = b2 - b1
-            bisector = (b1 + gap / 2.0) % 360.0
-            half_rad = math.radians(gap / 2.0)
-            max_o    = max(o1, o2)
-            if half_rad >= math.radians(85.0):
-                c_dist = max_o * 1.5
-            else:
-                c_dist = min(max_o / math.cos(half_rad), max_o * 3.0)
-            b_rad = math.radians(bisector)
-            hull_pts.append(Point(
-                node_pt.x + math.sin(b_rad) * c_dist,
-                node_pt.y + math.cos(b_rad) * c_dist,
-            ))
-
-    # Phase 3 — convex hull / fallback
-    if len(hull_pts) >= 3:
-        candidate = MultiPoint(hull_pts).convex_hull
-        if candidate.geom_type in ('Polygon', 'MultiPolygon'):
-            return candidate  # type: ignore[return-value]
-        return node_pt.buffer(_HULL_FALLBACK_R)
-    if len(hull_pts) == 2:
-        p0, p1 = hull_pts
-        r = max(p0.distance(p1) / 2.0, _HULL_FALLBACK_R)
-        return Point((p0.x + p1.x) / 2, (p0.y + p1.y) / 2).buffer(r)
-    return node_pt.buffer(_HULL_FALLBACK_R)
-
-
-def generate_intersection_hull_map(data: pd.DataFrame, center_lat: float, center_lon: float,
-                                   output_name: str, zoom: int = 19, bbox_m: int = 750) -> str:
-    """Build a map showing convex hulls of each intersection node.
-
-    Replicates ProximityModel._assign_curb_ramp_geometries hull construction:
-    for each intersection node, projects outward from the node along each
-    connected road's approach direction by that road's sidewalk offset, adds
-    bisector corner fill points, then computes the convex hull.
-    Returns the path to the saved HTML file.
-    """
-    cx, cy  = _to_utm.transform(center_lon, center_lat)
-    bbox    = box(cx - bbox_m, cy - bbox_m, cx + bbox_m, cy + bbox_m)
-    lat_deg = bbox_m / 111320
-    lon_deg = bbox_m / (111320 * math.cos(math.radians(center_lat)))
-
-    # Filter to bbox via street_geometry
-    _parsed_street = data['street_geometry'].apply(parse_geom)  # type: ignore[arg-type]
-    _in_bbox_mask  = _parsed_street.apply(lambda g: g is not None and bbox.intersects(g))  # type: ignore[arg-type]
-    df = data.loc[_in_bbox_mask].copy()
-
-    # Pre-parse node geometry columns
-    for col in ('start_node_geometry', 'end_node_geometry'):
-        if col in df.columns:
-            df[f'_p_{col}'] = df[col].apply(parse_geom)  # type: ignore[arg-type]
-
-    # Group rows by rounded UTM node key (mirrors ProximityModel grouping)
-    # node_key -> (node_pt, list[(row_dict, position)])
-    node_to_segs: dict[tuple[float, float], list[tuple[dict, str]]] = {}
-    node_key_to_pt: dict[tuple[float, float], Point] = {}
-
-    rows = df.to_dict('records')
-    for row in rows:
-        for node_col, flag_col, position in (
-            ('_p_start_node_geometry', 'start_node_is_intersection_node', 'start'),
-            ('_p_end_node_geometry',   'end_node_is_intersection_node',   'end'),
-        ):
-            if not bool(row.get(flag_col)):
-                continue
-            geom = row.get(node_col)
-            if not isinstance(geom, Point) or geom.is_empty:
-                continue
-            key = (round(geom.x, 1), round(geom.y, 1))
-            node_to_segs.setdefault(key, []).append((row, position))
-            node_key_to_pt.setdefault(key, geom)
-
-    # Build approach list for each node
-    # (bearing_deg from node toward far end, offset_m)
-    node_approaches: dict[tuple[float, float], list[tuple[float, float]]] = {}
-    for key, segs in node_to_segs.items():
-        node_pt = node_key_to_pt[key]
-        approaches: list[tuple[float, float]] = []
-        for row, position in segs:
-            far_col = '_p_end_node_geometry' if position == 'start' else '_p_start_node_geometry'
-            far_pt  = row.get(far_col)
-            if not isinstance(far_pt, Point) or far_pt.is_empty:
-                continue
-            dx   = far_pt.x - node_pt.x
-            dy   = far_pt.y - node_pt.y
-            dist = (dx * dx + dy * dy) ** 0.5
-            if dist < 1e-6:
-                continue
-            bearing = math.degrees(math.atan2(dx, dy)) % 360.0
-            offset  = _hull_sidewalk_offset(row)
-            approaches.append((bearing, offset))
-        if approaches:
-            node_approaches[key] = approaches
-
-    # Build map
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom,
-                   tiles='CartoDB positron')
-
-    fg_hulls  = folium.FeatureGroup(name='Intersection Hulls', show=True)
-    fg_nodes  = folium.FeatureGroup(name='Intersection Nodes', show=True)
-    fg_bbox   = folium.FeatureGroup(name=f'{bbox_m} m bbox',   show=True)
-
-    folium.Rectangle(
-        bounds=[
-            [center_lat - lat_deg, center_lon - lon_deg],
-            [center_lat + lat_deg, center_lon + lon_deg],
-        ],
-        color='gray', weight=1.5, fill=False, dash_array='6 4',
-        tooltip=f"{bbox_m} m bounding box"
-    ).add_to(fg_bbox)
-
-    hull_count = 0
-    for key, approaches in node_approaches.items():
-        node_pt  = node_key_to_pt[key]
-        poly     = _build_intersection_hull(node_pt, approaches)
-
-        # Convert polygon exterior ring from UTM to WGS84
-        ring = list(poly.exterior.coords)
-        xs   = [c[0] for c in ring]
-        ys   = [c[1] for c in ring]
-        lons, lats = _to_wgs.transform(xs, ys)
-        latlon_ring = [[lat, lon] for lat, lon in zip(lats, lons)]
-
-        n_app = len(approaches)
-        folium.Polygon(
-            locations=latlon_ring,
-            color='#1a6bb0', weight=1.5,
-            fill=True, fill_color='#4ea8de', fill_opacity=0.35,
-            tooltip=f"Intersection ({key[0]:.1f}, {key[1]:.1f}) · {n_app} approaches",
-            popup=make_popup(f'Intersection', [
-                ('UTM key',        f'{key[0]:.1f}, {key[1]:.1f}'),
-                ('Approaches',     n_app),
-                ('Hull area (m²)', f'{poly.area:.1f}'),
-            ])
-        ).add_to(fg_hulls)
-
-        # Centroid marker
-        cen = poly.centroid
-        cen_lon, cen_lat = _to_wgs.transform(cen.x, cen.y)
-        folium.CircleMarker(
-            location=[cen_lat, cen_lon], radius=4,
-            color='#8b0000', fill=True, fill_color='#8b0000', fill_opacity=1.0, weight=1,
-            tooltip=f"Node ({key[0]:.1f}, {key[1]:.1f}) · {n_app} approaches",
-        ).add_to(fg_nodes)
-
-        hull_count += 1
-
-    for fg in (fg_bbox, fg_hulls, fg_nodes):
-        fg.add_to(m)
-
-    folium.Marker(
-        [center_lat, center_lon],
-        popup=output_name,
-        icon=folium.Icon(color='orange', icon='map-marker')
-    ).add_to(m)
-
-    map_var   = m.get_name()
-    js_hulls  = fg_hulls.get_name()
-    js_nodes  = fg_nodes.get_name()
-    js_bbox   = fg_bbox.get_name()
-
-    legend_html = f"""
-<div id="px-legend" style="
-    position:fixed;bottom:30px;left:30px;z-index:9999;
-    background:white;padding:10px 14px;border:2px solid #aaa;
-    border-radius:6px;font-size:13px;font-family:sans-serif;line-height:1.9;">
-  <b style="font-size:14px">Intersection Hulls</b><br>
-
+<div id="legend">
+  <b style="font-size:14px">Legend</b><br>
   <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-    <input type="checkbox" checked onchange="toggleFG('{js_hulls}', this.checked)">
-    <span style="color:#1a6bb0;font-size:18px;line-height:1">&#9646;</span>
-    Convex Hulls ({hull_count})
+    <input type="checkbox" id="cb_nodes" checked>
+    <span style="color:#8b0000;font-size:18px;line-height:1">&#9679;</span> Intersection Nodes
   </label>
-
   <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-    <input type="checkbox" checked onchange="toggleFG('{js_nodes}', this.checked)">
-    <span style="color:#8b0000;font-size:18px;line-height:1">&#9679;</span>
-    Centroid Nodes ({hull_count})
+    <input type="checkbox" id="cb_ramps" checked>
+    <span style="color:#ff8c00;font-size:18px;line-height:1">&#9679;</span> Curb Ramps
   </label>
-
   <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-    <input type="checkbox" checked onchange="toggleFG('{js_bbox}', this.checked)">
-    <span style="color:gray;font-size:18px;line-height:1">&#9645;</span>
-    {bbox_m} m bbox
+    <input type="checkbox" id="cb_calm" checked>
+    <span style="color:#6a0dad;font-size:18px;line-height:1">&#9679;</span> Traffic Calming
   </label>
-
+  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+    <input type="checkbox" id="cb_sw_off" checked>
+    <span style="color:#add8e6;font-size:18px;line-height:1">&#9644;</span> Sidewalks \u2013 offset
+  </label>
+  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+    <input type="checkbox" id="cb_sw_sep" checked>
+    <span style="color:#00008b;font-size:18px;line-height:1">&#9644;</span> Sidewalks \u2013 separate
+  </label>
+  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+    <input type="checkbox" id="cb_bk_off" checked>
+    <span style="color:#90ee90;font-size:18px;line-height:1">&#9644;</span> Bikeways \u2013 offset
+  </label>
+  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+    <input type="checkbox" id="cb_bk_sep" checked>
+    <span style="color:#006400;font-size:18px;line-height:1">&#9644;</span> Bikeways \u2013 separate
+  </label>
+  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+    <input type="checkbox" id="cb_streets" checked>
+    <span style="color:#c0392b;font-size:18px;line-height:1">&#9644;</span> Streets
+  </label>
 </div>
 
-<script>
-function toggleFG(fgName, show) {{
-  var mapObj = window['{map_var}'];
-  if (show) {{
-    if (!mapObj.hasLayer(window[fgName])) mapObj.addLayer(window[fgName]);
-  }} else {{
-    if (mapObj.hasLayer(window[fgName]))  mapObj.removeLayer(window[fgName]);
-  }}
-}}
+<div id="px-search">
+  <b style="font-size:14px">Search</b><br>
+  <div style="display:flex;gap:4px;margin:6px 0 4px;">
+    <button id="px-mode-seg" style="flex:1;padding:3px 8px;border:1px solid #888;border-radius:4px;cursor:pointer;background:#1a73e8;color:white;font-size:12px;">
+      Segment ID
+    </button>
+    <button id="px-mode-node" style="flex:1;padding:3px 8px;border:1px solid #888;border-radius:4px;cursor:pointer;background:white;color:#333;font-size:12px;">
+      Node ID
+    </button>
+  </div>
+  <div style="display:flex;gap:4px;">
+    <input id="px-search-input" type="text" placeholder="e.g. 12_34_0"
+           style="flex:1;padding:4px 6px;border:1px solid #ccc;border-radius:4px;font-size:12px;min-width:140px;"
+           onkeydown="if(event.key==='Enter')pxSearch()">
+    <button onclick="pxSearch()"
+            style="padding:4px 10px;border:1px solid #888;border-radius:4px;cursor:pointer;background:#f5f5f5;font-size:12px;">
+      Go
+    </button>
+  </div>
+  <div id="px-search-status" style="margin-top:5px;font-size:11px;color:#555;min-height:14px;"></div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/proj4@2.11.0/dist/proj4.min.js"></script>
+<script type="module">
+import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/+esm';
+
+const PARQUET_URL = new URL('%%PARQUET_URL%%', window.location.href).href;
+
+// ── Coordinate transforms (all parquet geometries are EPSG:32610 UTM Zone 10N) ──
+proj4.defs('EPSG:32610', '+proj=utm +zone=10 +datum=WGS84 +units=m +no_defs');
+
+function viewportToUTM(bounds) {
+  const sw = proj4('EPSG:4326', 'EPSG:32610', [bounds.getWest(),  bounds.getSouth()]);
+  const ne = proj4('EPSG:4326', 'EPSG:32610', [bounds.getEast(),  bounds.getNorth()]);
+  return { minX: sw[0], minY: sw[1], maxX: ne[0], maxY: ne[1] };
+}
+
+// Recursively transform GeoJSON coordinates from UTM to WGS84 lon/lat
+function xfGeom(g) {
+  if (!g) return null;
+  const xf = c => proj4('EPSG:32610', 'EPSG:4326', c);
+  if (g.type === 'Point')           return { type: 'Point',           coordinates: xf(g.coordinates) };
+  if (g.type === 'LineString')      return { type: 'LineString',      coordinates: g.coordinates.map(xf) };
+  if (g.type === 'MultiLineString') return { type: 'MultiLineString', coordinates: g.coordinates.map(r => r.map(xf)) };
+  if (g.type === 'MultiPoint')      return { type: 'MultiPoint',      coordinates: g.coordinates.map(xf) };
+  return g;
+}
+
+// ── Incline-based colour darkening (mirrors _blend_with_black in Python) ─────
+function blendBlack(hex, opacity) {
+  const h = hex.replace('#', '');
+  const r = parseInt(h.slice(0,2),16), g = parseInt(h.slice(2,4),16), b = parseInt(h.slice(4,6),16);
+  const f = 1 - Math.max(0, Math.min(1, opacity));
+  return '#' + [r,g,b].map(v => Math.round(v*f).toString(16).padStart(2,'0')).join('');
+}
+function inclineColor(base, raw) {
+  const v = Math.abs(parseFloat(raw));
+  if (isNaN(v)) return base;
+  return blendBlack(base, Math.min(v / 30, 1) * 0.5);
+}
+
+// ── Colours (matching generate_map) ──────────────────────────────────────────
+const C = {
+  street:  '#c0392b',
+  bk_sep:  '#006400', bk_off: '#90ee90',
+  sw_sep:  '#00008b', sw_off: '#add8e6',
+  node:    '#8b0000',
+  ramp:    '#ff8c00',
+  calm:    '#6a0dad',
+  cross:   '#ff00ff',
+  cret:    '#008080',
+};
+
+// ── Zoom tier thresholds ──────────────────────────────────────────────────────
+function getTier(zoom) {
+  if (zoom >= 18) return 5;
+  if (zoom >= 17) return 4;
+  if (zoom >= 15) return 3;
+  if (zoom >= 13) return 2;
+  return 1;
+}
+
+const HW_RE = {
+  1: "(motorway|motorway_link|trunk|trunk_link|primary|primary_link|secondary|secondary_link)",
+  2: "(motorway|motorway_link|trunk|trunk_link|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|busway|cycleway)",
+};
+
+// ── Leaflet map ───────────────────────────────────────────────────────────────
+const map = L.map('map').setView([37.7749, -122.4194], 12);
+L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+  attribution: '&copy; OpenStreetMap contributors &copy; CARTO', maxZoom: 20
+}).addTo(map);
+
+const lg = {
+  streets: L.layerGroup().addTo(map),
+  bk_sep:  L.layerGroup().addTo(map),
+  bk_off:  L.layerGroup().addTo(map),
+  sw_sep:  L.layerGroup().addTo(map),
+  sw_off:  L.layerGroup().addTo(map),
+  nodes:   L.layerGroup().addTo(map),
+  ramps:   L.layerGroup().addTo(map),
+  calm:    L.layerGroup().addTo(map),
+};
+
+// ── Search index ─────────────────────────────────────────────────────────────
+const segIndex  = new Map();   // street_grid_id / sidewalk_*_ID → { layer, mid, baseColor, baseWeight }
+const nodeIndex = new Map();   // node_id (string) → { mid }
+let   _pxMode   = 'seg';
+
+// ── Popup builder (matches generate_map style) ────────────────────────────────
+function makePopup(title, attrs) {
+  const fmt = v => (v == null || String(v).trim() === '' || String(v) === 'nan' || String(v) === 'None')
+    ? '<i>\u2014</i>' : v;
+  const rows = attrs.map(([k,v]) =>
+    `<tr><td style="padding:2px 8px 2px 0;color:#555;white-space:nowrap"><b>${k}</b></td>` +
+    `<td style="padding:2px 0">${fmt(v)}</td></tr>`).join('');
+  return `<div style="font-family:sans-serif;font-size:12px;min-width:180px">` +
+         `<b style="font-size:13px">${title}</b>` +
+         `<table style="border-collapse:collapse;margin-top:4px">${rows}</table></div>`;
+}
+
+// ── Layer rendering ───────────────────────────────────────────────────────────
+function clearAll() {
+  Object.values(lg).forEach(l => l.clearLayers());
+  segIndex.clear();
+  nodeIndex.clear();
+}
+
+function midLatLon(geojson) {
+  // Return approximate [lat, lon] midpoint of a GeoJSON geometry (already WGS84)
+  const coords = geojson.type === 'LineString'      ? geojson.coordinates
+               : geojson.type === 'MultiLineString' ? geojson.coordinates.flat()
+               : geojson.type === 'Point'           ? [geojson.coordinates]
+               : geojson.type === 'MultiPoint'      ? geojson.coordinates
+               : [];
+  if (!coords.length) return [0, 0];
+  const mid = coords[Math.floor(coords.length / 2)];
+  return [mid[1], mid[0]];  // [lat, lon]
+}
+
+function renderRows(rows, tier) {
+  clearAll();
+  for (const r of rows) {
+    // ── Streets ──────────────────────────────────────────────────────────────
+    if (r.street_geom) {
+      const g    = xfGeom(JSON.parse(r.street_geom));
+      const col  = inclineColor(C.street, r.street_incline);
+      const opts = { style: () => ({ color: col, weight: tier >= 2 ? 2 : 1.5, opacity: 0.8 }) };
+      const layer = L.geoJSON(g, opts);
+      if (tier >= 2) {
+        layer.bindTooltip(String(r.name || r.highway || ''));
+        layer.bindPopup(makePopup('Street', [
+          ['Name',      r.name],       ['Highway',  r.highway],
+          ['Grid ID',   r.street_grid_id], ['Incline', r.street_incline],
+          ['Lanes',     r.lanes],       ['Surface',  r.surface],
+          ['Max speed', r.maxspeed],    ['Oneway',   r.oneway],
+        ]));
+        const mid = midLatLon(g);
+        segIndex.set(String(r.street_grid_id), { layer, mid, baseColor: col, baseWeight: 2 });
+      }
+      layer.addTo(lg.streets);
+    }
+
+    if (tier >= 2) {
+      // ── Bikeways ────────────────────────────────────────────────────────────
+      for (const [key, side, idx] of [
+        ['bk_l1_geom','left',1], ['bk_l2_geom','left',2],
+        ['bk_r1_geom','right',1],['bk_r2_geom','right',2],
+      ]) {
+        if (!r[key]) continue;
+        const isOff = r[`bikeway_${side}_${idx}_offset`] === 'yes';
+        const base  = isOff ? C.bk_off : C.bk_sep;
+        const col   = inclineColor(base, r[`bikeway_${side}_${idx}_incline`]);
+        const g     = xfGeom(JSON.parse(r[key]));
+        const layer = L.geoJSON(g, { style: () => ({ color: col, weight: 2, opacity: 0.85 }) })
+          .bindTooltip(`Bikeway ${side}-${idx}: ${r[`bikeway_${side}_${idx}_type`] || ''}`)
+          .bindPopup(makePopup(`Bikeway (${side} ${idx})`, [
+            ['Type',      r[`bikeway_${side}_${idx}_type`]],
+            ['Offset',    r[`bikeway_${side}_${idx}_offset`]],
+            ['Width (m)', r[`bikeway_${side}_${idx}_width`]],
+            ['Surface',   r[`bikeway_${side}_${idx}_surface`]],
+            ['Incline',   r[`bikeway_${side}_${idx}_incline`]],
+            ['Permitted', r[`bikeway_${side}_${idx}_permitted`]],
+            ['Separator', r[`bikeway_${side}_${idx}_seperator`]],
+            ['Street',    r.name],
+          ]));
+        layer.addTo(isOff ? lg.bk_off : lg.bk_sep);
+      }
+    }
+
+    if (tier >= 3) {
+      // ── Sidewalks ────────────────────────────────────────────────────────────
+      for (const [key, side] of [['sw_l_geom','left'],['sw_r_geom','right']]) {
+        if (!r[key]) continue;
+        const isOff = r[`sidewalk_${side}_offset`] === 'yes';
+        const base  = isOff ? C.sw_off : C.sw_sep;
+        const col   = inclineColor(base, r[`sidewalk_${side}_incline`]);
+        const g     = xfGeom(JSON.parse(r[key]));
+        const layer = L.geoJSON(g, { style: () => ({ color: col, weight: 2, opacity: 0.85 }) })
+          .bindTooltip(`Sidewalk ${side}: presence=${r[`sidewalk_${side}_presence`] || ''}`)
+          .bindPopup(makePopup(`Sidewalk (${side})`, [
+            ['ID',        r[`sidewalk_${side}_ID`]],
+            ['Presence',  r[`sidewalk_${side}_presence`]],
+            ['Surface',   r[`sidewalk_${side}_surface`]],
+            ['Quality',   r[`sidewalk_${side}_quality`]],
+            ['Width (m)', r[`sidewalk_${side}_width`]],
+            ['Incline',   r[`sidewalk_${side}_incline`]],
+            ['Separator', r[`sidewalk_${side}_seperator`]],
+            ['Offset',    r[`sidewalk_${side}_offset`]],
+            ['Street',    r.name],
+          ]));
+        const mid = midLatLon(g);
+        const swId = String(r[`sidewalk_${side}_ID`] || '');
+        if (swId) segIndex.set(swId, { layer, mid, baseColor: col, baseWeight: 2 });
+        layer.addTo(isOff ? lg.sw_off : lg.sw_sep);
+      }
+
+      // ── Crosswalks ────────────────────────────────────────────────────────────
+      for (const [key, pos] of [['xw_start_geom','start'],['xw_end_geom','end']]) {
+        if (!r[key]) continue;
+        const g = xfGeom(JSON.parse(r[key]));
+        L.geoJSON(g, { style: () => ({ color: C.cross, weight: 2, opacity: 0.8 }) })
+          .bindTooltip(`Crosswalk ${pos}`)
+          .bindPopup(makePopup(`Crosswalk (${pos})`, [
+            ['ID',         r[`crosswalk_${pos}_id`]],
+            ['Type',       r[`crosswalk_${pos}_type`]],
+            ['Controlled', r[`crosswalk_${pos}_controlled`]],
+            ['Marked',     r[`crosswalk_${pos}_marked`]],
+            ['Signals',    r[`crosswalk_${pos}_signals`]],
+          ]))
+          .addTo(lg.streets);
+      }
+
+      // ── Curb returns ──────────────────────────────────────────────────────────
+      if (r.curb_return_geom) {
+        const g = xfGeom(JSON.parse(r.curb_return_geom));
+        L.geoJSON(g, { style: () => ({ color: C.cret, weight: 2, opacity: 0.7 }) })
+          .addTo(lg.streets);
+      }
+
+      // ── Traffic calming ───────────────────────────────────────────────────────
+      if (r.feat_geom && r.street_feature_types) {
+        try {
+          const g     = xfGeom(JSON.parse(r.feat_geom));
+          const types = JSON.parse(r.street_feature_types.replace(/'/g, '"'));
+          const attrs = r.street_feature_attributes
+            ? JSON.parse(r.street_feature_attributes.replace(/'/g, '"')) : [];
+          const coords = g.type === 'MultiPoint' ? g.coordinates : [g.coordinates];
+          coords.forEach((c, i) => {
+            if (!String(types[i] || '').startsWith('traffic_calming')) return;
+            L.circleMarker([c[1], c[0]], {
+              radius: 5, color: C.calm, fillColor: C.calm, fillOpacity: 0.85, weight: 1.5,
+            })
+              .bindTooltip(`Traffic calming: ${types[i]}`)
+              .bindPopup(makePopup('Traffic Calming', [
+                ['Street', r.name], ['Type', types[i]],
+                ...(typeof attrs[i] === 'object' && attrs[i]
+                    ? Object.entries(attrs[i]) : []),
+              ]))
+              .addTo(lg.calm);
+          });
+        } catch(_) {}
+      }
+    }
+
+    if (tier >= 4) {
+      // ── Intersection nodes ────────────────────────────────────────────────────
+      for (const [key, idField, intField] of [
+        ['start_node_geom', 'start_node_id', 'start_node_is_intersection_node'],
+        ['end_node_geom',   'end_node_id',   'end_node_is_intersection_node'],
+      ]) {
+        if (!r[key] || !r[intField]) continue;
+        const g   = xfGeom(JSON.parse(r[key]));
+        const mid = [g.coordinates[1], g.coordinates[0]];
+        const nid = String(r[idField]);
+        if (!nodeIndex.has(nid)) {
+          L.circleMarker(mid, {
+            radius: 4, color: C.node, fillColor: C.node, fillOpacity: 0.9, weight: 1,
+          })
+            .bindTooltip(`Node ${nid}`)
+            .addTo(lg.nodes);
+          nodeIndex.set(nid, { mid });
+        }
+      }
+    }
+
+    if (tier >= 5) {
+      // ── Curb ramps ────────────────────────────────────────────────────────────
+      for (const s of ['left','right']) for (const p of ['start','end']) for (const i of [1,2,3]) {
+        const key  = `cr_${s}_${p}_${i}_geom`;
+        if (!r[key]) continue;
+        const base = `sidewalk_${s}_curbramp_${p}_${i}`;
+        const g    = xfGeom(JSON.parse(r[key]));
+        const mid  = [g.coordinates[1], g.coordinates[0]];
+        const rloc = r[`${base}_returnloc`];
+        const rpos = r[`${base}_returnposition`];
+        L.circleMarker(mid, {
+          radius: 5, color: C.ramp, fillColor: C.ramp, fillOpacity: 0.9, weight: 1,
+        })
+          .bindTooltip(`Curb ramp ${s}-${p}-${i}: loc=${rloc || ''}, pos=${rpos || ''}`)
+          .bindPopup(makePopup(`Curb Ramp (${s} ${p} #${i})`, [
+            ['ID',               r[`${base}_ID`]],
+            ['Side',             s],
+            ['Position',         p],
+            ['Index',            i],
+            ['Return direction', rloc],
+            ['Return position',  rpos],
+            ['Condition score',  r[`${base}_condition_score`]],
+            ['Street',           r.name],
+          ]))
+          .addTo(lg.ramps);
+      }
+    }
+  }
+}
+
+// ── SQL builder ───────────────────────────────────────────────────────────────
+function buildSQL(tier, bounds) {
+  // Helper: CASE-guard geometry columns (null-safe) → GeoJSON alias
+  // All columns are now native GeoParquet geometry — ST_AsGeoJSON works directly.
+  const wkb  = (col, alias) =>
+    `CASE WHEN ${col} IS NOT NULL THEN ST_AsGeoJSON(${col}) END AS ${alias}`;
+  const bk   = (s, n) => wkb(`bikeway_${s}_${n}_geometry`,             `bk_${s[0]}${n}_geom`);
+  const sw   = s      => wkb(`sidewalk_${s}_geometry`,                  `sw_${s[0]}_geom`);
+  const xw   = p      => wkb(`crosswalk_${p}_geometry`,                 `xw_${p}_geom`);
+  const nd   = s      => wkb(`${s}_node_geometry`,                      `${s}_node_geom`);
+  const cr   = (s,p,i)=> wkb(`sidewalk_${s}_curbramp_${p}_${i}_geometry`,`cr_${s}_${p}_${i}_geom`);
+
+  const cols = [
+    'street_grid_id', 'highway',
+    'ST_AsGeoJSON(street_geometry) AS street_geom',
+  ];
+
+  if (tier >= 2) {
+    cols.push(
+      'name','lanes','lane_width','surface','maxspeed','oneway','street_incline',
+      ...['left','right'].flatMap(s => [1,2].flatMap(n => [
+        `bikeway_${s}_${n}_type`,`bikeway_${s}_${n}_offset`,`bikeway_${s}_${n}_incline`,
+        `bikeway_${s}_${n}_permitted`,`bikeway_${s}_${n}_width`,`bikeway_${s}_${n}_seperator`,
+        bk(s, n),
+      ]))
+    );
+  }
+
+  if (tier >= 3) {
+    cols.push(
+      ...['left','right'].flatMap(s => [
+        `sidewalk_${s}_ID`,`sidewalk_${s}_presence`,`sidewalk_${s}_surface`,
+        `sidewalk_${s}_quality`,`sidewalk_${s}_width`,`sidewalk_${s}_incline`,
+        `sidewalk_${s}_seperator`,`sidewalk_${s}_offset`, sw(s),
+      ]),
+      ...['start','end'].flatMap(p => [
+        `crosswalk_${p}_id`,`crosswalk_${p}_type`,`crosswalk_${p}_controlled`,
+        `crosswalk_${p}_marked`,`crosswalk_${p}_signals`, xw(p),
+      ]),
+      wkb('curb_return_geometry', 'curb_return_geom'),
+      'street_feature_types','street_feature_attributes',
+      wkb('street_feature_geometry','feat_geom'),
+      'sidewalk_left_feature_types',
+      wkb('sidewalk_left_feature_geometry','sw_l_feat_geom'),
+      'sidewalk_right_feature_types',
+      wkb('sidewalk_right_feature_geometry','sw_r_feat_geom'),
+    );
+  }
+
+  if (tier >= 4) {
+    cols.push(
+      'start_node_id','start_node_is_intersection_node', nd('start'),
+      'end_node_id',  'end_node_is_intersection_node',   nd('end'),
+    );
+  }
+
+  if (tier >= 5) {
+    for (const s of ['left','right'])
+      for (const p of ['start','end'])
+        for (const i of [1,2,3]) {
+          const base = `sidewalk_${s}_curbramp_${p}_${i}`;
+          cols.push(
+            `${base}_ID`,`${base}_returnloc`,`${base}_returnposition`,`${base}_condition_score`,
+            cr(s, p, i),
+          );
+        }
+  }
+
+  // WHERE clause: highway filter (tiers 1-2) + viewport bbox (tiers 2+)
+  const hwClause   = tier <= 2 ? `regexp_matches(highway, '${HW_RE[tier]}')` : null;
+  let   bboxClause = null;
+  if (tier >= 2) {
+    const { minX, minY, maxX, maxY } = viewportToUTM(bounds);
+    bboxClause = `ST_Intersects(street_geometry, ST_MakeEnvelope(${minX}, ${minY}, ${maxX}, ${maxY}))`;
+  }
+  const where = [hwClause, bboxClause].filter(Boolean).join(' AND ') || 'true';
+
+  return `SELECT ${cols.join(', ')} FROM read_parquet('network.parquet') WHERE ${where}`;
+}
+
+// ── DuckDB init ───────────────────────────────────────────────────────────────
+let conn          = null;
+let _refreshTimer = null;
+
+async function initDuckDB() {
+  try {
+    setStatus('Loading DuckDB WASM\u2026');
+    const bundles  = duckdb.getJsDelivrBundles();
+    const bundle   = await duckdb.selectBundle(bundles);
+    const workerUrl = URL.createObjectURL(
+      new Blob([`importScripts("${bundle.mainWorker}");`], { type: 'text/javascript' })
+    );
+    const worker = new Worker(workerUrl);
+    const db     = new duckdb.AsyncDuckDB(new duckdb.VoidLogger(), worker);
+    await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+    URL.revokeObjectURL(workerUrl);
+    await db.registerFileURL('network.parquet', PARQUET_URL, duckdb.DuckDBDataProtocol.HTTP, false);
+    conn = await db.connect();
+    setStatus('Loading spatial extension\u2026');
+    await conn.query('LOAD spatial;');
+    setStatus('Ready \u2014 loading streets\u2026');
+    await refreshMap();
+  } catch (e) {
+    showError(
+      'DuckDB failed to load. Ensure you have internet access and are serving via ' +
+      'http://, not file://. Error: ' + e.message
+    );
+  }
+}
+
+async function refreshMap() {
+  if (!conn) return;
+  const zoom   = map.getZoom();
+  const tier   = getTier(zoom);
+  const bounds = map.getBounds();
+  setStatus(`Loading tier ${tier}\u2026`);
+  try {
+    const result = await conn.query(buildSQL(tier, bounds));
+    const rows   = result.toArray().map(r => r.toJSON());
+    setStatus(`Rendering ${rows.length} segments\u2026`);
+    renderRows(rows, tier);
+    setStatus(`Tier ${tier} \u00b7 ${rows.length} segments`);
+  } catch (e) {
+    const msg = e?.message || String(e);
+    setStatus('Query error: ' + msg.slice(0, 120));
+    console.error('County map query error:', e);
+  }
+}
+
+map.on('zoomend moveend', () => {
+  clearTimeout(_refreshTimer);
+  _refreshTimer = setTimeout(refreshMap, 300);
+});
+
+// ── Legend toggles ────────────────────────────────────────────────────────────
+[
+  ['cb_streets', 'streets'], ['cb_bk_sep', 'bk_sep'], ['cb_bk_off', 'bk_off'],
+  ['cb_sw_sep',  'sw_sep'],  ['cb_sw_off', 'sw_off'],
+  ['cb_nodes',   'nodes'],   ['cb_ramps',  'ramps'],   ['cb_calm', 'calm'],
+].forEach(([id, key]) => {
+  document.getElementById(id).addEventListener('change', e => {
+    e.target.checked ? map.addLayer(lg[key]) : map.removeLayer(lg[key]);
+  });
+});
+
+// ── Search ────────────────────────────────────────────────────────────────────
+let _flashTimer = null;
+
+function pxSearch() {
+  const id    = document.getElementById('px-search-input').value.trim();
+  const el    = document.getElementById('px-search-status');
+  const idx   = _pxMode === 'seg' ? segIndex : nodeIndex;
+  const entry = idx.get(id);
+  if (!entry) {
+    el.style.color = '#c00'; el.textContent = 'Not found: ' + id; return;
+  }
+  el.style.color = '#555'; el.textContent = '\u2192 Found: ' + id;
+  map.flyTo(entry.mid, 20);
+  if (entry.layer) {
+    clearTimeout(_flashTimer);
+    try { entry.layer.setStyle({ color: '#ffff00', weight: (entry.baseWeight || 2) * 2.5 }); } catch(_) {}
+    _flashTimer = setTimeout(() => {
+      try { entry.layer.setStyle({ color: entry.baseColor, weight: entry.baseWeight }); } catch(_) {}
+    }, 2500);
+    try { entry.layer.openPopup(entry.mid); } catch(_) {}
+  }
+}
+
+function pxSetMode(mode) {
+  _pxMode = mode;
+  const s = document.getElementById('px-mode-seg');
+  const n = document.getElementById('px-mode-node');
+  s.style.background = mode === 'seg'  ? '#1a73e8' : 'white';
+  s.style.color       = mode === 'seg'  ? 'white'   : '#333';
+  n.style.background = mode === 'node' ? '#1a73e8' : 'white';
+  n.style.color       = mode === 'node' ? 'white'   : '#333';
+  document.getElementById('px-search-input').placeholder =
+    mode === 'seg' ? 'e.g. 12_34_0' : 'e.g. 123456789';
+  document.getElementById('px-search-status').textContent = '';
+}
+
+document.getElementById('px-mode-seg').onclick  = () => pxSetMode('seg');
+document.getElementById('px-mode-node').onclick = () => pxSetMode('node');
+
+// ── Status / error helpers ────────────────────────────────────────────────────
+function setStatus(msg) { document.getElementById('status').textContent = msg; }
+function showError(msg)  {
+  const el = document.getElementById('error-banner');
+  el.textContent = msg; el.style.display = 'block';
+  setStatus('Error \u2014 see banner');
+}
+
+initDuckDB();
 </script>
+</body>
+</html>
 """
 
-    m.get_root().html.add_child(folium.Element(legend_html))  # type: ignore[attr-defined]
 
+def generate_county_map(parquet_path: str, output_name: str = 'sf_county') -> str:
+    """Generate a county-wide interactive map backed by DuckDB WASM.
+
+    Layers load progressively by zoom tier:
+      z<=12  streets (arterials only, county-wide)
+      z13-14 + bikeways
+      z15-16 + sidewalks, crosswalks, traffic calming
+      z17    + intersection nodes
+      z18+   + curb ramps
+
+    To open the map:
+        cd Output && python -m http.server 8080 --bind 127.0.0.1
+        http://localhost:8080/test_maps/<output_name>.html
+    """
+    parquet_basename = os.path.basename(parquet_path)
+    html = (
+        _COUNTY_MAP_TEMPLATE
+        .replace('%%PARQUET_URL%%', f'../{parquet_basename}')
+        .replace('%%TITLE%%', output_name)
+    )
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    out_path = os.path.join(OUTPUT_DIR, f"{output_name}.html")
-    m.save(out_path)
-    print(f"Hull map saved -> {out_path}  ({hull_count} hulls)")
+    out_path = os.path.join(OUTPUT_DIR, f'{output_name}.html')
+    with open(out_path, 'w', encoding='utf-8') as f:
+        f.write(html)
+    print(f'County map saved -> {out_path}')
+    print(f'  Serve: cd Output && python -m http.server 8080 --bind 127.0.0.1')
+    print(f'  Open:  http://localhost:8080/test_maps/{output_name}.html')
     return out_path
 
 
@@ -1160,13 +1621,7 @@ for parquet_path in _all_parquets:
         for f in as_completed(future_to_name):
             print(f"Map saved -> {f.result()}")
 
-# ── INTERSECTION HULL MAP — Embarcadero ────────────────────────────────────────
-_emb = next(loc for loc in LOCATIONS if loc["name"] == "sf_embarcadero")
-_emb_data = load_parquet(_emb["parquet"])
-generate_intersection_hull_map(
-    _emb_data,
-    _emb["lat"], _emb["lon"],
-    output_name="sf_embarcadero_intersection_hulls",
-    zoom=_emb["zoom"],
-    bbox_m=_emb["bbox_m"],
-)
+    # County-wide DuckDB WASM map (one per unique parquet)
+    _county_name = os.path.splitext(os.path.basename(parquet_path))[0].replace('_network', '_county_map')
+    generate_county_map(parquet_path, _county_name)
+

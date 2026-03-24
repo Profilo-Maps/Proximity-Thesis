@@ -1468,13 +1468,8 @@ def populate_schema(place: str, *, default_lane_width_m: float = 3.5, default_ma
 
     # --- Export ---
     _export_t0 = time.perf_counter()
-    # Geometry columns other than the active one must be serialized to WKB so
-    # they round-trip correctly through parquet (GeoParquet only encodes the
-    # active geometry column; raw Shapely objects in object columns do not survive).
-    # Use:
-#     from shapely import wkb
-#     gdf["bikeway_left_1_geometry"] = gdf["bikeway_left_1_geometry"].apply(
-#     lambda h: wkb.loads(h, hex=True) if h else None)
+    # Secondary geometry columns are serialized to WKB hex so they survive
+    # parquet round-tripping (GeoParquet only encodes the active geometry column).
 
     SECONDARY_GEOM_COLS = [
         "start_node_geometry", "end_node_geometry",
@@ -1881,6 +1876,10 @@ def _populate_separate_facilities(
         """Set a single cell, handling list/tuple values that ``pd.DataFrame.at``
         rejects with 'Must have equal len keys and value when setting with an
         iterable'.  Falls back to direct numpy array assignment."""
+        # Arrow-backed columns don't support element assignment —
+        # convert to object on first encounter.
+        if "arrow" in str(populated[col].dtype).lower():
+            populated[col] = pd.array(populated[col], dtype=object)
         try:
             populated.at[idx, col] = value  # type: ignore[index]
         except ValueError:
@@ -2235,10 +2234,10 @@ def _populate_separate_facilities(
             if new_pts and eg_pts:
                 ns, ne = new_pts[0], new_pts[-1]
                 es, ee = eg_pts[0], eg_pts[-1]
-                if ((math.hypot(ns[0]-es[0], ns[1]-es[1]) < 0.5 and
-                     math.hypot(ne[0]-ee[0], ne[1]-ee[1]) < 0.5) or
-                    (math.hypot(ns[0]-ee[0], ns[1]-ee[1]) < 0.5 and
-                     math.hypot(ne[0]-es[0], ne[1]-es[1]) < 0.5)):
+                if ((np.hypot(ns[0]-es[0], ns[1]-es[1]) < 0.5 and
+                     np.hypot(ne[0]-ee[0], ne[1]-ee[1]) < 0.5) or
+                    (np.hypot(ns[0]-ee[0], ns[1]-ee[1]) < 0.5 and
+                     np.hypot(ne[0]-es[0], ne[1]-es[1]) < 0.5)):
                     return True
         return False
 
@@ -2833,7 +2832,7 @@ def _is_suspect_geometry(geom: BaseGeometry) -> bool:
         coords = list(geom.coords) if isinstance(geom, LineString) else \
                  [c for ls in geom.geoms for c in ls.coords]
         if len(coords) >= 2:
-            crow = math.hypot(coords[-1][0] - coords[0][0], coords[-1][1] - coords[0][1])
+            crow = np.hypot(coords[-1][0] - coords[0][0], coords[-1][1] - coords[0][1])
             if crow > MIN_CROW_FLY_M and geom.length / crow > SINUOSITY_THRESHOLD:
                 return True
     return False
@@ -3446,6 +3445,11 @@ def _snap_offset_endpoints(
 
             for seg_idx, seg_end, side, ep_xy, _ in corner_eps:
                 ep_key = (seg_idx, side, seg_end)
+                prev_gid = ep_to_group.get(ep_key)
+                if prev_gid is not None and prev_gid != gid:
+                    # Already assigned by an earlier node — don't overwrite,
+                    # otherwise Stage 2 group-member propagation breaks.
+                    continue
                 ep_to_group[ep_key] = gid
                 group_members[gid].append(ep_key)
 
@@ -3760,6 +3764,105 @@ def _snap_offset_endpoints(
 
                 n_stage2a += 1
 
+    # ── Stage 2c: Singleton corner pairing ────────────────────────────────
+    # Stage 1 angular grouping uses a tight threshold (_ENDPOINT_SNAP_CORNER_ANGLE).
+    # At intersections where two perpendicular streets are both offset sidewalks,
+    # the two endpoints that should meet at a corner can land ~90° apart from the
+    # node (one due east, one due north), exceeding the threshold.  Stage 2 misses
+    # them if neither segment appears as a unique_dirs representative.
+    #
+    # This stage collects, per node, all endpoints NOT yet placed into a Stage 1
+    # group (ep_to_group), sorts them by angle, and pairs adjacent singletons from
+    # different segments via the same line-intersection logic as Stage 2.
+
+    n_stage2c = 0
+    _s2c_processed: set[frozenset[tuple[int, str, str]]] = set()
+
+    for node_pt, seg_entries in _stage_nodes:
+        nx, ny = node_pt.x, node_pt.y
+
+        singletons: list[tuple[int, str, str, tuple[float, float], float, float]] = []
+        for seg_idx, seg_end in seg_entries:
+            if seg_idx in _roundabout_idxs:
+                continue
+            for side in ("left", "right"):
+                ck = (seg_idx, side)
+                if ck not in sw_coords_cache:
+                    continue
+                coords = sw_coords_cache[ck]
+                if len(coords) < 2:
+                    continue
+                ep_key = (seg_idx, side, seg_end)
+                if ep_key in ep_to_group:
+                    continue  # already handled by Stage 1/2
+                ep = coords[0] if seg_end == "start" else coords[-1]
+                angle = math.degrees(math.atan2(ep[0] - nx, ep[1] - ny)) % 360
+                brg = _tangent_bearing(coords, seg_end)
+                singletons.append((seg_idx, seg_end, side, ep, angle, brg))
+
+        if len(singletons) < 2:
+            continue
+
+        singletons.sort(key=lambda e: e[4])
+        n_s = len(singletons)
+
+        for k in range(n_s):
+            idx_a, end_a, side_a, pt_a, angle_a, brg_a = singletons[k]
+            idx_b, end_b, side_b, pt_b, angle_b, brg_b = singletons[(k + 1) % n_s]
+
+            if idx_a == idx_b:
+                continue
+
+            pair_key: frozenset[tuple[int, str, str]] = frozenset(
+                {(idx_a, side_a, end_a), (idx_b, side_b, end_b)}
+            )
+            if pair_key in _s2c_processed:
+                continue
+            _s2c_processed.add(pair_key)
+
+            dd = math.sqrt((pt_a[0] - pt_b[0]) ** 2 + (pt_a[1] - pt_b[1]) ** 2)
+            if dd < 0.01 or dd > _ENDPOINT_SNAP_MAX_EXTEND_M:
+                continue
+
+            meet = _line_intersect(
+                pt_a, brg_a, pt_b, brg_b,
+                max_dist=_ENDPOINT_SNAP_MAX_EXTEND_M,
+            )
+            if meet is None:
+                meet = ((pt_a[0] + pt_b[0]) / 2, (pt_a[1] + pt_b[1]) / 2)
+
+            nd = math.sqrt((meet[0] - nx) ** 2 + (meet[1] - ny) ** 2)
+            if nd > _ENDPOINT_SNAP_MAX_EXTEND_M * 2:
+                continue
+
+            for s_idx, s_side, s_end in ((idx_a, side_a, end_a), (idx_b, side_b, end_b)):
+                ck = (s_idx, s_side)
+                if ck not in sw_coords_cache:
+                    continue
+                cds = sw_coords_cache[ck]
+                cur_ep = cds[0] if s_end == "start" else cds[-1]
+                d_move = math.sqrt(
+                    (meet[0] - cur_ep[0]) ** 2 + (meet[1] - cur_ep[1]) ** 2
+                )
+                if d_move < 0.01 or d_move > _ENDPOINT_SNAP_MAX_EXTEND_M:
+                    continue
+                geom_col = f"sidewalk_{s_side}_geometry"
+                geom = populated.at[s_idx, geom_col]
+                if not isinstance(geom, BaseGeometry) or geom.is_empty:
+                    continue
+                populated.at[s_idx, geom_col] = _move_endpoint(  # type: ignore[index]
+                    geom, s_end, meet
+                )
+                c = list(sw_coords_cache[ck])
+                if s_end == "start":
+                    c[0] = meet
+                else:
+                    c[-1] = meet
+                sw_coords_cache[ck] = c
+                n_endpoints_moved += 1
+
+            n_stage2c += 1
+
     # ── Stage 3: Shapely-crosses trimming ─────────────────────────────────
     # Vectorised: build one STRtree of all intersection-endpoint sidewalk
     # geometries, bulk-query for crossing pairs, then trim each segment at
@@ -3984,6 +4087,11 @@ def _snap_offset_endpoints(
             else:
                 continue
 
+            # Don't re-trim an endpoint already placed by Stage 3 crosses-trimming
+            tgt_trim_key = (target_seg_idx, target_side, trim_end)
+            if tgt_trim_key in trimmed_keys:
+                continue
+
             # Trim the target segment with substring
             tgt_geom_col = f"sidewalk_{target_side}_geometry"
             tgt_geom = populated.at[target_seg_idx, tgt_geom_col]
@@ -4005,25 +4113,28 @@ def _snap_offset_endpoints(
             sw_coords_cache[(target_seg_idx, target_side)] = new_cds
             n_endpoints_moved += 1
 
-            # Snap the probe's own endpoint to the crossing (may be sub-centimetre)
+            # Snap the probe's own endpoint to the crossing (may be sub-centimetre).
+            # Skip if Stage 3 already placed this endpoint correctly.
             probe_geom_col = f"sidewalk_{probe_side}_geometry"
             probe_obj = populated.at[probe_seg_idx, probe_geom_col]
             if isinstance(probe_obj, BaseGeometry) and not probe_obj.is_empty:
-                pr_cds = sw_coords_cache.get((probe_seg_idx, probe_side))
-                if pr_cds:
-                    cur_ep = pr_cds[0] if probe_end == "start" else pr_cds[-1]
-                    d_ep = math.sqrt((cross_pt[0]-cur_ep[0])**2 + (cross_pt[1]-cur_ep[1])**2)
-                    if 0.01 < d_ep <= _ENDPOINT_SNAP_MAX_EXTEND_M:
-                        populated.at[probe_seg_idx, probe_geom_col] = _move_endpoint(  # type: ignore[index]
-                            probe_obj, probe_end, cross_pt
-                        )
-                        cl = list(pr_cds)
-                        if probe_end == "start":
-                            cl[0] = cross_pt
-                        else:
-                            cl[-1] = cross_pt
-                        sw_coords_cache[(probe_seg_idx, probe_side)] = cl
-                        n_endpoints_moved += 1
+                probe_trim_key = (probe_seg_idx, probe_side, probe_end)
+                if probe_trim_key not in trimmed_keys:
+                    pr_cds = sw_coords_cache.get((probe_seg_idx, probe_side))
+                    if pr_cds:
+                        cur_ep = pr_cds[0] if probe_end == "start" else pr_cds[-1]
+                        d_ep = math.sqrt((cross_pt[0]-cur_ep[0])**2 + (cross_pt[1]-cur_ep[1])**2)
+                        if 0.01 < d_ep <= _ENDPOINT_SNAP_MAX_EXTEND_M:
+                            populated.at[probe_seg_idx, probe_geom_col] = _move_endpoint(  # type: ignore[index]
+                                probe_obj, probe_end, cross_pt
+                            )
+                            cl = list(pr_cds)
+                            if probe_end == "start":
+                                cl[0] = cross_pt
+                            else:
+                                cl[-1] = cross_pt
+                            sw_coords_cache[(probe_seg_idx, probe_side)] = cl
+                            n_endpoints_moved += 1
 
             n_stage2b += 1
 
@@ -4152,6 +4263,7 @@ def _snap_offset_endpoints(
     print(f"Endpoint snapping: {n_stage1} same-street, "
           f"{n_stage2} cross-street, "
           f"{n_stage2a} antiparallel-outer, "
+          f"{n_stage2c} singleton-pairs, "
           f"{n_stage2b} probe-crosses, "
           f"{n_stage3} crosses-trimmed, "
           f"{n_stage_ra} roundabout-corners, "
@@ -4164,8 +4276,16 @@ _CURB_RAMP_SNAP_M        = 1.0    # snap close-but-not-touching sidewalk endpoin
 _CURB_RAMP_HULL_FALLBACK_R = 15.0 # hull radius when < 3 non-collinear projected points exist
 
 
+_DEFAULT_SIDEWALK_WIDTH_M = 1.5  # typical US sidewalk width for hull margin
+
 def _sidewalk_max_offset_m(row: "pd.Series[Any]", default_lane_width_m: float) -> float:
-    """Max perpendicular offset (m) from road centreline to sidewalk, either side."""
+    """Max perpendicular offset (m) from road centreline to the outer sidewalk edge.
+
+    Includes half the road width, any bikeway widths on the wider side,
+    and the sidewalk width (from data or a default).  This gives the full
+    distance from the centreline to where sidewalks can physically cross
+    at intersection corners.
+    """
     lanes      = _parse_numeric(row.get("lanes"),      2.0)
     lane_width = _parse_numeric(row.get("lane_width"), default_lane_width_m)
     half_road  = (lanes * lane_width) / 2.0
@@ -4179,7 +4299,9 @@ def _sidewalk_max_offset_m(row: "pd.Series[Any]", default_lane_width_m: float) -
                 else _DEFAULT_BIKE_WIDTH_M if not _is_na(row.get(f"bikeway_{s}_{slot}_type"))
                 else 0.0
             )
-        max_offset = max(max_offset, half_road + bike_w)
+        sw_w_raw = row.get(f"sidewalk_{s}_width")
+        sw_w = _parse_numeric(sw_w_raw, _DEFAULT_SIDEWALK_WIDTH_M) if not _is_na(sw_w_raw) else _DEFAULT_SIDEWALK_WIDTH_M
+        max_offset = max(max_offset, half_road + bike_w + sw_w)
     return max_offset if max_offset > 0 else _CURB_RAMP_HULL_FALLBACK_R
 
 
@@ -4229,20 +4351,28 @@ def _assign_curb_ramp_geometries(
     """
     # ── Inner helpers ─────────────────────────────────────────────────────────
 
-    def _endpoint(geom: BaseGeometry | None, which: str) -> Point | None:
-        """Start (coords[0]) or end (coords[-1]) Point of a geometry."""
+    def _endpoint(geom: BaseGeometry | None, which: str, coords: list[tuple[float, float]] | None = None) -> Point | None:
+        """Start (coords[0]) or end (coords[-1]) Point of a geometry.
+
+        If coords is provided, use it instead of re-computing from geom.
+        """
         if not isinstance(geom, BaseGeometry) or geom.is_empty:
             return None
-        coords = _flatten_coords(geom)
+        if coords is None:
+            coords = _flatten_coords(geom)
         return Point(coords[0] if which == "start" else coords[-1]) if coords else None
 
-    def _closer_position(geom: BaseGeometry, ref: Point) -> str:
-        """Return 'start' or 'end' — whichever endpoint of *geom* is closer to *ref*."""
-        coords = _flatten_coords(geom)
+    def _closer_position(geom: BaseGeometry, ref: Point, coords: list[tuple[float, float]] | None = None) -> str:
+        """Return 'start' or 'end' — whichever endpoint of *geom* is closer to *ref*.
+
+        If coords is provided, use it instead of re-computing from geom.
+        """
+        if coords is None:
+            coords = _flatten_coords(geom)
         if not coords:
             return "start"
-        d_start = math.hypot(coords[0][0] - ref.x, coords[0][1] - ref.y)
-        d_end = math.hypot(coords[-1][0] - ref.x, coords[-1][1] - ref.y)
+        d_start = np.hypot(coords[0][0] - ref.x, coords[0][1] - ref.y)
+        d_end = np.hypot(coords[-1][0] - ref.x, coords[-1][1] - ref.y)
         return "start" if d_start <= d_end else "end"
 
     def _snap_endpoint(geom: BaseGeometry, which: str, new_pt: Point) -> BaseGeometry:
@@ -4343,6 +4473,20 @@ def _assign_curb_ramp_geometries(
     _retro_int_keys: list[tuple[float, float]] = list(node_key_to_pt.keys())
     _retro_int_tree: STRtree | None = STRtree(_retro_int_pts) if _retro_int_pts else None
 
+    # ── Fix 1: geometry index dict — O(1) row lookup without pandas overhead ──
+    _geom_by_idx: dict[int, Any] = dict(
+        zip(populated.index, populated.geometry.to_numpy(dtype=object))
+    )
+    # ── Fix 2: bearing cache — pre-compute once per connection segment ─────────
+    _bearing_cache: dict[int, float | None] = {}
+    for _bc_segs in node_to_segs.values():
+        for _bc_idx, _ in _bc_segs:
+            if _bc_idx not in _bearing_cache:
+                _bc_g = _geom_by_idx.get(_bc_idx)
+                _bearing_cache[_bc_idx] = (
+                    _retro_bearing(_bc_g) if isinstance(_bc_g, BaseGeometry) else None
+                )
+
     n_fw_slot_filled = 0
     n_fw_ramp_direct = 0
 
@@ -4400,10 +4544,12 @@ def _assign_curb_ramp_geometries(
                 for road_idx_r, _ in connections_at_node:
                     if road_idx_r == fw_idx:
                         continue
-                    road_g = populated.geometry.loc[road_idx_r]
+                    road_g = _geom_by_idx.get(road_idx_r)
                     if not isinstance(road_g, BaseGeometry):
                         continue
-                    if not _retro_parallel(fw_bearing, _retro_bearing(road_g)):
+                    if road_idx_r not in _bearing_cache:
+                        _bearing_cache[road_idx_r] = _retro_bearing(road_g)
+                    if not _retro_parallel(fw_bearing, _bearing_cache[road_idx_r]):
                         continue
                     side_r = _retro_side(road_g, fw_ep)
                     geom_col_r = f"sidewalk_{side_r}_geometry"
@@ -4427,11 +4573,10 @@ def _assign_curb_ramp_geometries(
                 #    parallel to at least one road at this intersection node
                 #    (guards against connectors / crosswalk endpoints).
                 is_parallel_to_road = any(
-                    _retro_parallel(fw_bearing, _retro_bearing(geom))
+                    _retro_parallel(fw_bearing, _bearing_cache.get(r_idx))
                     for r_idx, _ in connections_at_node
                     if r_idx != fw_idx
-                    for geom in (populated.geometry.loc[r_idx],)
-                    if isinstance(geom, BaseGeometry)
+                    and isinstance(_geom_by_idx.get(r_idx), BaseGeometry)
                 )
                 if not is_parallel_to_road:
                     continue
@@ -4460,6 +4605,32 @@ def _assign_curb_ramp_geometries(
 
     sw_tree: STRtree | None = STRtree(all_sw_geoms) if all_sw_geoms else None
 
+    # ── Fix 5: Pre-fetch hull columns to avoid populated.loc[row_idx] per node ─
+    _start_node_geom_map: dict[int, Any] = (
+        dict(zip(populated.index, populated["start_node_geometry"].to_numpy(dtype=object)))
+        if "start_node_geometry" in populated.columns else {}
+    )
+    _end_node_geom_map: dict[int, Any] = (
+        dict(zip(populated.index, populated["end_node_geometry"].to_numpy(dtype=object)))
+        if "end_node_geometry" in populated.columns else {}
+    )
+    _hull_offset_cols = [c for c in (
+        "lanes", "lane_width",
+        "bikeway_left_1_width", "bikeway_left_1_type",
+        "bikeway_left_2_width", "bikeway_left_2_type",
+        "bikeway_right_1_width", "bikeway_right_1_type",
+        "bikeway_right_2_width", "bikeway_right_2_type",
+    ) if c in populated.columns]
+    _conn_idxs = list({row_idx for segs in node_to_segs.values() for row_idx, _ in segs})
+    _offset_sub = (
+        populated.loc[_conn_idxs, _hull_offset_cols]
+        if _hull_offset_cols else pd.DataFrame(index=_conn_idxs)
+    )
+    _offset_by_idx: dict[int, float] = {
+        int(idx): _sidewalk_max_offset_m(_offset_sub.loc[idx], default_lane_width_m)
+        for idx in _offset_sub.index
+    }
+
     n_assigned = 0
     n_snapped  = 0
 
@@ -4471,7 +4642,13 @@ def _assign_curb_ramp_geometries(
             continue
 
         # ── Build convex hull of projected sidewalk offsets ───────────────────
-        # Phase 1: project one point per road approach along its centreline.
+        # Phase 1: project one point per *unique* road approach direction along
+        #   its centreline.  Duplicate / antiparallel approaches (common at 4-way
+        #   intersections where osmnx creates both u→v and v→u edges) are merged
+        #   to prevent spurious corner-fill points.
+        # Phase 1b: include actual sidewalk endpoints near the node so the hull
+        #   covers all relevant geometry (offset-only projections can fall short
+        #   of where sidewalk bodies actually cross).
         # Phase 2: add corner points at bisector directions between adjacent
         #   approaches so the hull fills intersection corners rather than
         #   forming a diamond.  The corner distance is max(o1,o2)/cos(half_gap),
@@ -4479,11 +4656,11 @@ def _assign_curb_ramp_geometries(
         #   parallel approaches.
         import math as _hm
         hull_pts_list: list[Point] = []
-        _hull_approaches: list[tuple[float, float]] = []  # (bearing_deg, offset_m)
+        _hull_approaches_raw: list[tuple[float, float]] = []
         for row_idx, position in connections:
-            row    = cast(pd.Series, populated.loc[row_idx])
-            far_col = "end_node_geometry" if position == "start" else "start_node_geometry"
-            far_geom = row.get(far_col)
+            far_geom = (
+                _end_node_geom_map if position == "start" else _start_node_geom_map
+            ).get(row_idx)
             if not isinstance(far_geom, BaseGeometry) or far_geom.is_empty:
                 continue
             far_pt = cast(Point, far_geom)
@@ -4492,11 +4669,49 @@ def _assign_curb_ramp_geometries(
             dist = (dx * dx + dy * dy) ** 0.5
             if dist < 1e-6:
                 continue
-            offset = _sidewalk_max_offset_m(row, default_lane_width_m)
+            offset = _offset_by_idx.get(row_idx, _CURB_RAMP_HULL_FALLBACK_R)
             hull_pts_list.append(
                 Point(node_pt.x + dx / dist * offset, node_pt.y + dy / dist * offset)
             )
-            _hull_approaches.append((_hm.degrees(_hm.atan2(dx, dy)) % 360.0, offset))
+            _hull_approaches_raw.append((_hm.degrees(_hm.atan2(dx, dy)) % 360.0, offset))
+
+        # Deduplicate approaches: merge entries within 20° (parallel or
+        # antiparallel) keeping the maximum offset.
+        _hull_approaches: list[tuple[float, float]] = []
+        _HULL_DEDUP_TOL = 20.0
+        for _brg, _off in sorted(_hull_approaches_raw, key=lambda x: x[0]):
+            _merged = False
+            for _ei in range(len(_hull_approaches)):
+                _ebrg, _eoff = _hull_approaches[_ei]
+                _bdiff = abs(_brg - _ebrg) % 360.0
+                if _bdiff > 180.0:
+                    _bdiff = 360.0 - _bdiff
+                if _bdiff < _HULL_DEDUP_TOL or (180.0 - _bdiff) < _HULL_DEDUP_TOL:
+                    _hull_approaches[_ei] = (_ebrg, max(_eoff, _off))
+                    _merged = True
+                    break
+            if not _merged:
+                _hull_approaches.append((_brg, _off))
+
+        # Phase 1b: include actual sidewalk endpoints near the node.
+        # This ensures the hull covers sidewalk body crossings that extend
+        # beyond the road-width-based projections.
+        _hull_sw_max_d = _CURB_RAMP_HULL_FALLBACK_R
+        for row_idx, position in connections:
+            for _sw_side in ("left", "right"):
+                _sw_col = f"sidewalk_{_sw_side}_geometry"
+                if _sw_col not in populated.columns:
+                    continue
+                _sw_g = populated.at[row_idx, _sw_col]
+                if not isinstance(_sw_g, BaseGeometry) or _sw_g.is_empty:
+                    continue
+                _sw_cds = _flatten_coords(_sw_g)
+                if not _sw_cds:
+                    continue
+                _sw_ep = _sw_cds[0] if position == "start" else _sw_cds[-1]
+                _sw_d = _hm.sqrt((_sw_ep[0] - node_pt.x) ** 2 + (_sw_ep[1] - node_pt.y) ** 2)
+                if _sw_d <= _hull_sw_max_d:
+                    hull_pts_list.append(Point(_sw_ep[0], _sw_ep[1]))
 
         # Phase 2: corner fill
         if len(_hull_approaches) >= 2:
@@ -4511,10 +4726,16 @@ def _assign_curb_ramp_geometries(
                 _bisector = (_b1 + _gap / 2.0) % 360.0
                 _half_rad = _hm.radians(_gap / 2.0)
                 _max_o    = max(_o1, _o2)
+                _sum_o    = _o1 + _o2
                 if _half_rad >= _hm.radians(85.0):
                     _c_dist = _max_o * 1.5   # cap for very wide gaps
                 else:
-                    _c_dist = min(_max_o / _hm.cos(_half_rad), _max_o * 3.0)
+                    # Use the larger of cosine-based and sum-based estimates.
+                    # Cosine works well for acute angles; sum-of-offsets
+                    # correctly models where offset sidewalks cross at ~90°
+                    # intersections (diagonal ≈ o1 + o2).
+                    _c_dist = min(max(_max_o / _hm.cos(_half_rad), _sum_o),
+                                  _max_o * 3.0)
                 _bR = _hm.radians(_bisector)
                 hull_pts_list.append(Point(
                     node_pt.x + _hm.sin(_bR) * _c_dist,
@@ -4543,13 +4764,21 @@ def _assign_curb_ramp_geometries(
             continue
 
         # ── Snap close-but-not-touching endpoints ─────────────────────────────
+        # Pre-compute flattened coordinates for all local_sw geometries to avoid redundant traversals
+        _coords_cache: dict[int, list[tuple[float, float]]] = {}
+        for row_idx, side_idx in local_sw:
+            geom = cast(BaseGeometry | None, populated.at[row_idx, f"sidewalk_{side_idx}_geometry"])
+            if isinstance(geom, BaseGeometry) and not geom.is_empty:
+                _coords_cache[id(geom)] = _flatten_coords(geom)
+
         for i in range(len(local_sw)):
             ri, si = local_sw[i]
             gi = cast(BaseGeometry | None, populated.at[ri, f"sidewalk_{si}_geometry"])
             if not isinstance(gi, BaseGeometry) or gi.is_empty:
                 continue
-            pos_i = _closer_position(gi, node_pt)
-            end_i = _endpoint(gi, pos_i)
+            gi_coords = _coords_cache.get(id(gi))
+            pos_i = _closer_position(gi, node_pt, gi_coords)
+            end_i = _endpoint(gi, pos_i, gi_coords)
             if end_i is None:
                 continue
             for j in range(i + 1, len(local_sw)):
@@ -4557,11 +4786,12 @@ def _assign_curb_ramp_geometries(
                 gj = cast(BaseGeometry | None, populated.at[rj, f"sidewalk_{sj}_geometry"])
                 if not isinstance(gj, BaseGeometry) or gj.is_empty:
                     continue
-                pos_j = _closer_position(gj, node_pt)
-                end_j = _endpoint(gj, pos_j)
+                gj_coords = _coords_cache.get(id(gj))
+                pos_j = _closer_position(gj, node_pt, gj_coords)
+                end_j = _endpoint(gj, pos_j, gj_coords)
                 if end_j is None:
                     continue
-                d = end_i.distance(end_j)
+                d = np.hypot(end_i.x - end_j.x, end_i.y - end_j.y)
                 if 0 < d <= _CURB_RAMP_SNAP_M:
                     mid = Point((end_i.x + end_j.x) / 2, (end_i.y + end_j.y) / 2)
                     populated.at[ri, f"sidewalk_{si}_geometry"] = _snap_endpoint(gi, pos_i, mid)  # type: ignore[index]
@@ -4570,16 +4800,25 @@ def _assign_curb_ramp_geometries(
                     # Update gi/end_i for subsequent inner-loop iterations
                     gi = cast(BaseGeometry, populated.at[ri, f"sidewalk_{si}_geometry"])
                     end_i = mid
+                    # Invalidate cache for updated geometry
+                    if id(gi) in _coords_cache:
+                        del _coords_cache[id(gi)]
 
         # ── Find pairwise sidewalk intersections within hull ──────────────────
+        # Accumulate updates for batch writing instead of individual .at[] calls
+        _updates: defaultdict[tuple[int, str], Any] = defaultdict(lambda: None)
+        _snap_updates: defaultdict[tuple[int, str], Any] = defaultdict(lambda: None)
+
         for i, (ri, si) in enumerate(local_sw):
             gi = cast(BaseGeometry | None, populated.at[ri, f"sidewalk_{si}_geometry"])
             if not isinstance(gi, BaseGeometry) or gi.is_empty:
                 continue
+            gi_coords = _coords_cache.get(id(gi))
             for rj, sj in local_sw[i + 1:]:
                 gj = cast(BaseGeometry | None, populated.at[rj, f"sidewalk_{sj}_geometry"])
                 if not isinstance(gj, BaseGeometry) or gj.is_empty:
                     continue
+                gj_coords = _coords_cache.get(id(gj))
                 inter = gi.intersection(gj)
                 if inter.is_empty:
                     continue
@@ -4591,14 +4830,32 @@ def _assign_curb_ramp_geometries(
                 else:
                     continue
                 for ramp_pt in ramp_candidates:
-                    if not hull.contains(ramp_pt):
+                    if not hull.covers(ramp_pt):
                         continue
-                    for row_x, side_x, geom_x in ((ri, si, gi), (rj, sj, gj)):
-                        pos_x   = _closer_position(geom_x, ramp_pt)
+                    for row_x, side_x, geom_x, geom_coords in ((ri, si, gi, gi_coords), (rj, sj, gj, gj_coords)):
+                        pos_x   = _closer_position(geom_x, ramp_pt, geom_coords)
                         ramp_col = f"sidewalk_{side_x}_curbramp_{pos_x}_1_geometry"
                         if pd.isna(populated.at[row_x, ramp_col]):
-                            populated.at[row_x, ramp_col] = ramp_pt  # type: ignore[index]
+                            _updates[(row_x, ramp_col)] = ramp_pt
                             n_assigned += 1
+                        # Snap the endpoint to the ramp point so the geometry
+                        # terminates at the corner, not at the overshooting tip.
+                        ep_coord = _endpoint(geom_x, pos_x, geom_coords)
+                        if ep_coord is not None:
+                            d_ep = np.hypot(ep_coord.x - ramp_pt.x,
+                                            ep_coord.y - ramp_pt.y)
+                            if d_ep > 1e-3:
+                                geom_col_x = f"sidewalk_{side_x}_geometry"
+                                _snap_updates[(row_x, geom_col_x)] = _snap_endpoint(
+                                    geom_x, pos_x, ramp_pt
+                                )
+                                n_snapped += 1
+
+        # Apply batched updates
+        for (row_x, col), val in _updates.items():
+            populated.at[row_x, col] = val  # type: ignore[index]
+        for (row_x, col), val in _snap_updates.items():
+            populated.at[row_x, col] = val  # type: ignore[index]
 
     # ── Fallback: proximity-based for slots still empty ───────────────────────
     all_node_pts = list(node_key_to_pt.values())
@@ -4613,17 +4870,20 @@ def _assign_curb_ramp_geometries(
             # Build has_geom and coords cache once per side (shared by start + end).
             _geom_arr = populated[geom_col].to_numpy(dtype=object)
             has_geom = pd.Series(
-                [isinstance(g, BaseGeometry) and not g.is_empty for g in _geom_arr],
+                shapely.is_geometry(_geom_arr) & ~shapely.is_empty(_geom_arr),
                 index=populated.index, dtype=bool,
             )
+            _geom_mask = has_geom.to_numpy()
+            _geom_pos = np.where(_geom_mask)[0]
             _coords_map: dict = {
                 idx: _flatten_coords(g)
-                for idx, g in zip(populated.index[has_geom], _geom_arr[has_geom.to_numpy()])
+                for idx, g in zip(populated.index[_geom_pos], _geom_arr[_geom_pos])
             }
             for position in ("start", "end"):
                 ramp_col = f"sidewalk_{side}_curbramp_{position}_1_geometry"
                 ramp_empty = populated[ramp_col].isna()
-                candidate_idxs = populated.index[has_geom & ramp_empty]
+                _cand_mask = (has_geom & ramp_empty).to_numpy()
+                candidate_idxs = populated.index[np.where(_cand_mask)[0]]
                 if len(candidate_idxs) == 0:
                     continue
 
@@ -4649,14 +4909,13 @@ def _assign_curb_ramp_geometries(
                     _ep_pts, predicate="dwithin", distance=_CURB_RAMP_PROXIMITY_M
                 )
 
-                # Unique input indices that had at least one hit
+                # Unique input indices that had at least one hit — batch write
                 _hit_set: set[int] = set(_tree_hits_l.tolist())
-
-                for _qi in _hit_set:
-                    idx = _valid_indices[_qi]
-                    pt = Point(_ep_coords_list[_qi])
-                    populated.at[idx, ramp_col] = pt  # type: ignore[index]
-                    n_assigned += 1
+                if _hit_set:
+                    _fb_idxs = [_valid_indices[_qi] for _qi in _hit_set]
+                    _fb_pts  = [Point(_ep_coords_list[_qi]) for _qi in _hit_set]
+                    populated.loc[_fb_idxs, ramp_col] = _fb_pts  # type: ignore[index]
+                    n_assigned += len(_hit_set)
 
     print(f"Curb ramp geometries assigned: {n_assigned} ramps, {n_snapped} endpoint snaps, "
           f"{n_fw_slot_filled} footway slots filled, {n_fw_ramp_direct} footway direct ramps")
