@@ -16,6 +16,7 @@ import shapely
 from shapely import wkt
 from shapely.geometry import shape, box, Point, LineString, MultiLineString, MultiPoint, MultiPolygon, Polygon
 from shapely.geometry.base import BaseGeometry
+from ProximityModel import _build_intersection_hulls
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
 OUTPUT_DIR = "Output/test_maps"
@@ -197,6 +198,15 @@ def geom_to_latlons(geom: BaseGeometry | None) -> list[list[float]]:
     return [[lat, lon] for lat, lon in zip(lats, lons)]
 
 
+def polygon_exterior_latlons(poly: BaseGeometry) -> list[list[float]]:
+    """Convert a UTM Polygon exterior ring to WGS84 [[lat, lon], ...] pairs."""
+    if isinstance(poly, Polygon) and not poly.is_empty:
+        arr = np.array(poly.exterior.coords)
+        lons, lats = _to_wgs.transform(arr[:, 0], arr[:, 1])
+        return [[lat, lon] for lat, lon in zip(lats, lons)]
+    return []
+
+
 def add_endpoints(coords, color, target):
     """Draw a small circle at the start and end of a segment."""
     for pt in (coords[0], coords[-1]):
@@ -313,7 +323,9 @@ def _blend_with_black(hex_color: str, opacity: float) -> str:
 # ── MAP GENERATION ─────────────────────────────────────────────────────────────
 def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
                  output_name: str, zoom: int = 19, bbox_m: int = 750,
-                 bar_pos: int = 0) -> str:
+                 bar_pos: int = 0,
+                 default_lane_width_m: float = 3.5,
+                 hull_fallback_r: float = 15.0) -> str:
     """Build and save a folium map centered on (center_lat, center_lon).
 
     Returns the path to the saved HTML file.
@@ -361,7 +373,7 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
 
     # -- map + feature groups
     m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom,
-                   tiles='CartoDB positron')
+                   max_zoom=22, tiles='CartoDB positron', zoom_control=False)
 
     fg_streets   = folium.FeatureGroup(name='Streets',              show=True)
     fg_sw_sep    = folium.FeatureGroup(name='Sidewalks – separate', show=True)
@@ -369,6 +381,8 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
     fg_bk_sep    = folium.FeatureGroup(name='Bikeways – separate',  show=True)
     fg_bk_off    = folium.FeatureGroup(name='Bikeways – offset',  show=True)
     fg_nodes         = folium.FeatureGroup(name='Intersection Nodes',   show=True)
+    fg_hulls         = folium.FeatureGroup(name='Intersection Hulls',   show=True)
+    fg_slots         = folium.FeatureGroup(name='Crosswalk Slots',      show=True)
     fg_curbramps     = folium.FeatureGroup(name='Curb Ramps',           show=True)
     fg_crosswalks    = folium.FeatureGroup(name='Crosswalks',            show=True)
     fg_curb_returns  = folium.FeatureGroup(name='Curb Returns',         show=True)
@@ -395,6 +409,8 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
         'curb_return': 0,
         'traffic_calming': 0,
         'intersection_node': 0,
+        'hull': 0,
+        'slot': 0,
     }
 
     _geom_cols_to_parse = (
@@ -405,6 +421,7 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
         + ['street_feature_geometry']
         + ['crosswalk_start_geometry', 'crosswalk_end_geometry']
         + ['curb_return_geometry']
+        + ['start_node_geometry', 'end_node_geometry']
     )
 
     def _parse_list_col(v):
@@ -429,7 +446,7 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
         data = data.loc[_in_bbox_mask].copy()
         data['_street_geom'] = _parsed_street[_in_bbox_mask]
         _present_geom_cols = [c for c in _geom_cols_to_parse if c in data.columns]
-        pbar.total = 4 + len(_present_geom_cols) + len(data)
+        pbar.total = 5 + len(_present_geom_cols) + len(data)
         pbar.refresh()
         pbar.update(1)
 
@@ -464,6 +481,93 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
                 pbar.update(1)
         for _col, _result in _col_results.items():
             data[f'_p_{_col}'] = _result
+
+        # ── Stage 3.5: intersection hulls and crosswalk slots ─────────────────
+        pbar.set_description(f'{output_name} · hulls & slots')
+        _hull_geom_map = {
+            col: f'_p_{col}' for col in
+            ('start_node_geometry', 'end_node_geometry',
+             'sidewalk_left_geometry', 'sidewalk_right_geometry')
+        }
+        _hull_attr_cols = [
+            'start_node_is_intersection_node', 'end_node_is_intersection_node',
+            'lanes', 'lane_width',
+            'bikeway_left_1_width', 'bikeway_left_1_type',
+            'bikeway_left_2_width', 'bikeway_left_2_type',
+            'bikeway_right_1_width', 'bikeway_right_1_type',
+            'bikeway_right_2_width', 'bikeway_right_2_type',
+        ]
+        _hull_df = pd.DataFrame(index=data.index)
+        for _orig, _parsed in _hull_geom_map.items():
+            _hull_df[_orig] = data[_parsed] if _parsed in data.columns else None
+        for _ac in _hull_attr_cols:
+            if _ac in data.columns:
+                _hull_df[_ac] = data[_ac]
+
+        _node_to_segs, _node_key_to_pt, _int_hulls = _build_intersection_hulls(
+            _hull_df, default_lane_width_m, hull_fallback_r  # type: ignore[arg-type]
+        )
+
+        # Render hull polygons (amber, translucent)
+        for _hk, _hull_poly in _int_hulls.items():
+            if not in_bbox(_hull_poly):
+                continue
+            _hcoords = polygon_exterior_latlons(_hull_poly)
+            if _hcoords:
+                folium.Polygon(
+                    locations=_hcoords,
+                    color='#b45309', weight=1.5, opacity=0.8,
+                    fill=True, fill_color='#fbbf24', fill_opacity=0.15,
+                    tooltip=f"Intersection hull ({_hk[0]:.1f}, {_hk[1]:.1f})",
+                ).add_to(fg_hulls)
+                counts['hull'] += 1
+
+        # Compute and render crosswalk slot zones (cyan, translucent)
+        for _nk, _conns in _node_to_segs.items():
+            if len(_conns) <= 1:
+                continue
+            _np = _node_key_to_pt.get(_nk)
+            _hp = _int_hulls.get(_nk)
+            if _np is None or _hp is None:
+                continue
+            for _sr, _sp in _conns:
+                _far_col = 'end_node_geometry' if _sp == 'start' else 'start_node_geometry'
+                if _far_col not in _hull_df.columns:
+                    continue
+                _fg = _hull_df.at[_sr, _far_col]
+                if not isinstance(_fg, BaseGeometry) or _fg.is_empty:
+                    continue
+                _fp = cast(Point, _fg)
+                _dx, _dy = _fp.x - _np.x, _fp.y - _np.y
+                _ad = (_dx * _dx + _dy * _dy) ** 0.5
+                if _ad < 1e-6:
+                    continue
+                _ux, _uy = _dx / _ad, _dy / _ad
+                _px2, _py2 = -_uy, _ux
+                _shw = default_lane_width_m / 2.0
+                _r = hull_fallback_r
+                _cx2, _cy2 = _np.x, _np.y
+                _rect = Polygon([
+                    (_cx2 + _ux * _shw + _px2 * _r, _cy2 + _uy * _shw + _py2 * _r),
+                    (_cx2 + _ux * _shw - _px2 * _r, _cy2 + _uy * _shw - _py2 * _r),
+                    (_cx2 - _ux * _shw - _px2 * _r, _cy2 - _uy * _shw - _py2 * _r),
+                    (_cx2 - _ux * _shw + _px2 * _r, _cy2 - _uy * _shw + _py2 * _r),
+                ])
+                _zone = _rect.intersection(_hp)
+                if _zone.is_empty or not in_bbox(_zone):
+                    continue
+                _zcoords = polygon_exterior_latlons(_zone)
+                if not _zcoords:
+                    continue
+                _st_name = str(data.at[_sr, 'name']) if 'name' in data.columns else ''
+                folium.Polygon(
+                    locations=_zcoords,
+                    color='#0891b2', weight=1.5, opacity=0.8,
+                    fill=True, fill_color='#7dd3fc', fill_opacity=0.2,
+                    tooltip=f"Crosswalk slot ({_sp}): {_st_name or '(unnamed)'}",
+                ).add_to(fg_slots)
+                counts['slot'] += 1
+        pbar.update(1)
 
         # ── Stage 4: pre-parse feature list columns ───────────────────────────
         pbar.set_description(f'{output_name} · feature lists')
@@ -743,7 +847,7 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
 
         # ── Stage 6: assemble + save ──────────────────────────────────────────
         pbar.set_description(f'{output_name} · saving')
-        for fg in (fg_bbox, fg_streets, fg_bk_sep, fg_bk_off, fg_sw_sep, fg_sw_off, fg_curbramps, fg_crosswalks, fg_curb_returns, fg_traffic_calm, fg_nodes):
+        for fg in (fg_bbox, fg_hulls, fg_slots, fg_streets, fg_bk_sep, fg_bk_off, fg_sw_sep, fg_sw_off, fg_curbramps, fg_crosswalks, fg_curb_returns, fg_traffic_calm, fg_nodes):
             fg.add_to(m)
 
         folium.Marker(
@@ -763,6 +867,8 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
         js_curb_returns = fg_curb_returns.get_name()
         js_traffic_calm = fg_traffic_calm.get_name()
         js_nodes        = fg_nodes.get_name()
+        js_hulls        = fg_hulls.get_name()
+        js_slots        = fg_slots.get_name()
         js_bbox         = fg_bbox.get_name()
 
         legend_html = f"""
@@ -777,6 +883,20 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
            onchange="toggleFG('{js_nodes}', this.checked)">
     <span style="color:#8b0000;font-size:18px;line-height:1">&#9679;</span>
     Intersection Nodes ({counts['intersection_node']})
+  </label>
+
+  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+    <input type="checkbox" id="cb_hulls" checked
+           onchange="toggleFG('{js_hulls}', this.checked)">
+    <span style="color:#b45309;font-size:18px;line-height:1">&#9647;</span>
+    Intersection Hulls ({counts['hull']})
+  </label>
+
+  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+    <input type="checkbox" id="cb_slots" checked
+           onchange="toggleFG('{js_slots}', this.checked)">
+    <span style="color:#0891b2;font-size:18px;line-height:1">&#9647;</span>
+    Crosswalk Slots ({counts['slot']})
   </label>
 
   <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
@@ -948,13 +1068,169 @@ document.addEventListener('DOMContentLoaded', function() {{
     box.style.display = 'block';
     box.textContent = e.latlng.lat.toFixed(7) + ', ' + e.latlng.lng.toFixed(7);
   }});
-  map.on('contextmenu', function() {{
-    box.style.display = 'none';
-  }});
 }});
 </script>
 """
         m.get_root().html.add_child(folium.Element(_coord_html))  # type: ignore[attr-defined]
+
+        # --- Click-to-probe nearby segments panel ---
+        # Uses plain string + .replace() to avoid f-string escaping mangling JS
+        _probe_html = """
+<div id="px-probe" style="
+    position:fixed;top:50px;left:10px;z-index:10002;
+    background:white;border:2px solid #aaa;border-radius:6px;
+    font:12px/1.5 sans-serif;color:#333;box-shadow:0 2px 6px rgba(0,0,0,0.2);
+    max-width:280px;min-width:200px;display:none;">
+  <div style="background:#1a73e8;color:white;padding:5px 10px;border-radius:4px 4px 0 0;
+              display:flex;justify-content:space-between;align-items:center;">
+    <b>Nearby Segments</b>
+    <span id="px-probe-close" style="cursor:pointer;font-size:14px;line-height:1;">&times;</span>
+  </div>
+  <div style="padding:6px 10px;">
+    <label style="font-size:11px;color:#666;">
+      Radius:
+      <input id="px-probe-radius" type="range" min="5" max="100" value="20"
+             style="width:90px;vertical-align:middle;">
+      <span id="px-probe-radius-val">20</span> m
+    </label>
+  </div>
+  <div id="px-probe-list" style="padding:0 8px 8px;max-height:220px;overflow-y:auto;"></div>
+</div>
+<button id="px-probe-toggle" style="
+    position:fixed;top:10px;left:10px;z-index:10001;
+    padding:5px 12px;border:2px solid #aaa;border-radius:4px;cursor:pointer;
+    background:white;color:#333;font:12px sans-serif;
+    box-shadow:0 1px 4px rgba(0,0,0,0.15);">
+  &#128269; Probe Segments
+</button>
+<script>
+(function() {
+  var _probeActive = false;
+  var _probeTimer = {};
+
+  function pxProbeToggle() {
+    _probeActive = !_probeActive;
+    var btn = document.getElementById('px-probe-toggle');
+    btn.style.background  = _probeActive ? '#1a73e8' : 'white';
+    btn.style.color       = _probeActive ? 'white'   : '#333';
+    btn.style.borderColor = _probeActive ? '#1a73e8' : '#aaa';
+    btn.textContent       = _probeActive ? '\\u{1F50D} Probe ON \\u2014 click map' : '\\u{1F50D} Probe Segments';
+    if (!_probeActive) {
+      document.getElementById('px-probe').style.display = 'none';
+    }
+  }
+
+  document.getElementById('px-probe-toggle').addEventListener('click', function(e) {
+    e.stopPropagation();
+    pxProbeToggle();
+  });
+
+  function haverDist(lat1, lon1, lat2, lon2) {
+    var R = 6371000;
+    var dLat = (lat2-lat1)*Math.PI/180;
+    var dLon = (lon2-lon1)*Math.PI/180;
+    var a = Math.sin(dLat/2)*Math.sin(dLat/2) +
+            Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*
+            Math.sin(dLon/2)*Math.sin(dLon/2);
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  }
+
+  function flashSegment(segId) {
+    var entry = _pxSegIndex[segId];
+    if (!entry) return;
+    var layer = window[entry.v];
+    if (!layer) return;
+    if (_probeTimer[segId]) clearTimeout(_probeTimer[segId]);
+    try { layer.setStyle({color:'#ff4400', weight: entry.ow * 3}); } catch(e) {}
+    _probeTimer[segId] = setTimeout(function() {
+      try { layer.setStyle({color: entry.oc, weight: entry.ow}); } catch(e) {}
+    }, 2500);
+  }
+
+  var _hidden = {};
+  function hideSegment(segId) {
+    var entry = _pxSegIndex[segId];
+    if (!entry) return;
+    var layer = window[entry.v];
+    if (!layer) return;
+    if (_hidden[segId]) {
+      try { layer.setStyle({opacity:1, weight: entry.ow}); } catch(e) {}
+      delete _hidden[segId];
+    } else {
+      try { layer.setStyle({opacity:0, weight:0}); } catch(e) {}
+      _hidden[segId] = true;
+    }
+    // Update button text in probe list
+    var btn = document.getElementById('px-hide-' + segId);
+    if (btn) btn.textContent = _hidden[segId] ? 'Show' : 'Hide';
+  }
+
+  function probeAt(latlng, radiusM) {
+    var found = [];
+    for (var id in _pxSegIndex) {
+      var e = _pxSegIndex[id];
+      var d = haverDist(latlng.lat, latlng.lng, e.c[0], e.c[1]);
+      if (d <= radiusM) found.push({id: id, dist: d, entry: e});
+    }
+    found.sort(function(a,b){ return a.dist - b.dist; });
+    return found;
+  }
+
+  function renderProbe(found) {
+    var panel = document.getElementById('px-probe');
+    var list  = document.getElementById('px-probe-list');
+    if (found.length === 0) {
+      list.innerHTML = '<div style="color:#999;font-size:11px;padding:4px 2px;">No segments found</div>';
+    } else {
+      list.innerHTML = found.map(function(f) {
+        var col = f.entry.oc || '#333';
+        return '<div style="display:flex;align-items:center;gap:6px;padding:3px 2px;border-bottom:1px solid #eee;">' +
+          '<span style="display:inline-block;width:10px;height:10px;border-radius:2px;flex-shrink:0;background:' + col + '"></span>' +
+          '<code style="flex:1;font-size:11px;user-select:all;">' + f.id + '</code>' +
+          '<span style="font-size:10px;color:#999;">' + Math.round(f.dist) + 'm</span>' +
+          '<button onclick="flashSegment(\\'' + f.id + '\\')" style="font-size:10px;padding:1px 5px;cursor:pointer;border:1px solid #ccc;border-radius:3px;background:#f5f5f5;">Flash</button>' +
+          '<button id="px-hide-' + f.id + '" onclick="hideSegment(\\'' + f.id + '\\')" style="font-size:10px;padding:1px 5px;cursor:pointer;border:1px solid #ccc;border-radius:3px;background:#f5f5f5;">' + (_hidden[f.id] ? 'Show' : 'Hide') + '</button>' +
+        '</div>';
+      }).join('');
+    }
+    panel.style.display = 'block';
+  }
+
+  function pxProbeInit() {
+    var mapObj = window['%%MAP_VAR%%'];
+    if (!mapObj) { setTimeout(pxProbeInit, 100); return; }
+
+    var radiusInput = document.getElementById('px-probe-radius');
+    var radiusVal   = document.getElementById('px-probe-radius-val');
+    radiusInput.addEventListener('input', function() {
+      radiusVal.textContent = radiusInput.value;
+    });
+
+    mapObj.on('click', function(e) {
+      if (!_probeActive) return;
+      var r = parseInt(radiusInput.value, 10);
+      var found = probeAt(e.latlng, r);
+      renderProbe(found);
+    });
+
+    document.getElementById('px-probe-close').addEventListener('click', function() {
+      document.getElementById('px-probe').style.display = 'none';
+      _probeActive = false;
+      var btn = document.getElementById('px-probe-toggle');
+      btn.style.background  = 'white';
+      btn.style.color       = '#333';
+      btn.style.borderColor = '#aaa';
+      btn.textContent       = '\\u{1F50D} Probe Segments';
+    });
+  }
+  setTimeout(pxProbeInit, 0);
+
+  window.flashSegment = flashSegment;
+  window.hideSegment = hideSegment;
+})();
+</script>
+""".replace("%%MAP_VAR%%", map_var)
+        m.get_root().html.add_child(folium.Element(_probe_html))  # type: ignore[attr-defined]
 
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         out_path = os.path.join(OUTPUT_DIR, f"{output_name}.html")
@@ -1004,12 +1280,58 @@ html, body { height: 100%; }
   background: white; padding: 10px 14px; border: 2px solid #aaa;
   border-radius: 6px; font-size: 13px; font-family: sans-serif; line-height: 1.6;
 }
+#px-probe-toggle {
+  position: fixed; top: 10px; left: 10px; z-index: 10001;
+  padding: 5px 12px; border: 2px solid #aaa; border-radius: 4px; cursor: pointer;
+  background: white; color: #333; font: 12px sans-serif;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.15);
+}
+#px-probe {
+  position: fixed; top: 42px; left: 10px; z-index: 10002;
+  background: white; border: 2px solid #aaa; border-radius: 6px;
+  font: 12px/1.5 sans-serif; color: #333; box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+  max-width: 280px; min-width: 200px; display: none;
+}
 </style>
 </head>
 <body>
 <div id="error-banner"></div>
 <div id="status">Initializing DuckDB WASM\u2026</div>
 <div id="map"></div>
+
+<div id="px-coords" style="
+    position:fixed;bottom:30px;right:30px;z-index:9999;
+    background:rgba(255,255,255,0.92);padding:6px 12px;border-radius:6px;
+    font:12px/1.4 monospace;color:#333;box-shadow:0 1px 4px rgba(0,0,0,0.2);
+    pointer-events:none;display:none;">
+</div>
+
+<button id="px-probe-toggle">&#128269; Probe</button>
+
+<div id="px-probe">
+  <div style="background:#1a73e8;color:white;padding:5px 10px;border-radius:4px 4px 0 0;
+              display:flex;justify-content:space-between;align-items:center;">
+    <b>Probe</b>
+    <span id="px-probe-close" style="cursor:pointer;font-size:14px;line-height:1;">&times;</span>
+  </div>
+  <div style="padding:6px 10px;">
+    <label style="font-size:11px;color:#666;">
+      Radius:
+      <input id="px-probe-radius" type="range" min="5" max="100" value="20"
+             style="width:90px;vertical-align:middle;">
+      <span id="px-probe-radius-val">20</span> m
+    </label>
+  </div>
+  <div style="padding:0 8px 4px;">
+    <b style="font-size:11px;color:#555;">Nearby Segments</b>
+    <div id="px-probe-segs" style="max-height:200px;overflow-y:auto;margin-top:2px;"></div>
+  </div>
+  <hr style="margin:4px 8px;border:none;border-top:1px solid #ddd;">
+  <div style="padding:0 8px 8px;">
+    <b style="font-size:11px;color:#555;">Nearby Points</b>
+    <div id="px-probe-pts" style="max-height:160px;overflow-y:auto;margin-top:2px;"></div>
+  </div>
+</div>
 
 <div id="legend">
   <b style="font-size:14px">Legend</b><br>
@@ -1045,6 +1367,14 @@ html, body { height: 100%; }
     <input type="checkbox" id="cb_streets" checked>
     <span style="color:#c0392b;font-size:18px;line-height:1">&#9644;</span> Streets
   </label>
+  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+    <input type="checkbox" id="cb_slots" checked>
+    <span style="color:#0891b2;font-size:16px;line-height:1">&#9634;</span> Crosswalk Slots
+  </label>
+  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+    <input type="checkbox" id="cb_hulls" checked>
+    <span style="color:#b45309;font-size:16px;line-height:1">&#9634;</span> Intersection Hulls
+  </label>
 </div>
 
 <div id="px-search">
@@ -1075,6 +1405,8 @@ html, body { height: 100%; }
 import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/+esm';
 
 const PARQUET_URL = new URL('%%PARQUET_URL%%', window.location.href).href;
+const HULL_FC = %%HULL_GEOJSON%%;
+const SLOT_FC = %%SLOT_GEOJSON%%;
 
 // ── Coordinate transforms (all parquet geometries are EPSG:32610 UTM Zone 10N) ──
 proj4.defs('EPSG:32610', '+proj=utm +zone=10 +datum=WGS84 +units=m +no_defs');
@@ -1150,12 +1482,15 @@ const lg = {
   nodes:   L.layerGroup().addTo(map),
   ramps:   L.layerGroup().addTo(map),
   calm:    L.layerGroup().addTo(map),
+  hulls:   L.layerGroup().addTo(map),
+  slots:   L.layerGroup().addTo(map),
 };
 
 // ── Search index ─────────────────────────────────────────────────────────────
-const segIndex  = new Map();   // street_grid_id / sidewalk_*_ID → { layer, mid, baseColor, baseWeight }
-const nodeIndex = new Map();   // node_id (string) → { mid }
-let   _pxMode   = 'seg';
+const segIndex   = new Map();   // street_grid_id / sidewalk_*_ID / bk_* → { layer, mid, baseColor, baseWeight, label }
+const nodeIndex  = new Map();   // node_id (string) → { mid }
+const pointIndex = new Map();   // node_* / ramp_* → { layer, lat, lon, label, baseColor, baseRadius }
+let   _pxMode    = 'seg';
 
 // ── Popup builder (matches generate_map style) ────────────────────────────────
 function makePopup(title, attrs) {
@@ -1169,11 +1504,44 @@ function makePopup(title, attrs) {
          `<table style="border-collapse:collapse;margin-top:4px">${rows}</table></div>`;
 }
 
+// ── Coordinate on click ────────────────────────────────────────────────────────
+const _coordBox = document.getElementById('px-coords');
+map.on('click', e => {
+  _coordBox.style.display = 'block';
+  _coordBox.textContent = e.latlng.lat.toFixed(7) + ', ' + e.latlng.lng.toFixed(7);
+  if (_probeActive) {
+    const r = parseInt(_probeRadiusInput.value, 10);
+    renderProbe(probeSegments(e.latlng, r), probePoints(e.latlng, r));
+  }
+});
+map.on('contextmenu', () => { _coordBox.style.display = 'none'; });
+
+// ── Hull and slot rendering (pre-computed, viewport-filtered, zoom-gated) ──────
+function renderHullsAndSlots() {
+  lg.hulls.clearLayers();
+  lg.slots.clearLayers();
+  if (map.getZoom() < 17) return;
+  const b = map.getBounds();
+  const inView = f => {
+    const ring = f.geometry.coordinates[0];
+    return ring.some(([lon, lat]) => b.contains([lat, lon]));
+  };
+  L.geoJSON({ type: 'FeatureCollection', features: HULL_FC.features.filter(inView) }, {
+    style: () => ({ color: '#b45309', weight: 1.5, opacity: 0.8, fill: true, fillColor: '#fbbf24', fillOpacity: 0.15 }),
+    onEachFeature: (f, l) => l.bindTooltip(f.properties.tip),
+  }).addTo(lg.hulls);
+  L.geoJSON({ type: 'FeatureCollection', features: SLOT_FC.features.filter(inView) }, {
+    style: () => ({ color: '#0891b2', weight: 1.5, opacity: 0.8, fill: true, fillColor: '#7dd3fc', fillOpacity: 0.2 }),
+    onEachFeature: (f, l) => l.bindTooltip(f.properties.tip),
+  }).addTo(lg.slots);
+}
+
 // ── Layer rendering ───────────────────────────────────────────────────────────
 function clearAll() {
-  Object.values(lg).forEach(l => l.clearLayers());
+  ['streets','bk_sep','bk_off','sw_sep','sw_off','nodes','ramps','calm'].forEach(k => lg[k].clearLayers());
   segIndex.clear();
   nodeIndex.clear();
+  pointIndex.clear();
 }
 
 function midLatLon(geojson) {
@@ -1206,7 +1574,7 @@ function renderRows(rows, tier) {
           ['Max speed', r.maxspeed],    ['Oneway',   r.oneway],
         ]));
         const mid = midLatLon(g);
-        segIndex.set(String(r.street_grid_id), { layer, mid, baseColor: col, baseWeight: 2 });
+        segIndex.set(String(r.street_grid_id), { layer, mid, baseColor: col, baseWeight: 2, label: String(r.name || r.highway || r.street_grid_id) });
       }
       layer.addTo(lg.streets);
     }
@@ -1222,6 +1590,8 @@ function renderRows(rows, tier) {
         const base  = isOff ? C.bk_off : C.bk_sep;
         const col   = inclineColor(base, r[`bikeway_${side}_${idx}_incline`]);
         const g     = xfGeom(JSON.parse(r[key]));
+        const bkMid = midLatLon(g);
+        const bkKey = `bk_${side}_${idx}_${r.street_grid_id}`;
         const layer = L.geoJSON(g, { style: () => ({ color: col, weight: 2, opacity: 0.85 }) })
           .bindTooltip(`Bikeway ${side}-${idx}: ${r[`bikeway_${side}_${idx}_type`] || ''}`)
           .bindPopup(makePopup(`Bikeway (${side} ${idx})`, [
@@ -1234,6 +1604,7 @@ function renderRows(rows, tier) {
             ['Separator', r[`bikeway_${side}_${idx}_seperator`]],
             ['Street',    r.name],
           ]));
+        segIndex.set(bkKey, { layer, mid: bkMid, baseColor: col, baseWeight: 2, label: `Bikeway ${side}-${idx}: ${r[`bikeway_${side}_${idx}_type`] || ''} (${r.name || ''})` });
         layer.addTo(isOff ? lg.bk_off : lg.bk_sep);
       }
     }
@@ -1261,7 +1632,7 @@ function renderRows(rows, tier) {
           ]));
         const mid = midLatLon(g);
         const swId = String(r[`sidewalk_${side}_ID`] || '');
-        if (swId) segIndex.set(swId, { layer, mid, baseColor: col, baseWeight: 2 });
+        if (swId) segIndex.set(swId, { layer, mid, baseColor: col, baseWeight: 2, label: `Sidewalk ${side}: ${r.name || swId}` });
         layer.addTo(isOff ? lg.sw_off : lg.sw_sep);
       }
 
@@ -1324,12 +1695,13 @@ function renderRows(rows, tier) {
         const mid = [g.coordinates[1], g.coordinates[0]];
         const nid = String(r[idField]);
         if (!nodeIndex.has(nid)) {
-          L.circleMarker(mid, {
+          const nodeMk = L.circleMarker(mid, {
             radius: 4, color: C.node, fillColor: C.node, fillOpacity: 0.9, weight: 1,
           })
             .bindTooltip(`Node ${nid}`)
             .addTo(lg.nodes);
           nodeIndex.set(nid, { mid });
+          pointIndex.set(`node_${nid}`, { layer: nodeMk, lat: mid[0], lon: mid[1], label: `Node ${nid}`, baseColor: C.node, baseRadius: 4 });
         }
       }
     }
@@ -1344,7 +1716,8 @@ function renderRows(rows, tier) {
         const mid  = [g.coordinates[1], g.coordinates[0]];
         const rloc = r[`${base}_returnloc`];
         const rpos = r[`${base}_returnposition`];
-        L.circleMarker(mid, {
+        const rampKey = `ramp_${s}_${p}_${i}_${r.street_grid_id}`;
+        const rampMk = L.circleMarker(mid, {
           radius: 5, color: C.ramp, fillColor: C.ramp, fillOpacity: 0.9, weight: 1,
         })
           .bindTooltip(`Curb ramp ${s}-${p}-${i}: loc=${rloc || ''}, pos=${rpos || ''}`)
@@ -1359,6 +1732,7 @@ function renderRows(rows, tier) {
             ['Street',           r.name],
           ]))
           .addTo(lg.ramps);
+        pointIndex.set(rampKey, { layer: rampMk, lat: mid[0], lon: mid[1], label: `Ramp ${s}-${p}-${i} (${r.name || ''})`, baseColor: C.ramp, baseRadius: 5 });
       }
     }
   }
@@ -1367,9 +1741,9 @@ function renderRows(rows, tier) {
 // ── SQL builder ───────────────────────────────────────────────────────────────
 function buildSQL(tier, bounds) {
   // Helper: CASE-guard geometry columns (null-safe) → GeoJSON alias
-  // All columns are now native GeoParquet geometry — ST_AsGeoJSON works directly.
+  // Secondary geometry columns are stored as WKB hex (VARCHAR); decode before ST_AsGeoJSON.
   const wkb  = (col, alias) =>
-    `CASE WHEN ${col} IS NOT NULL THEN ST_AsGeoJSON(${col}) END AS ${alias}`;
+    `CASE WHEN ${col} IS NOT NULL THEN ST_AsGeoJSON(ST_GeomFromHEXWKB(CAST(${col} AS VARCHAR))) END AS ${alias}`;
   const bk   = (s, n) => wkb(`bikeway_${s}_${n}_geometry`,             `bk_${s[0]}${n}_geom`);
   const sw   = s      => wkb(`sidewalk_${s}_geometry`,                  `sw_${s[0]}_geom`);
   const xw   = p      => wkb(`crosswalk_${p}_geometry`,                 `xw_${p}_geom`);
@@ -1495,7 +1869,7 @@ async function refreshMap() {
 
 map.on('zoomend moveend', () => {
   clearTimeout(_refreshTimer);
-  _refreshTimer = setTimeout(refreshMap, 300);
+  _refreshTimer = setTimeout(() => { refreshMap(); renderHullsAndSlots(); }, 300);
 });
 
 // ── Legend toggles ────────────────────────────────────────────────────────────
@@ -1503,6 +1877,7 @@ map.on('zoomend moveend', () => {
   ['cb_streets', 'streets'], ['cb_bk_sep', 'bk_sep'], ['cb_bk_off', 'bk_off'],
   ['cb_sw_sep',  'sw_sep'],  ['cb_sw_off', 'sw_off'],
   ['cb_nodes',   'nodes'],   ['cb_ramps',  'ramps'],   ['cb_calm', 'calm'],
+  ['cb_hulls',   'hulls'],   ['cb_slots',  'slots'],
 ].forEach(([id, key]) => {
   document.getElementById(id).addEventListener('change', e => {
     e.target.checked ? map.addLayer(lg[key]) : map.removeLayer(lg[key]);
@@ -1548,6 +1923,132 @@ function pxSetMode(mode) {
 document.getElementById('px-mode-seg').onclick  = () => pxSetMode('seg');
 document.getElementById('px-mode-node').onclick = () => pxSetMode('node');
 
+// ── Probe ─────────────────────────────────────────────────────────────────────
+let _probeActive = false;
+const _probeTimerSeg = {};
+const _probeTimerPt  = {};
+const _hiddenSeg     = {};
+const _hiddenPt      = {};
+
+function haverDist(lat1, lon1, lat2, lon2) {
+  const R = 6371000, r = Math.PI / 180;
+  const dLat = (lat2 - lat1) * r, dLon = (lon2 - lon1) * r;
+  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*r)*Math.cos(lat2*r)*Math.sin(dLon/2)**2;
+  return R * 2 * Math.asin(Math.sqrt(a));
+}
+
+function probeSegments(latlng, radiusM) {
+  const found = [];
+  segIndex.forEach((e, key) => {
+    const d = haverDist(latlng.lat, latlng.lng, e.mid[0], e.mid[1]);
+    if (d <= radiusM) found.push({ key, dist: d, entry: e });
+  });
+  found.sort((a, b) => a.dist - b.dist);
+  return found;
+}
+
+function probePoints(latlng, radiusM) {
+  const found = [];
+  pointIndex.forEach((e, key) => {
+    const d = haverDist(latlng.lat, latlng.lng, e.lat, e.lon);
+    if (d <= radiusM) found.push({ key, dist: d, entry: e });
+  });
+  found.sort((a, b) => a.dist - b.dist);
+  return found;
+}
+
+function flashFeature(key, kind) {
+  if (kind === 'seg') {
+    const e = segIndex.get(key); if (!e || !e.layer) return;
+    if (_probeTimerSeg[key]) clearTimeout(_probeTimerSeg[key]);
+    try { e.layer.setStyle({ color: '#ff4400', weight: e.baseWeight * 3 }); } catch(_) {}
+    _probeTimerSeg[key] = setTimeout(() => {
+      try { e.layer.setStyle({ color: e.baseColor, weight: e.baseWeight }); } catch(_) {}
+    }, 2500);
+  } else {
+    const e = pointIndex.get(key); if (!e || !e.layer) return;
+    if (_probeTimerPt[key]) clearTimeout(_probeTimerPt[key]);
+    try { e.layer.setStyle({ color: '#ff4400', fillColor: '#ff4400', radius: e.baseRadius * 2.5 }); } catch(_) {}
+    _probeTimerPt[key] = setTimeout(() => {
+      try { e.layer.setStyle({ color: e.baseColor, fillColor: e.baseColor, radius: e.baseRadius }); } catch(_) {}
+    }, 2500);
+  }
+}
+
+function toggleHide(key, kind) {
+  const safeKey = key.replace(/[^a-zA-Z0-9_]/g, '_');
+  const btn = document.getElementById('px-hide-' + kind + '-' + safeKey);
+  if (kind === 'seg') {
+    const e = segIndex.get(key); if (!e || !e.layer) return;
+    if (_hiddenSeg[key]) {
+      try { e.layer.setStyle({ color: e.baseColor, weight: e.baseWeight, opacity: 0.8 }); } catch(_) {}
+      delete _hiddenSeg[key];
+      if (btn) btn.textContent = 'Hide';
+    } else {
+      try { e.layer.setStyle({ opacity: 0, weight: 0 }); } catch(_) {}
+      _hiddenSeg[key] = true;
+      if (btn) btn.textContent = 'Show';
+    }
+  } else {
+    const e = pointIndex.get(key); if (!e || !e.layer) return;
+    if (_hiddenPt[key]) {
+      try { e.layer.setStyle({ color: e.baseColor, fillColor: e.baseColor, fillOpacity: 0.9, opacity: 1, radius: e.baseRadius }); } catch(_) {}
+      delete _hiddenPt[key];
+      if (btn) btn.textContent = 'Hide';
+    } else {
+      try { e.layer.setStyle({ opacity: 0, fillOpacity: 0 }); } catch(_) {}
+      _hiddenPt[key] = true;
+      if (btn) btn.textContent = 'Show';
+    }
+  }
+}
+
+function _probeRow(key, dist, entry, kind) {
+  const safeKey = key.replace(/[^a-zA-Z0-9_]/g, '_');
+  const isHidden = kind === 'seg' ? !!_hiddenSeg[key] : !!_hiddenPt[key];
+  return '<div style="display:flex;align-items:center;gap:4px;padding:3px 2px;border-bottom:1px solid #f0f0f0;font-size:11px;">' +
+    '<span style="display:inline-block;width:10px;height:10px;border-radius:2px;flex-shrink:0;background:' + (entry.baseColor || '#888') + ';"></span>' +
+    '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + (entry.label || key) + '">' + (entry.label || key) + '</span>' +
+    '<span style="color:#888;flex-shrink:0;">' + Math.round(dist) + 'm</span>' +
+    '<button onclick="flashFeature(\'' + key + '\',\'' + kind + '\')" style="padding:1px 5px;font-size:10px;cursor:pointer;border:1px solid #ccc;border-radius:3px;">Flash</button>' +
+    '<button id="px-hide-' + kind + '-' + safeKey + '" onclick="toggleHide(\'' + key + '\',\'' + kind + '\')" style="padding:1px 5px;font-size:10px;cursor:pointer;border:1px solid #ccc;border-radius:3px;">' + (isHidden ? 'Show' : 'Hide') + '</button>' +
+    '</div>';
+}
+
+function renderProbe(segResults, ptResults) {
+  const panel   = document.getElementById('px-probe');
+  const segList = document.getElementById('px-probe-segs');
+  const ptList  = document.getElementById('px-probe-pts');
+  segList.innerHTML = segResults.length
+    ? segResults.map(f => _probeRow(f.key, f.dist, f.entry, 'seg')).join('')
+    : '<div style="color:#999;font-size:11px;padding:4px 2px;">No segments found</div>';
+  ptList.innerHTML  = ptResults.length
+    ? ptResults.map(f => _probeRow(f.key, f.dist, f.entry, 'pt')).join('')
+    : '<div style="color:#999;font-size:11px;padding:4px 2px;">No points found</div>';
+  panel.style.display = 'block';
+}
+
+function _setProbeActive(active) {
+  _probeActive = active;
+  const btn = document.getElementById('px-probe-toggle');
+  btn.style.background  = active ? '#1a73e8' : 'white';
+  btn.style.color       = active ? 'white'   : '#333';
+  btn.style.borderColor = active ? '#1a73e8' : '#aaa';
+  btn.textContent       = active ? '\\u{1F50D} Probe ON \\u2014 click map' : '\\u{1F50D} Probe';
+  if (!active) document.getElementById('px-probe').style.display = 'none';
+}
+
+document.getElementById('px-probe-toggle').addEventListener('click', e => {
+  e.stopPropagation();
+  _setProbeActive(!_probeActive);
+});
+
+document.getElementById('px-probe-close').addEventListener('click', () => _setProbeActive(false));
+
+const _probeRadiusInput = document.getElementById('px-probe-radius');
+const _probeRadiusVal   = document.getElementById('px-probe-radius-val');
+_probeRadiusInput.addEventListener('input', () => { _probeRadiusVal.textContent = _probeRadiusInput.value; });
+
 // ── Status / error helpers ────────────────────────────────────────────────────
 function setStatus(msg) { document.getElementById('status').textContent = msg; }
 function showError(msg)  {
@@ -1556,6 +2057,7 @@ function showError(msg)  {
   setStatus('Error \u2014 see banner');
 }
 
+renderHullsAndSlots();
 initDuckDB();
 </script>
 </body>
@@ -1563,7 +2065,7 @@ initDuckDB();
 """
 
 
-def generate_county_map(parquet_path: str, output_name: str = 'sf_county') -> str:
+def generate_county_map(parquet_path: str, data: pd.DataFrame, output_name: str = 'sf_county') -> str:
     """Generate a county-wide interactive map backed by DuckDB WASM.
 
     Layers load progressively by zoom tier:
@@ -1577,11 +2079,113 @@ def generate_county_map(parquet_path: str, output_name: str = 'sf_county') -> st
         cd Output && python -m http.server 8080 --bind 127.0.0.1
         http://localhost:8080/test_maps/<output_name>.html
     """
+    # ── Pre-compute intersection hulls and crosswalk slot zones ─────────────────
+    _default_lw = 3.5
+    _hull_r     = 15.0
+    _hull_attr_cols = [
+        'start_node_is_intersection_node', 'end_node_is_intersection_node',
+        'lanes', 'lane_width',
+        'bikeway_left_1_width', 'bikeway_left_1_type',
+        'bikeway_left_2_width', 'bikeway_left_2_type',
+        'bikeway_right_1_width', 'bikeway_right_1_type',
+        'bikeway_right_2_width', 'bikeway_right_2_type',
+    ]
+    _hull_df = pd.DataFrame(index=data.index)
+    for _col in ('start_node_geometry', 'end_node_geometry',
+                 'sidewalk_left_geometry', 'sidewalk_right_geometry'):
+        if _col in data.columns:
+            _hull_df[_col] = parse_geom_series(data[_col])
+    for _col in _hull_attr_cols:
+        if _col in data.columns:
+            _hull_df[_col] = data[_col]
+
+    _node_to_segs, _node_key_to_pt, _int_hulls = _build_intersection_hulls(
+        _hull_df, _default_lw, _hull_r  # type: ignore[arg-type]
+    )
+
+    def _poly_to_ring(poly: BaseGeometry) -> list | None:
+        """UTM Polygon → WGS84 [[lon, lat], ...] exterior ring, or None."""
+        if poly is None or poly.is_empty:
+            return None
+        if hasattr(poly, 'geoms'):
+            poly = max(poly.geoms, key=lambda p: p.area)  # type: ignore[attr-defined]
+        try:
+            return [list(_to_wgs.transform(x, y)) for x, y in poly.exterior.coords]  # type: ignore[union-attr]
+        except Exception:
+            return None
+
+    hull_features: list[dict] = []
+    for _hk, _hp in _int_hulls.items():
+        _ring = _poly_to_ring(_hp)
+        if _ring:
+            hull_features.append({
+                'type': 'Feature',
+                'geometry': {'type': 'Polygon', 'coordinates': [_ring]},
+                'properties': {'tip': f'Hull ({_hk[0]:.0f}, {_hk[1]:.0f})'},
+            })
+
+    slot_features: list[dict] = []
+    for _nk, _conns in _node_to_segs.items():
+        if len(_conns) <= 1:
+            continue
+        _np  = _node_key_to_pt.get(_nk)
+        _hp  = _int_hulls.get(_nk)
+        if _np is None or _hp is None:
+            continue
+        for _sr, _sp in _conns:
+            _far_col = 'end_node_geometry' if _sp == 'start' else 'start_node_geometry'
+            if _far_col not in _hull_df.columns:
+                continue
+            _fg = _hull_df.at[_sr, _far_col]
+            if not isinstance(_fg, BaseGeometry) or _fg.is_empty:
+                continue
+            _fp   = cast(Point, _fg)
+            _dx, _dy = _fp.x - _np.x, _fp.y - _np.y
+            _ad  = (_dx * _dx + _dy * _dy) ** 0.5
+            if _ad < 1e-6:
+                continue
+            _ux, _uy = _dx / _ad, _dy / _ad
+            _px2, _py2 = -_uy, _ux
+            _shw = _default_lw / 2.0
+            # Center slot at hull-boundary exit point (ring pattern)
+            _arm_ray = LineString([(_np.x, _np.y), (_np.x + _ux * _hull_r * 4, _np.y + _uy * _hull_r * 4)])
+            _bnd_i = _arm_ray.intersection(_hp.boundary)
+            if _bnd_i.is_empty:
+                _scx, _scy = _np.x, _np.y
+            elif _bnd_i.geom_type == 'MultiPoint':
+                _bpt = max(cast(MultiPoint, _bnd_i).geoms, key=lambda p: p.distance(_np))
+                _scx, _scy = cast(Point, _bpt).x, cast(Point, _bpt).y
+            else:
+                _scx, _scy = cast(Point, _bnd_i).x, cast(Point, _bnd_i).y
+            _rect = Polygon([
+                (_scx + _ux * _shw + _px2 * _hull_r, _scy + _uy * _shw + _py2 * _hull_r),
+                (_scx + _ux * _shw - _px2 * _hull_r, _scy + _uy * _shw - _py2 * _hull_r),
+                (_scx - _ux * _shw - _px2 * _hull_r, _scy - _uy * _shw - _py2 * _hull_r),
+                (_scx - _ux * _shw + _px2 * _hull_r, _scy - _uy * _shw + _py2 * _hull_r),
+            ])
+            _zone = _rect.intersection(_hp)
+            if _zone.is_empty:
+                continue
+            _ring = _poly_to_ring(_zone)
+            if not _ring:
+                continue
+            _name = str(data.at[_sr, 'name']) if 'name' in data.columns else ''
+            slot_features.append({
+                'type': 'Feature',
+                'geometry': {'type': 'Polygon', 'coordinates': [_ring]},
+                'properties': {'tip': f'Slot ({_sp}): {_name or "(unnamed)"}'},
+            })
+
+    hull_json = json.dumps({'type': 'FeatureCollection', 'features': hull_features})
+    slot_json = json.dumps({'type': 'FeatureCollection', 'features': slot_features})
+
     parquet_basename = os.path.basename(parquet_path)
     html = (
         _COUNTY_MAP_TEMPLATE
         .replace('%%PARQUET_URL%%', f'../{parquet_basename}')
         .replace('%%TITLE%%', output_name)
+        .replace('%%HULL_GEOJSON%%', hull_json)
+        .replace('%%SLOT_GEOJSON%%', slot_json)
     )
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     out_path = os.path.join(OUTPUT_DIR, f'{output_name}.html')
@@ -1615,7 +2219,9 @@ for parquet_path in _all_parquets:
             ex.submit(generate_map, data,
                       loc["lat"], loc["lon"], loc["name"],
                       loc.get("zoom", 19), loc.get("bbox_m", 750),
-                      bar_pos=i): loc["name"]
+                      bar_pos=i,
+                      default_lane_width_m=loc.get("default_lane_width_m", 3.5),
+                      hull_fallback_r=loc.get("hull_fallback_r", 15.0)): loc["name"]
             for i, loc in enumerate(facility_locs)
         }
         for f in as_completed(future_to_name):
@@ -1623,5 +2229,5 @@ for parquet_path in _all_parquets:
 
     # County-wide DuckDB WASM map (one per unique parquet)
     _county_name = os.path.splitext(os.path.basename(parquet_path))[0].replace('_network', '_county_map')
-    generate_county_map(parquet_path, _county_name)
+    generate_county_map(parquet_path, data, _county_name)
 
