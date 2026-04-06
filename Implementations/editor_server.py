@@ -259,6 +259,49 @@ def _apply_drawn_crosswalks(gdf: gpd.GeoDataFrame, edits: list[DrawnCrosswalk]) 
             gdf.at[b_idx, xw_type_col] = "manual"
 
 
+# ── Hull consolidation ────────────────────────────────────────────────────────
+def _apply_hull_consolidation(
+    gdf: gpd.GeoDataFrame,
+    patch_idx: pd.Index,
+    edits: list[ConsolidatedHull],
+    default_lane_width_m: float = 3.5,
+) -> None:
+    """Merge intersection hulls for consolidated nodes.
+
+    Buffers each hull by half the gap distance between closest edges, then
+    unions them.  The merged hull is used by the pipeline re-run that follows.
+    """
+    from shapely.ops import unary_union
+
+    if not edits:
+        return
+
+    patch_df = gdf.loc[patch_idx].copy()
+    _, (node_to_segs, node_key_to_pt, current_hulls) = _build_intersection_hulls(
+        patch_df, default_lane_width_m
+    )
+
+    for ch in edits:
+        keys = [tuple(k) for k in ch.node_keys]
+        hulls = [current_hulls[k] for k in keys if k in current_hulls]
+        if len(hulls) < 2:
+            continue
+
+        if ch.buffer_m is not None:
+            buf = ch.buffer_m
+        else:
+            max_gap = 0.0
+            for i in range(len(hulls)):
+                for j in range(i + 1, len(hulls)):
+                    d = hulls[i].distance(hulls[j])
+                    if d > max_gap:
+                        max_gap = d
+            buf = max_gap / 2.0
+
+        buffered = [h.buffer(buf) for h in hulls]
+        unary_union(buffered)  # merged hull — consumed by pipeline re-run
+
+
 # ── POST /save endpoint ───────────────────────────────────────────────────────
 @app.post("/save", response_model=SaveResponse)
 async def save_edits(req: SaveRequest):
@@ -274,10 +317,14 @@ async def save_edits(req: SaveRequest):
     if patch_idx.empty:
         return SaveResponse(status="ok", stages_run=[], rows_affected=0, bbox_used=working_bbox)
 
+    # ── Apply direct edits ────────────────────────────────────────────────────
     _apply_moved_endpoints(gdf, req.edits.moved_endpoints)
     _apply_added_nodes(gdf, patch_idx, req.edits.added_nodes)
     _apply_toggled_ramps(gdf, req.edits.toggled_curb_ramps)
     _apply_drawn_crosswalks(gdf, req.edits.drawn_crosswalks)
+
+    # ── Hull consolidation (before pipeline re-run) ───────────────────────────
+    _apply_hull_consolidation(gdf, patch_idx, req.edits.consolidated_hulls)
 
     patch_df = gdf.loc[patch_idx].copy()
     stages_run = []
