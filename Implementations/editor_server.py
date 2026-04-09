@@ -26,15 +26,25 @@ if str(_IMPL_DIR) not in sys.path:
     sys.path.insert(0, str(_IMPL_DIR))
 
 from ProximityModel import (
-    _build_intersection_hulls,
-    _assign_curb_ramp_geometries,
-    _create_crosswalk_geometries,
-    _snap_offset_endpoints,
-    _CURB_RAMP_PROXIMITY_M,
+    PipelineConfig,
+    step_10_snap_endpoints,
+    step_12_curb_ramps_and_hulls,
+    step_13_merge_hulls,
+    step_14_crosswalk_slots,
+    step_15_crosswalk_geometries,
+)
+
+# Buffer (metres) used to expand edit bboxes before filtering affected rows.
+_EDIT_PROXIMITY_M = 20.0
+
+# Shared config for pipeline step re-runs on edited patches.
+_PIPELINE_CONFIG = PipelineConfig(
+    place_name="editor",
+    output_path="",
 )
 
 OUTPUT_DIR = _IMPL_DIR.parent / "Output"
-EDITOR_HTML = OUTPUT_DIR / "test_maps" / "county_editor.html"
+EDITOR_HTML = _IMPL_DIR / "county_editor.html"
 
 app = FastAPI(title="Proximity Editor")
 
@@ -66,6 +76,55 @@ async def serve_parquet(filename: str):
     if not path.exists():
         raise HTTPException(404, f"File not found: {filename}")
     return FileResponse(path, media_type="application/octet-stream")
+
+
+@app.get("/hulls/{parquet_name}")
+async def get_hulls(
+    parquet_name: str,
+    min_lon: float,
+    min_lat: float,
+    max_lon: float,
+    max_lat: float,
+):
+    """Return hull polygons and crosswalk slots for the requested viewport bbox."""
+    gdf = _load_gdf(parquet_name)
+    bbox = BBox(minX=min_lon, minY=min_lat, maxX=max_lon, maxY=max_lat)
+    # Buffer ~200 m in degrees so edge-straddling intersections are included
+    patch_idx = _filter_bbox(gdf, bbox, buffer_m=0.002)
+    if len(patch_idx) == 0:
+        return {"hulls": [], "slots": []}
+
+    patch_df = gdf.loc[patch_idx].copy()
+    _, hulls = step_12_curb_ramps_and_hulls(patch_df, _PIPELINE_CONFIG)
+    if hulls.empty:
+        return {"hulls": [], "slots": []}
+    hulls = step_13_merge_hulls(hulls, _PIPELINE_CONFIG)
+    step_14_crosswalk_slots(patch_df, hulls, _PIPELINE_CONFIG)
+
+    hull_features = []
+    for idx in hulls.index:
+        geom = hulls.at[idx, "geometry"]
+        if geom is None or geom.is_empty:
+            continue
+        node_id = hulls.at[idx, "node_id"]
+        hull_features.append({
+            "type": "Feature",
+            "geometry": geom.__geo_interface__,
+            "properties": {"tip": f"Intersection {node_id}", "node_id": str(node_id)},
+        })
+
+    slot_features = []
+    for slot in hulls.attrs.get("crosswalk_slots", []):
+        geom = slot.get("slot_geom")
+        if geom is None or geom.is_empty:
+            continue
+        slot_features.append({
+            "type": "Feature",
+            "geometry": geom.__geo_interface__,
+            "properties": {"tip": f"Crosswalk slot · node {slot.get('node_id', '')}"},
+        })
+
+    return {"hulls": hull_features, "slots": slot_features}
 
 
 # ── Pipeline stage definitions ────────────────────────────────────────────────
@@ -215,7 +274,7 @@ def _apply_added_nodes(gdf: gpd.GeoDataFrame, patch_idx: pd.Index,
                     best_dist = d
                     best_idx = idx
                     best_prefix = prefix
-        if best_idx is not None and best_dist < _CURB_RAMP_PROXIMITY_M * 2:
+        if best_idx is not None and best_dist < _EDIT_PROXIMITY_M * 2:
             gdf.at[best_idx, f"{best_prefix}_node_is_intersection_node"] = True
 
 
@@ -260,53 +319,80 @@ def _apply_drawn_crosswalks(gdf: gpd.GeoDataFrame, edits: list[DrawnCrosswalk]) 
 
 
 # ── Hull consolidation ────────────────────────────────────────────────────────
-def _apply_hull_consolidation(
-    gdf: gpd.GeoDataFrame,
-    patch_idx: pd.Index,
+def _compute_consolidation_buffer(
     edits: list[ConsolidatedHull],
-    default_lane_width_m: float = 3.5,
-) -> None:
-    """Merge intersection hulls for consolidated nodes.
+    patch_df: gpd.GeoDataFrame,
+) -> float | None:
+    """Return an override hull_merge_buffer_m that forces selected nodes to merge.
 
-    Buffers each hull by half the gap distance between closest edges, then
-    unions them.  The merged hull is used by the pipeline re-run that follows.
+    When the user picks explicit node_keys to consolidate, we widen the merge
+    buffer to at least half the gap between the farthest pair of hulls in the
+    edit set so that step_13 unions them. Returns None if no edits.
     """
-    from shapely.ops import unary_union
-
     if not edits:
-        return
+        return None
 
-    patch_df = gdf.loc[patch_idx].copy()
-    _, (node_to_segs, node_key_to_pt, current_hulls) = _build_intersection_hulls(
-        patch_df, default_lane_width_m
-    )
+    # Run step_12 once to get current hulls (in WGS84)
+    _, current_hulls = step_12_curb_ramps_and_hulls(patch_df.copy(), _PIPELINE_CONFIG)
+    if current_hulls.empty:
+        return None
 
+    hulls_utm = current_hulls.to_crs("EPSG:32610")
+    from shapely.geometry import Point as _Pt
+
+    override_buf: float | None = None
     for ch in edits:
-        keys = [tuple(k) for k in ch.node_keys]
-        hulls = [current_hulls[k] for k in keys if k in current_hulls]
-        if len(hulls) < 2:
+        # Resolve each (x, y) key to the nearest hull by centroid distance
+        resolved_idxs: list[int] = []
+        for k in ch.node_keys:
+            target = _Pt(k[0], k[1])
+            best_i = None
+            best_d = float("inf")
+            for i in hulls_utm.index:
+                c = hulls_utm.at[i, "geometry"].centroid
+                d = c.distance(target)
+                if d < best_d:
+                    best_d = d
+                    best_i = i
+            if best_i is not None:
+                resolved_idxs.append(best_i)
+
+        if len(resolved_idxs) < 2:
             continue
 
         if ch.buffer_m is not None:
             buf = ch.buffer_m
         else:
             max_gap = 0.0
-            for i in range(len(hulls)):
-                for j in range(i + 1, len(hulls)):
-                    d = hulls[i].distance(hulls[j])
+            for i in range(len(resolved_idxs)):
+                for j in range(i + 1, len(resolved_idxs)):
+                    gi = hulls_utm.at[resolved_idxs[i], "geometry"]
+                    gj = hulls_utm.at[resolved_idxs[j], "geometry"]
+                    d = gi.distance(gj)
                     if d > max_gap:
                         max_gap = d
-            buf = max_gap / 2.0
+            buf = (max_gap / 2.0) + 0.5  # small epsilon to guarantee overlap
 
-        buffered = [h.buffer(buf) for h in hulls]
-        unary_union(buffered)  # merged hull — consumed by pipeline re-run
+        if override_buf is None or buf > override_buf:
+            override_buf = buf
+
+    return override_buf
 
 
 # ── POST /save endpoint ───────────────────────────────────────────────────────
+_EMPTY_CROSSWALK_CACHE = gpd.GeoDataFrame(
+    columns=["geometry", "type", "controlled", "marked", "markings",
+             "signals", "island", "kerb", "tactile_paving",
+             "traffic_calming", "continuous"],
+    geometry="geometry",
+    crs="EPSG:4326",
+)
+
+
 @app.post("/save", response_model=SaveResponse)
 async def save_edits(req: SaveRequest):
     gdf = _load_gdf(req.parquet)
-    buffer_m = _CURB_RAMP_PROXIMITY_M
+    buffer_m = _EDIT_PROXIMITY_M
     working_bbox = BBox(
         minX=req.bbox.minX - buffer_m,
         minY=req.bbox.minY - buffer_m,
@@ -323,32 +409,38 @@ async def save_edits(req: SaveRequest):
     _apply_toggled_ramps(gdf, req.edits.toggled_curb_ramps)
     _apply_drawn_crosswalks(gdf, req.edits.drawn_crosswalks)
 
-    # ── Hull consolidation (before pipeline re-run) ───────────────────────────
-    _apply_hull_consolidation(gdf, patch_idx, req.edits.consolidated_hulls)
-
     patch_df = gdf.loc[patch_idx].copy()
-    stages_run = []
+
+    # ── Hull consolidation: derive override merge buffer from the edit set ────
+    override_buf = _compute_consolidation_buffer(req.edits.consolidated_hulls, patch_df)
+    from dataclasses import replace as _dc_replace
+    run_config = _PIPELINE_CONFIG
+    if override_buf is not None:
+        run_config = _dc_replace(_PIPELINE_CONFIG, hull_merge_buffer_m=override_buf)
+
+    stages_run: list[int] = []
 
     if req.dirty_from_stage <= STAGE_SNAP_ENDPOINTS:
-        patch_df = _snap_offset_endpoints(patch_df)
+        patch_df = step_10_snap_endpoints(patch_df, run_config)
         stages_run.append(STAGE_SNAP_ENDPOINTS)
 
-    hulls_data = None
-    if req.dirty_from_stage <= STAGE_BUILD_HULLS:
-        patch_df, hulls_data = _build_intersection_hulls(patch_df)
-        stages_run.append(STAGE_BUILD_HULLS)
-
+    # step_12 now places curb ramps AND builds hulls in one shot, so
+    # STAGE_BUILD_HULLS and STAGE_ASSIGN_RAMPS collapse onto the same call.
+    hulls: gpd.GeoDataFrame | None = None
     if req.dirty_from_stage <= STAGE_ASSIGN_RAMPS:
-        patch_df = _assign_curb_ramp_geometries(
-            patch_df,
-            _precomputed_hulls=hulls_data,
-        )
+        patch_df, hulls = step_12_curb_ramps_and_hulls(patch_df, run_config)
+        hulls = step_13_merge_hulls(hulls, run_config)
+        if req.dirty_from_stage <= STAGE_BUILD_HULLS:
+            stages_run.append(STAGE_BUILD_HULLS)
         stages_run.append(STAGE_ASSIGN_RAMPS)
 
     if req.dirty_from_stage <= STAGE_CREATE_XWALKS:
-        patch_df, _ = _create_crosswalk_geometries(
-            patch_df,
-            _precomputed_hulls=hulls_data,
+        if hulls is None:
+            patch_df, hulls = step_12_curb_ramps_and_hulls(patch_df, run_config)
+            hulls = step_13_merge_hulls(hulls, run_config)
+        patch_df = step_14_crosswalk_slots(patch_df, hulls, run_config)
+        patch_df = step_15_crosswalk_geometries(
+            patch_df, hulls, _EMPTY_CROSSWALK_CACHE, run_config,
         )
         stages_run.append(STAGE_CREATE_XWALKS)
 

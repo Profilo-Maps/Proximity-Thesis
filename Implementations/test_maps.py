@@ -9,6 +9,7 @@ import numpy as np
 
 from tqdm import tqdm
 
+import geopandas as gpd
 import pandas as pd
 import folium
 from pyproj import Transformer
@@ -16,7 +17,17 @@ import shapely
 from shapely import wkt
 from shapely.geometry import shape, box, Point, LineString, MultiLineString, MultiPoint, MultiPolygon, Polygon
 from shapely.geometry.base import BaseGeometry
-from ProximityModel import _build_intersection_hulls
+from ProximityModel import (
+    PipelineConfig as _PipelineConfig,
+    step_12_curb_ramps_and_hulls as _step_12,
+    step_13_merge_hulls as _step_13,
+    step_14_crosswalk_slots as _step_14,
+)
+
+_DEFAULT_PIPELINE_CONFIG = _PipelineConfig(
+    place_name="test_maps",
+    output_path="",
+)
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
 OUTPUT_DIR = "Output/test_maps"
@@ -46,22 +57,23 @@ LOCATIONS = [
         "bbox_m": 750,
         "parquet": "Output/San_Francisco_County_California_USA_network.parquet",
     },
-    {
-        "name":   "alameda_test_map",
-        "lat":    37 + 52/60 + 16.4/3600,      # 37°52'16.4"N
-        "lon":    -(122 + 16/60 + 4.8/3600),    # 122°16'04.8"W
-        "zoom":   19,
-        "bbox_m": 750,
-        "parquet": "Output/Alameda_County_California_USA_network.parquet",
-    },
-    {
-        "name":   "alameda_ashby",
-        "lat":    37 + 50/60 + 49.5/3600,      # 37°50'49.5"N
-        "lon":    -(122 + 16/60 + 18.8/3600),   # 122°16'18.8"W
-        "zoom":   19,
-        "bbox_m": 750,
-        "parquet": "Output/Alameda_County_California_USA_network.parquet",
-    },
+    # TODO: re-enable when Alameda parquet is ready
+    # {
+    #     "name":   "alameda_test_map",
+    #     "lat":    37 + 52/60 + 16.4/3600,      # 37°52'16.4"N
+    #     "lon":    -(122 + 16/60 + 4.8/3600),    # 122°16'04.8"W
+    #     "zoom":   19,
+    #     "bbox_m": 750,
+    #     "parquet": "Output/Alameda_County_California_USA_network.parquet",
+    # },
+    # {
+    #     "name":   "alameda_ashby",
+    #     "lat":    37 + 50/60 + 49.5/3600,      # 37°50'49.5"N
+    #     "lon":    -(122 + 16/60 + 18.8/3600),   # 122°16'18.8"W
+    #     "zoom":   19,
+    #     "bbox_m": 750,
+    #     "parquet": "Output/Alameda_County_California_USA_network.parquet",
+    # },
 ]
 
 # ── COORDINATE TRANSFORMERS ────────────────────────────────────────────────────
@@ -136,8 +148,8 @@ def parse_geom(val) -> BaseGeometry | None:
 
 
 def _utm_to_latlon(x, y):
-    lon, lat = _to_wgs.transform(x, y)
-    return [lat, lon]
+    """Return [lat, lon] from a WGS84 point (x=lon, y=lat)."""
+    return [y, x]
 
 
 def parse_geom_series(series: pd.Series) -> pd.Series:
@@ -180,30 +192,20 @@ def parse_geom_series(series: pd.Series) -> pd.Series:
 
 
 def geom_to_latlons(geom: BaseGeometry | None) -> list[list[float]]:
-    """Batch-transform all coords of a LineString/MultiLineString (UTM → WGS84).
-
-    Uses a single pyproj array call per geometry instead of one call per point.
-    """
+    """Extract [[lat, lon], ...] pairs from a WGS84 LineString/MultiLineString."""
     if geom is None:
         return []
     if isinstance(geom, LineString):
-        arr = np.array(geom.coords)
-    elif isinstance(geom, MultiLineString):
-        arr = np.vstack([np.array(line.coords) for line in geom.geoms])
-    else:
-        return []
-    if not len(arr):
-        return []
-    lons, lats = _to_wgs.transform(arr[:, 0], arr[:, 1])
-    return [[lat, lon] for lat, lon in zip(lats, lons)]
+        return [[lat, lon] for lon, lat in geom.coords]
+    if isinstance(geom, MultiLineString):
+        return [[lat, lon] for line in geom.geoms for lon, lat in line.coords]
+    return []
 
 
 def polygon_exterior_latlons(poly: BaseGeometry) -> list[list[float]]:
-    """Convert a UTM Polygon exterior ring to WGS84 [[lat, lon], ...] pairs."""
+    """Return [[lat, lon], ...] from a WGS84 Polygon exterior ring."""
     if isinstance(poly, Polygon) and not poly.is_empty:
-        arr = np.array(poly.exterior.coords)
-        lons, lats = _to_wgs.transform(arr[:, 0], arr[:, 1])
-        return [[lat, lon] for lat, lon in zip(lats, lons)]
+        return [[lat, lon] for lon, lat in poly.exterior.coords]
     return []
 
 
@@ -330,11 +332,11 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
 
     Returns the path to the saved HTML file.
     """
-    # -- bounding box in UTM, degrees for rectangle drawing
-    cx, cy  = _to_utm.transform(center_lon, center_lat)
-    bbox    = box(cx - bbox_m, cy - bbox_m, cx + bbox_m, cy + bbox_m)
+    # -- bounding box in WGS84 degrees (geometries are EPSG:4326)
     lat_deg = bbox_m / 111320
     lon_deg = bbox_m / (111320 * math.cos(math.radians(center_lat)))
+    bbox    = box(center_lon - lon_deg, center_lat - lat_deg,
+                  center_lon + lon_deg, center_lat + lat_deg)
 
     def in_bbox(geom):
         return geom is not None and bbox.intersects(geom)
@@ -484,89 +486,68 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
 
         # ── Stage 3.5: intersection hulls and crosswalk slots ─────────────────
         pbar.set_description(f'{output_name} · hulls & slots')
-        _hull_geom_map = {
-            col: f'_p_{col}' for col in
-            ('start_node_geometry', 'end_node_geometry',
-             'sidewalk_left_geometry', 'sidewalk_right_geometry')
-        }
-        _hull_attr_cols = [
-            'start_node_is_intersection_node', 'end_node_is_intersection_node',
-            'lanes', 'lane_width',
-            'bikeway_left_1_width', 'bikeway_left_1_type',
-            'bikeway_left_2_width', 'bikeway_left_2_type',
-            'bikeway_right_1_width', 'bikeway_right_1_type',
-            'bikeway_right_2_width', 'bikeway_right_2_type',
+
+        # Build a minimal GeoDataFrame for step_12/13/14 from pre-parsed cols
+        _hull_geom_cols = [
+            'start_node_geometry', 'end_node_geometry',
+            'sidewalk_left_geometry', 'sidewalk_right_geometry',
+            *[f'sidewalk_{s}_curbramp_{p}_{n}_geometry'
+              for s in ('left', 'right') for p in ('start', 'end') for n in (1, 2, 3)]
         ]
-        _hull_df = pd.DataFrame(index=data.index)
-        for _orig, _parsed in _hull_geom_map.items():
-            _hull_df[_orig] = data[_parsed] if _parsed in data.columns else None
-        for _ac in _hull_attr_cols:
-            if _ac in data.columns:
-                _hull_df[_ac] = data[_ac]
+        _hull_attr_cols = [
+            'start_node_id', 'end_node_id',
+            'start_node_is_intersection_node', 'end_node_is_intersection_node',
+            'name',
+        ]
+        _hull_df = gpd.GeoDataFrame(index=data.index, geometry=data['_street_geom'], crs='EPSG:4326')
+        _hull_df['street_geometry'] = data['_street_geom']
+        for _col in _hull_geom_cols:
+            _parsed = f'_p_{_col}'
+            _hull_df[_col] = data[_parsed] if _parsed in data.columns else None
+        for _col in _hull_attr_cols:
+            if _col in data.columns:
+                _hull_df[_col] = data[_col]
+        _, _hulls_gdf = _step_12(_hull_df, _DEFAULT_PIPELINE_CONFIG)
+        _hulls_gdf = _step_13(_hulls_gdf, _DEFAULT_PIPELINE_CONFIG)
+        _step_14(_hull_df, _hulls_gdf, _DEFAULT_PIPELINE_CONFIG)
+        _slot_list = _hulls_gdf.attrs.get('crosswalk_slots', [])
 
-        _node_to_segs, _node_key_to_pt, _int_hulls = _build_intersection_hulls(
-            _hull_df, default_lane_width_m, hull_fallback_r  # type: ignore[arg-type]
-        )
+        # Render hull polygons (amber, translucent) — hulls are WGS84 (lon, lat)
+        for _hrow in _hulls_gdf.itertuples():
+            _hull_geom = _hrow.geometry
+            if not in_bbox(_hull_geom):
+                continue
+            if isinstance(_hull_geom, Polygon):
+                _hcoords = [[c[1], c[0]] for c in _hull_geom.exterior.coords]
+                if _hcoords:
+                    _clon, _clat = _hull_geom.centroid.x, _hull_geom.centroid.y
+                    folium.Polygon(
+                        locations=_hcoords,
+                        color='#b45309', weight=1.5, opacity=0.8,
+                        fill=True, fill_color='#fbbf24', fill_opacity=0.15,
+                        tooltip=f"Intersection hull ({_clon:.5f}, {_clat:.5f})",
+                    ).add_to(fg_hulls)
+                    counts['hull'] += 1
 
-        # Render hull polygons (amber, translucent)
-        for _hk, _hull_poly in _int_hulls.items():
-            if not in_bbox(_hull_poly):
+        # Render crosswalk slot zones (cyan, translucent) — slots are WGS84
+        for _slot in _slot_list:
+            _slot_poly = _slot.get('slot_geom')
+            if not isinstance(_slot_poly, (Polygon, MultiPolygon)):
                 continue
-            _hcoords = polygon_exterior_latlons(_hull_poly)
-            if _hcoords:
-                folium.Polygon(
-                    locations=_hcoords,
-                    color='#b45309', weight=1.5, opacity=0.8,
-                    fill=True, fill_color='#fbbf24', fill_opacity=0.15,
-                    tooltip=f"Intersection hull ({_hk[0]:.1f}, {_hk[1]:.1f})",
-                ).add_to(fg_hulls)
-                counts['hull'] += 1
-
-        # Compute and render crosswalk slot zones (cyan, translucent)
-        for _nk, _conns in _node_to_segs.items():
-            if len(_conns) <= 1:
+            if not in_bbox(_slot_poly):
                 continue
-            _np = _node_key_to_pt.get(_nk)
-            _hp = _int_hulls.get(_nk)
-            if _np is None or _hp is None:
+            if not isinstance(_slot_poly, Polygon):
                 continue
-            for _sr, _sp in _conns:
-                _far_col = 'end_node_geometry' if _sp == 'start' else 'start_node_geometry'
-                if _far_col not in _hull_df.columns:
-                    continue
-                _fg = _hull_df.at[_sr, _far_col]
-                if not isinstance(_fg, BaseGeometry) or _fg.is_empty:
-                    continue
-                _fp = cast(Point, _fg)
-                _dx, _dy = _fp.x - _np.x, _fp.y - _np.y
-                _ad = (_dx * _dx + _dy * _dy) ** 0.5
-                if _ad < 1e-6:
-                    continue
-                _ux, _uy = _dx / _ad, _dy / _ad
-                _px2, _py2 = -_uy, _ux
-                _shw = default_lane_width_m / 2.0
-                _r = hull_fallback_r
-                _cx2, _cy2 = _np.x, _np.y
-                _rect = Polygon([
-                    (_cx2 + _ux * _shw + _px2 * _r, _cy2 + _uy * _shw + _py2 * _r),
-                    (_cx2 + _ux * _shw - _px2 * _r, _cy2 + _uy * _shw - _py2 * _r),
-                    (_cx2 - _ux * _shw - _px2 * _r, _cy2 - _uy * _shw - _py2 * _r),
-                    (_cx2 - _ux * _shw + _px2 * _r, _cy2 - _uy * _shw + _py2 * _r),
-                ])
-                _zone = _rect.intersection(_hp)
-                if _zone.is_empty or not in_bbox(_zone):
-                    continue
-                _zcoords = polygon_exterior_latlons(_zone)
-                if not _zcoords:
-                    continue
-                _st_name = str(data.at[_sr, 'name']) if 'name' in data.columns else ''
-                folium.Polygon(
-                    locations=_zcoords,
-                    color='#0891b2', weight=1.5, opacity=0.8,
-                    fill=True, fill_color='#7dd3fc', fill_opacity=0.2,
-                    tooltip=f"Crosswalk slot ({_sp}): {_st_name or '(unnamed)'}",
-                ).add_to(fg_slots)
-                counts['slot'] += 1
+            _zcoords = [[c[1], c[0]] for c in _slot_poly.exterior.coords]
+            if not _zcoords:
+                continue
+            folium.Polygon(
+                locations=_zcoords,
+                color='#0891b2', weight=1.5, opacity=0.8,
+                fill=True, fill_color='#7dd3fc', fill_opacity=0.2,
+                tooltip="Crosswalk slot",
+            ).add_to(fg_slots)
+            counts['slot'] += 1
         pbar.update(1)
 
         # ── Stage 4: pre-parse feature list columns ───────────────────────────
@@ -2080,101 +2061,65 @@ def generate_county_map(parquet_path: str, data: pd.DataFrame, output_name: str 
         http://localhost:8080/test_maps/<output_name>.html
     """
     # ── Pre-compute intersection hulls and crosswalk slot zones ─────────────────
-    _default_lw = 3.5
-    _hull_r     = 15.0
-    _hull_attr_cols = [
-        'start_node_is_intersection_node', 'end_node_is_intersection_node',
-        'lanes', 'lane_width',
-        'bikeway_left_1_width', 'bikeway_left_1_type',
-        'bikeway_left_2_width', 'bikeway_left_2_type',
-        'bikeway_right_1_width', 'bikeway_right_1_type',
-        'bikeway_right_2_width', 'bikeway_right_2_type',
+    _hull_geom_cols_county = [
+        'start_node_geometry', 'end_node_geometry',
+        'sidewalk_left_geometry', 'sidewalk_right_geometry',
+        *[f'sidewalk_{s}_curbramp_{p}_{n}_geometry'
+          for s in ('left', 'right') for p in ('start', 'end') for n in (1, 2, 3)]
     ]
-    _hull_df = pd.DataFrame(index=data.index)
-    for _col in ('start_node_geometry', 'end_node_geometry',
-                 'sidewalk_left_geometry', 'sidewalk_right_geometry'):
+    _hull_attr_cols_county = [
+        'start_node_id', 'end_node_id',
+        'start_node_is_intersection_node', 'end_node_is_intersection_node',
+        'name',
+    ]
+    _hull_street_geom = parse_geom_series(data['street_geometry']) if 'street_geometry' in data.columns else gpd.GeoSeries(index=data.index, dtype=object)
+    _hull_df = gpd.GeoDataFrame(index=data.index, geometry=_hull_street_geom, crs='EPSG:4326')
+    _hull_df['street_geometry'] = _hull_street_geom
+    for _col in _hull_geom_cols_county:
         if _col in data.columns:
             _hull_df[_col] = parse_geom_series(data[_col])
-    for _col in _hull_attr_cols:
+    for _col in _hull_attr_cols_county:
         if _col in data.columns:
             _hull_df[_col] = data[_col]
 
-    _node_to_segs, _node_key_to_pt, _int_hulls = _build_intersection_hulls(
-        _hull_df, _default_lw, _hull_r  # type: ignore[arg-type]
-    )
+    _, _hulls_gdf = _step_12(_hull_df, _DEFAULT_PIPELINE_CONFIG)
+    _hulls_gdf = _step_13(_hulls_gdf, _DEFAULT_PIPELINE_CONFIG)
+    _step_14(_hull_df, _hulls_gdf, _DEFAULT_PIPELINE_CONFIG)
+    _slot_list = _hulls_gdf.attrs.get('crosswalk_slots', [])
 
-    def _poly_to_ring(poly: BaseGeometry) -> list | None:
-        """UTM Polygon → WGS84 [[lon, lat], ...] exterior ring, or None."""
+    def _wgs_poly_to_ring(poly: BaseGeometry) -> list | None:
+        """WGS84 Polygon → [[lon, lat], ...] exterior ring for GeoJSON, or None."""
         if poly is None or poly.is_empty:
             return None
         if hasattr(poly, 'geoms'):
             poly = max(poly.geoms, key=lambda p: p.area)  # type: ignore[attr-defined]
-        try:
-            return [list(_to_wgs.transform(x, y)) for x, y in poly.exterior.coords]  # type: ignore[union-attr]
-        except Exception:
+        if not hasattr(poly, 'exterior'):
             return None
+        return [[x, y] for x, y in poly.exterior.coords]  # type: ignore[union-attr]
 
     hull_features: list[dict] = []
-    for _hk, _hp in _int_hulls.items():
-        _ring = _poly_to_ring(_hp)
+    for _hrow in _hulls_gdf.itertuples():
+        _geom = cast(BaseGeometry, _hrow.geometry)
+        _ring = _wgs_poly_to_ring(_geom)
         if _ring:
+            _clon, _clat = _geom.centroid.x, _geom.centroid.y
             hull_features.append({
                 'type': 'Feature',
                 'geometry': {'type': 'Polygon', 'coordinates': [_ring]},
-                'properties': {'tip': f'Hull ({_hk[0]:.0f}, {_hk[1]:.0f})'},
+                'properties': {'tip': f'Hull ({_clon:.5f}, {_clat:.5f})'},
             })
 
     slot_features: list[dict] = []
-    for _nk, _conns in _node_to_segs.items():
-        if len(_conns) <= 1:
+    for _slot in _slot_list:
+        _slot_poly = _slot.get('slot_geom')
+        _ring = _wgs_poly_to_ring(_slot_poly)
+        if not _ring:
             continue
-        _np  = _node_key_to_pt.get(_nk)
-        _hp  = _int_hulls.get(_nk)
-        if _np is None or _hp is None:
-            continue
-        for _sr, _sp in _conns:
-            _far_col = 'end_node_geometry' if _sp == 'start' else 'start_node_geometry'
-            if _far_col not in _hull_df.columns:
-                continue
-            _fg = _hull_df.at[_sr, _far_col]
-            if not isinstance(_fg, BaseGeometry) or _fg.is_empty:
-                continue
-            _fp   = cast(Point, _fg)
-            _dx, _dy = _fp.x - _np.x, _fp.y - _np.y
-            _ad  = (_dx * _dx + _dy * _dy) ** 0.5
-            if _ad < 1e-6:
-                continue
-            _ux, _uy = _dx / _ad, _dy / _ad
-            _px2, _py2 = -_uy, _ux
-            _shw = _default_lw / 2.0
-            # Center slot at hull-boundary exit point (ring pattern)
-            _arm_ray = LineString([(_np.x, _np.y), (_np.x + _ux * _hull_r * 4, _np.y + _uy * _hull_r * 4)])
-            _bnd_i = _arm_ray.intersection(_hp.boundary)
-            if _bnd_i.is_empty:
-                _scx, _scy = _np.x, _np.y
-            elif _bnd_i.geom_type == 'MultiPoint':
-                _bpt = max(cast(MultiPoint, _bnd_i).geoms, key=lambda p: p.distance(_np))
-                _scx, _scy = cast(Point, _bpt).x, cast(Point, _bpt).y
-            else:
-                _scx, _scy = cast(Point, _bnd_i).x, cast(Point, _bnd_i).y
-            _rect = Polygon([
-                (_scx + _ux * _shw + _px2 * _hull_r, _scy + _uy * _shw + _py2 * _hull_r),
-                (_scx + _ux * _shw - _px2 * _hull_r, _scy + _uy * _shw - _py2 * _hull_r),
-                (_scx - _ux * _shw - _px2 * _hull_r, _scy - _uy * _shw - _py2 * _hull_r),
-                (_scx - _ux * _shw + _px2 * _hull_r, _scy - _uy * _shw + _py2 * _hull_r),
-            ])
-            _zone = _rect.intersection(_hp)
-            if _zone.is_empty:
-                continue
-            _ring = _poly_to_ring(_zone)
-            if not _ring:
-                continue
-            _name = str(data.at[_sr, 'name']) if 'name' in data.columns else ''
-            slot_features.append({
-                'type': 'Feature',
-                'geometry': {'type': 'Polygon', 'coordinates': [_ring]},
-                'properties': {'tip': f'Slot ({_sp}): {_name or "(unnamed)"}'},
-            })
+        slot_features.append({
+            'type': 'Feature',
+            'geometry': {'type': 'Polygon', 'coordinates': [_ring]},
+            'properties': {'tip': 'Crosswalk slot'},
+        })
 
     hull_json = json.dumps({'type': 'FeatureCollection', 'features': hull_features})
     slot_json = json.dumps({'type': 'FeatureCollection', 'features': slot_features})

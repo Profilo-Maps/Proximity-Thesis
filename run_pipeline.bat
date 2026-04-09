@@ -7,19 +7,9 @@ echo Proximity Model Pipeline Runner
 echo ================================================================================
 echo.
 
-REM Activate conda environment
-call conda activate ParkximityENV
-
-REM Check if activation was successful
-if errorlevel 1 (
-    echo ERROR: Failed to activate ParkximityENV conda environment
-    echo Please ensure the environment exists and conda is properly configured
-    pause
-    exit /b 1
-)
-
-REM Get the directory where this batch file is located
+REM Get the directory where this batch file is located and cd into it
 set SCRIPT_DIR=%~dp0
+cd /d "%SCRIPT_DIR%"
 
 REM Record pipeline start time
 set PIPELINE_START=%time%
@@ -29,7 +19,7 @@ echo ===========================================================================
 echo.
 
 set PHASE_START=%time%
-python "%SCRIPT_DIR%Implementations\ProximityModel.py"
+uv run python "%SCRIPT_DIR%Implementations\ProximityModel.py"
 
 if errorlevel 1 (
     echo.
@@ -50,7 +40,13 @@ echo Proceeding to test maps...
 echo.
 
 set PHASE_START=%time%
-python "%SCRIPT_DIR%Implementations\test_maps.py"
+if not exist "%SCRIPT_DIR%Implementations\test_maps.py" (
+    echo ERROR: test_maps.py not found at %SCRIPT_DIR%Implementations\test_maps.py
+    dir "%SCRIPT_DIR%Implementations\"
+    pause
+    exit /b 1
+)
+uv run python "%SCRIPT_DIR%Implementations\test_maps.py"
 
 if errorlevel 1 (
     echo.
@@ -74,6 +70,18 @@ echo Pipeline Complete!  Total runtime: %DURATION%
 echo ================================================================================
 echo.
 echo Test maps are in: %SCRIPT_DIR%Output\test_maps\
+echo.
+
+echo Launching county editor server on http://localhost:8081 ...
+echo ================================================================================
+start "Proximity Editor Server" cmd /k "cd /d "%SCRIPT_DIR%" && uv run uvicorn Implementations.editor_server:app --reload --port 8081"
+
+REM Give the server a moment to start before opening the browser
+timeout /t 2 /nobreak >nul
+start "" "http://localhost:8081"
+
+echo Editor server is running in a separate window.
+echo Close that window to stop the server.
 echo.
 pause
 exit /b 0

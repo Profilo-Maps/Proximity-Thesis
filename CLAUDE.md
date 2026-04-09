@@ -1,32 +1,21 @@
 # Project Architecture & Rules
 You are a senior developer helping me implement this feature of a larger project. Proximity is a graph network exported as a parquet built on OSM and government data. It will be used for network analysis and data crowdsourcing by other applications. 
 
-
 **Path to Python:** `C:/Dev/Proximity/.venv/Scripts/python.exe`
 **Run commands with:** `uv run python` (from project root)
 
-**Spec Checking Strategy:** Before implementing a feature, check the specs folder for guidance.
+## Planning: Uncertainty Protocol
+ALWAYS ask questions before writing code. These questions should be used to highlight design decisions that are ambiguously justified by logic or that are matters of taste.When recommending approaches, order them by complexity of implementation. DO NOT use the superpowers:writing-plans skill, start implementing after a design is approved. After a feature is implemented, check the /docs folder for intermediate implementation docs and consolidate them to the readme.md.
 
-**Uncertainty Strategy:** ALWAYS ask questions before writing code. These questions should be used to highlight design decisions that are ambiguously justified by logic or that are matters of taste.When recommending approaches, order them by complexity of implementation.
+## Debugging: Correction History Protocol
+WHENEVER THE USER ASKS YOU TO DIAGNOSE AN ISSUE AT AN INTERSECTION, create a script in `/notesforrobot/<subfolder>/` — existing feature → existing folder; new feature → new folder added here: `sidewalk_matching/`, `curb_ramp_assignment/`, `crosswalk_geometry/`, `snapping_endpoint_alignment/`, `roundabout_handling/`, `street_geometry/`.
 
-## Correction History Protocol
-WHENEVER you create a diagnostic script, document the script with comments on the error and the solution in the /notesforrobot folder. ALSO document the problem solving process you used to revise a diagnostic script that led to the optimal solution being uncovered. MAKE SURE to discuss which user prompts were most useful in uncovering the solution.
+Update the script's `ANNOTATION` docstring **as the investigation progresses**, not retrospectively. Sections: error investigated · informed change · schema context · key prompts (quote the exact phrase that reoriented reasoning and explain why) · crosswalk design impact if intersection-related. Update the subfolder `INDEX.md` when adding a script.
 
-**Plan Document Etiquette:** DO NOT use the superpowers:writing-plans skill, start implementing after a design is approved. After a feature is implemented, check the /docs folder for intermediate implementation docs and consolidate them to the readme.md.
+## Post-Implementation/Debugging: Optimization Protocol
+After implementing a new feature or sucessfully debugging, always verify that the code is vectorized and optimized to work efficiently on large datasets. ONLY implement low level vectorizations that are safe and do not touch underlying logic (ex. simplifying expensive loops).
 
 ## Critical Constraints
 - Do NOT generate new specs or documentation; I provide hand authored specs. Update the readme for new features.
-- Maintain strict type safety across all module boundaries. Use Pyright to typecheck after implementing a feature.
-
-## Typechecking
-Use the integrated VS Code Pylance extension for type checking.
-
-## Package Management
-ALWAYS USE UV FOR LIBRARY AND ENVIRONMENT MANAGEMENT
-uv init: Create a new Python project.
-uv add: Add a dependency to the project.
-uv remove: Remove a dependency from the project.
-uv sync: Sync the project's dependencies with the environment.
-uv lock: Create a lockfile for the project's dependencies.
-uv run: Run a command in the project environment.
+- Maintain strict type safety across all module boundaries.
 
