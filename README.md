@@ -9,14 +9,16 @@ Processes OpenStreetMap data to generate per-city street network GeoParquet file
 | File | Role |
 |---|---|
 | `Implementations/ProximityModel.py` | Main pipeline (15 steps, 3 phases) |
-| `Implementations/editor_server.py` | FastAPI server for the county map editor |
-| `Implementations/county_editor.html` | Interactive county map editor frontend |
 | `Implementations/test_maps.py` | Diagnostic map generation (read-only folium maps) |
-| `run_pipeline.bat` | Full pipeline runner — builds parquet, generates maps, launches editor |
+| `editor/server/editor_server.py` | FastAPI server for the county map editor |
+| `editor/web/` | React + Vite + MapLibre GL frontend |
+| `editor/shared/` | `@proximity/shared` — TypeScript types and utilities shared with RollTracks |
+| `run_pipeline.bat` | Pipeline runner with selectable mode (Full / Pipeline only / Maps only) |
 | `specs/ProximityPipelineOutline.md` | Step-by-step pipeline specification |
 | `specs/ProximitySchema.md` | Full 256-column output schema |
 
 ### Data
+
 - `Output/` — Generated GeoParquet files and map HTML
 - `Implementations/.osm_cache/` — Cached OSMnx graphs and phase checkpoints
 
@@ -24,17 +26,25 @@ Processes OpenStreetMap data to generate per-city street network GeoParquet file
 
 ## Quick Start
 
-### Option A — Full pipeline + editor (Windows)
-
 ```bat
 run_pipeline.bat
 ```
 
-Runs `ProximityModel.py` then `test_maps.py`, then launches the county editor at `http://localhost:8081` automatically.
+Interactive menu — pick one:
 
-### Option B — Pipeline only
+| Key | Mode | What it does |
+|---|---|---|
+| `1` | Full | Pipeline + Test Maps + Editor |
+| `2` | Pipeline only | Run pipeline |
+| `3` | Test Maps | Generate diagnostic folium maps |
+| `4` | Editor only | Launch editor (skip pipeline) |
+
+The editor opens automatically at `http://localhost:5173` with the API server on port 8000.
+
+### Manual launch (CLI)
 
 ```bash
+# Pipeline
 uv run python -c "
 from Implementations.ProximityModel import PipelineConfig, run_pipeline
 cfg = PipelineConfig(
@@ -43,51 +53,167 @@ cfg = PipelineConfig(
 )
 run_pipeline(cfg)
 "
+
+# Test maps (outputs to Output/test_maps/)
+uv run python Implementations/test_maps.py
+
+# Editor (two terminals)
+cd editor/server && uv run uvicorn editor_server:app --reload --port 8000
+cd editor/web && npm run dev
 ```
-
-### Option C — Editor only (parquet already built)
-
-```bash
-uv run uvicorn Implementations.editor_server:app --reload --port 8081
-```
-
-Then open `http://localhost:8081`.
 
 ---
 
 ## County Map Editor
 
-The editor lets you inspect and correct the pipeline output interactively against a live parquet file.
+A browser-based GIS editor for inspecting and correcting pipeline output against a live parquet file. Built with React, MapLibre GL JS (WebGL), Zustand for state management, and a FastAPI backend.
 
-### Edit Modes (toolbar)
+### Architecture
 
-| Mode | Action |
+```
+editor/
+  shared/                     @proximity/shared — types + utils
+    src/types/
+      NetworkSegment.ts       Full 256-column schema as TypeScript interfaces
+      changeset.ts            SaveRequest, Edits, PipelineStage types
+    src/tools/
+      types.ts                MapAdapter, ToolCallbacks, ToolSubtype, SourceMutation
+      toolLogic.ts            Platform-agnostic tool state machines (12 tools)
+      geometry.ts             Pure math: point projection, nearest-on-line
+      index.ts                Barrel export
+    src/utils/
+      SegmentSpatialGrid.ts   Degree-based spatial grid with haversine queries
+      wkbToGeoJSON.ts         WKB hex → GeoJSON decoder
+      utmToWgs84.ts           UTM Zone 10N → WGS84 projection
+
+  web/                        React + Vite frontend
+    src/
+      api/editorApi.ts        Typed API client for FastAPI endpoints
+      store/
+        editorStore.ts        App state (tools, subtypes, selection, layers, viewport)
+        changesetStore.ts     Edit accumulation with localStorage persistence
+      components/
+        MapView.tsx           MapLibre GL map with 15 layers + edit overlays
+        ToolBar.tsx           12 edit tools grouped by Point/Line/Poly
+        SubtypeSelector.tsx   Floating subtype popover for creation tools
+        panels/
+          ProbePanel.tsx      Radius-based feature inspection
+          HistoryPanel.tsx    Chronological edit log with undo + save
+          AttributeTable.tsx  Bottom strip with inline cell editing
+          LayersPanel.tsx     Layer visibility toggles
+          SearchPanel.tsx     Segment/node ID search
+          ConfigPanel.tsx     Pipeline config editor (global/city)
+      hooks/
+        useMapLayers.ts       Layer definitions + colors
+        useToolHandler.ts     Tool → map interaction wiring (passes subtype)
+        useVertexDrag.ts      Click-drag vertex editing with real-time GeoJSON mutation
+        mapLibreAdapter.ts    Web-specific MapAdapter implementation
+
+  server/
+    editor_server.py          FastAPI backend (parquet I/O, pipeline re-runs)
+```
+
+### Shared Package
+
+`editor/shared/` (`@proximity/shared`) provides TypeScript types and utilities shared between the web editor and the [RollTracks](https://github.com/your-org/rolltracks) React Native mobile app. The mobile app's DataRanger service consumes the same `NetworkSegment` types and spatial utilities.
+
+Install via file reference: `"@proximity/shared": "file:../shared"`.
+
+### UI Layout
+
+```
+┌──────────────────────────────────────────────────────┐
+│ Toolbar │  Map (MapLibre GL)              │ Probe     │
+│  (left) │                                │ History   │
+│         │         [Layers panel]          │  (right)  │
+├─────────┴────────────────────────────────┴───────────┤
+│ Attribute Table strip  [pop-out ↗]                   │
+└──────────────────────────────────────────────────────┘
+```
+
+- **Left toolbar** — vertical icon bar with 14 edit tools organized by type (Point, Segment, Polygon)
+- **Probe panel** (top-right) — radius-based feature inspection with visibility toggles
+- **History panel** (bottom-right) — pending changeset entries with save/discard
+- **Layers panel** (bottom-left, dockable) — per-layer visibility toggles
+- **Attribute table** (bottom strip) — expandable table with inline cell editing
+- **Config panel** (slide-out) — Global and City tabs for `PipelineConfig` values
+- **Search panel** (slide-out) — fly to segments or nodes by ID
+
+### Edit Tools
+
+| Group | Tool | Action |
+|---|---|---|
+| **Point** | Move Point | Click-drag any point or line vertex (nodes, ramps, calming, street/bikeway/sidewalk vertices); endpoints highlighted |
+| | Snap Point | Snap node to nearest segment |
+| | Add Node | Place new point (subtype selector: node / ramp / calm) |
+| | Delete Point | Remove point (works on all point types: nodes, curb ramps, calming points) |
+| **Segment** | Merge Segments | Join two connected segments (earlier grid ID survives) |
+| | Split Segment | Split segment at click point |
+| | Draw Segment | Draw new line (subtype selector: street / bikeway / sidewalk / crosswalk / curb return) |
+| | Draw Crosswalk | Connect two curb ramps |
+| **Polygon** | Add Polygon | Draw new polygon (subtype selector: hull / slot) |
+| | Delete Polygon | Remove hull polygon (marks node as non-intersection) |
+| | Edit Polygon Face | Drag hull vertices |
+
+### Feature Subtypes
+
+Tools that create new features (Add Node, Draw Segment, Add Polygon) show a floating subtype selector when active. This determines what type of feature is placed:
+
+| Tool | Subtypes | Notes |
+|---|---|---|
+| **Add Node** | `node` (intersection), `ramp` (curb ramp), `calm` (traffic calming) | Ramp subtype: tap a sidewalk first, then click to place the ramp at that position |
+| **Draw Segment** | `street`, `bikeway`, `sidewalk`, `crosswalk`, `curb_return` | Sets the feature `_t` property and layer color |
+| **Add Polygon** | `hull` (intersection hull), `slot` (crosswalk slot) | |
+
+### Point Feature Types
+
+The network contains three point feature types:
+
+| Type | `_t` value | Description | Layer |
+|---|---|---|---|
+| Intersection node | `node` | Street network intersection point | `px-nodes` (zoom ≥ 17) |
+| Curb ramp | `ramp` | Accessible ramp at sidewalk endpoint | `px-ramps` (zoom ≥ 18) |
+| Traffic calming | `calm` | Speed bump, chicane, or other calming feature | `px-calming` (zoom ≥ 15) |
+
+Feature highlighting (selection) is done via probe panel click or direct map click — no separate toolbar tool needed.
+
+### Real-time Editing
+
+All edits mutate the GeoJSON source in-place for immediate visual feedback:
+- **Vertex drag** — line vertices (streets, bikeways, sidewalks) are extracted into a separate draggable points layer with endpoint highlighting
+- **Add/delete** — features are added to or removed from the main source instantly
+- **Undo** — Ctrl+Z reverts both the changeset and the map state via JSON snapshots
+- **Confirm** — Enter key confirms multi-step tools (draw segment, add polygon, edit polygon face)
+
+### Server Endpoints
+
+| Endpoint | Description |
 |---|---|
-| **+ Node** | Click to place a new intersection node |
-| **Crosswalk** | Click two curb ramps to draw a crosswalk between them |
-| **Move** | Drag a segment endpoint; select which segments rubber-band with it |
-
-### Context Menus
-
-- **Right-click intersection node** — Consolidate hulls: merges selected nodes into a single hull zone, using an adaptive buffer based on the gap between hull edges
-- **Right-click curb ramp** — Enable / disable the ramp
+| `GET /features/{parquet}` | GeoJSON features filtered by bbox + zoom tier |
+| `GET /rows/{parquet}` | Attribute table rows (no geometry) |
+| `GET /hulls/{parquet}` | Hull polygons + crosswalk slots for bbox |
+| `GET /config/{parquet}` | Pipeline config field definitions + overrides |
+| `POST /config/{parquet}` | Update global or city config overrides |
+| `POST /save` | Apply changeset, re-run pipeline stages, write parquet |
 
 ### Save & Pipeline Re-run
 
-Edits are staged in the changeset panel (persisted in `localStorage`). Clicking **Save** sends the changeset to the server, which:
+Edits accumulate in the changeset store (persisted to `localStorage`). On save, the server:
 
-1. Applies direct edits to the in-memory GeoDataFrame
-2. Determines the earliest affected pipeline stage
-3. Re-runs only the affected stages on the rows within the edit bounding box
-4. Writes the result back to the parquet file
+1. Filters rows within the edit bounding box (± 20m buffer)
+2. Applies direct edits to the in-memory GeoDataFrame
+3. Re-runs affected pipeline stages on filtered rows
+4. Writes the updated parquet file
 
 **Stage → Step mapping:**
 
-| Stage | Steps re-run |
-|---|---|
-| `SNAP_ENDPOINTS` | `step_10` |
-| `BUILD_HULLS` + `ASSIGN_RAMPS` | `step_12`, `step_13` |
-| `CREATE_CROSSWALKS` | `step_14`, `step_15` |
+| Stage | Index | Steps re-run | Triggered by |
+|---|---|---|---|
+| `SNAP_ENDPOINTS` | 0 | `step_10` | Move endpoint, split/merge/draw segment |
+| `BUILD_HULLS` | 1 | `step_12`, `step_13` | Add/delete node, add/delete polygon |
+| `ASSIGN_RAMPS` | 2 | `step_12` ramp phase | Toggle curb ramp, edit hull vertices |
+| `CREATE_XWALKS` | 3 | `step_14`, `step_15` | Draw crosswalk |
+| *(attr-only)* | 99 | none | Attribute table cell edits |
 
 ---
 
@@ -138,29 +264,21 @@ Curb ramps are **inferred geometrically** from sidewalk endpoint positions — n
 
 ### Algorithm (Step 12)
 
-1. **Identify intersection nodes** — segments whose `start_node_is_intersection_node` or `end_node_is_intersection_node` flag is set are collected. A lookup table maps each intersection node ID → list of `(segment_index, "start"|"end")` pairs.
+1. **Identify intersection nodes** — segments whose `start_node_is_intersection_node` or `end_node_is_intersection_node` flag is set are collected.
 
-2. **Collect candidate ramp points** — for every segment arm attached to an intersection node, the endpoint of each populated sidewalk geometry (left and right sides) is extracted:
-   - `which_end == "start"` → first coordinate of the sidewalk LineString
-   - `which_end == "end"` → last coordinate of the sidewalk LineString
-   - Nodes with fewer than 2 candidate points are skipped.
+2. **Collect candidate ramp points** — for every segment arm at an intersection node, the endpoint of each sidewalk geometry (left and right) is extracted.
 
-3. **Pre-snap close pairs** — all candidate points are projected to UTM. Any two points within `curb_ramp_snap_m` (default 1.0 m) are replaced by their midpoint (back-projected to WGS-84). This merges ramp positions where left/right sidewalk endpoints nearly coincide at a tight corner.
+3. **Pre-snap close pairs** — candidate points within `curb_ramp_snap_m` (default 1.0m) are merged to their midpoint.
 
-4. **Write ramp geometry** — each snapped point is stored in the first available slot in the schema columns:
-   ```
-   sidewalk_{left|right}_curbramp_{start|end}_{1|2|3}_geometry
-   sidewalk_{left|right}_curbramp_{start|end}_{1|2|3}_ID
-   ```
-   Up to 3 ramp slots exist per side per endpoint. The slot is filled only if the column is currently null, so manual overrides (from the editor) are preserved on pipeline re-runs.
+4. **Write ramp geometry** — snapped points fill schema slots (`sidewalk_{L|R}_curbramp_{start|end}_{1|2|3}_geometry`). Manual overrides from the editor are preserved on re-runs.
 
-5. **Build intersection hull** — after snapping, the unique ramp points at the node form a convex hull (or a thin buffered line if only 2 unique points remain). This hull becomes the intersection zone used by Steps 13–15.
+5. **Build intersection hull** — unique ramp points form a convex hull used by Steps 13–15.
 
 ### Limitations
 
-- Ramps are placed at sidewalk **endpoints**, so a ramp is only inferred where a sidewalk geometry actually terminates at an intersection. Segments with no mapped sidewalk produce no ramp.
-- The approach cannot distinguish a ramp from a street-level corner where the sidewalk happens to end — it models the *location* of the transition, not whether a physical ramp structure is present.
-- Ramp attributes (surface, slope, tactile paving) are not populated automatically; they require manual enrichment via the county editor.
+- Ramps are only inferred where sidewalk geometry terminates at an intersection.
+- Cannot distinguish a ramp from a street-level corner.
+- Ramp attributes (surface, slope, tactile paving) require manual enrichment via the editor.
 
 ---
 
@@ -216,8 +334,14 @@ All geometry stored as GeoParquet native geometry in **EPSG:4326**. Metric calcu
 
 ## Dependencies
 
+**Python (pipeline + server):**
 ```
 osmnx  geopandas  shapely  pyarrow  pandas  numpy  scipy  pyproj  requests  tqdm  fastapi  uvicorn
 ```
 
-Run with `uv run python` from the project root. Python path: `C:/Dev/Proximity/.venv/Scripts/python.exe`.
+**Node (editor frontend):**
+```
+react  react-dom  maplibre-gl  zustand  @turf/*  vite  typescript
+```
+
+Run pipeline with `uv run python` from project root. Run editor with `npm run dev` from `editor/web/`.

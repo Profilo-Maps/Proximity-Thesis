@@ -38,6 +38,7 @@ from shapely.geometry import (
 )
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import nearest_points, split, snap, linemerge, transform as _shapely_transform
+from shapely import STRtree, intersection as _shapely_intersection, length as _shapely_length
 from scipy.spatial import cKDTree  # type: ignore[attr-defined]
 from tqdm import tqdm
 
@@ -420,6 +421,25 @@ def _flatten_coords(geom: BaseGeometry) -> list[tuple[float, float]]:
     return []
 
 
+def _consolidate_line_geom(geom: BaseGeometry) -> BaseGeometry:
+    """Merge a MultiLineString to a single LineString where possible.
+
+    Borrowed from the old _to_linestring / _sw_linemerge pattern.
+    - Try shapely linemerge (works when parts share endpoints).
+    - If parts are genuinely disconnected, keep only the longest.
+    This cleans up MultiLineStrings produced by offset_curve() on curved
+    roads and by OSMnx edge simplification of separately-mapped footways.
+    """
+    if not isinstance(geom, MultiLineString):
+        return geom
+    merged = linemerge(geom)
+    if isinstance(merged, LineString):
+        return merged
+    # Still fragmented — take the longest contiguous part
+    parts: list[BaseGeometry] = list(merged.geoms) if isinstance(merged, MultiLineString) else [merged]
+    return max(parts, key=lambda g: g.length)
+
+
 def _find_deflection_split_points(
     coords: list[tuple[float, float]], threshold_rad: float,
 ) -> list[int]:
@@ -791,13 +811,17 @@ def step_02_load_streets(
         ms_str = ms_str.str.replace(_sfx, "", regex=False)
     maxspeed_vals = pd.to_numeric(ms_str, errors="coerce").fillna(config.default_maxspeed).astype(np.int64).values
 
-    # Parse lanes
+    # Parse lanes — flatten lists, convert to nullable int
     lanes_raw = _safe_col(edges_reset, "lanes")
-    lanes_vals = [_parse_int_or_none(v) for v in lanes_raw]
+    _lanes_flat = lanes_raw.apply(lambda v: v[0] if isinstance(v, list) else v)
+    lanes_vals = pd.to_numeric(_lanes_flat.astype(str).str.strip(), errors="coerce")
+    lanes_vals = [int(v) if pd.notna(v) else None for v in lanes_vals]
 
-    # Parse lane_width
+    # Parse lane_width — flatten lists, convert to nullable float
     lw_raw = _safe_col(edges_reset, "lane_width")
-    lw_vals = [_parse_float_or_none(v) for v in lw_raw]
+    _lw_flat = lw_raw.apply(lambda v: v[0] if isinstance(v, list) else v)
+    lw_vals = pd.to_numeric(_lw_flat.astype(str).str.strip(), errors="coerce")
+    lw_vals = [float(v) if pd.notna(v) else None for v in lw_vals]
 
     # Stringify osmid (may be int or list of ints from simplification)
     street_ids = edges_reset["osmid"].astype(str).values
@@ -1005,6 +1029,11 @@ def step_04_bearings_and_grid_ids(
     cell = config.grid_cell_size
     origin_x, origin_y = float(xs.min()), float(ys.min())
 
+    # Store grid origin for parquet metadata (used by RollTracks for viewport-based loading)
+    gdf.attrs["grid_origin_x"] = origin_x
+    gdf.attrs["grid_origin_y"] = origin_y
+    gdf.attrs["grid_cell_size"] = cell
+
     # Compute centroid grid cells for each segment
     seg_centroids_utm = utm_geom.centroid
     cx = np.asarray(seg_centroids_utm.x, dtype=np.float64)
@@ -1204,26 +1233,43 @@ def step_06_usgs_elevation(
     syn_end   = gdf["end_node_id"]   < 0
     if syn_start.any() or syn_end.any():
         # Build a coord→elevation lookup from all real-node rows
-        coord_elev: dict[tuple[float, float], float] = {}
         xs = shapely.get_x(first_pts).astype(np.float64)
         ys = shapely.get_y(first_pts).astype(np.float64)
         xe = shapely.get_x(last_pts).astype(np.float64)
         ye = shapely.get_y(last_pts).astype(np.float64)
-        for i, idx in enumerate(gdf.index):
-            if not syn_start.at[idx] and not pd.isna(elev_start.at[idx]):
-                coord_elev[(round(xs[i], 7), round(ys[i], 7))] = float(cast(float, elev_start.at[idx]))
-            if not syn_end.at[idx] and not pd.isna(elev_end.at[idx]):
-                coord_elev[(round(xe[i], 7), round(ye[i], 7))] = float(cast(float, elev_end.at[idx]))
-        # Fill synthetic starts from coord lookup
-        for i, idx in enumerate(gdf.index):
-            if syn_start.at[idx] and pd.isna(elev_start.at[idx]):
-                key = (round(xs[i], 7), round(ys[i], 7))
-                if key in coord_elev:
-                    elev_start.at[idx] = coord_elev[key]
-            if syn_end.at[idx] and pd.isna(elev_end.at[idx]):
-                key = (round(xe[i], 7), round(ye[i], 7))
-                if key in coord_elev:
-                    elev_end.at[idx] = coord_elev[key]
+        # Build coord→elevation from real nodes (vectorized mask + zip)
+        _syn_s = syn_start.values
+        _syn_e = syn_end.values
+        _es = elev_start.values
+        _ee = elev_end.values
+        _real_s = ~_syn_s & ~np.isnan(_es.astype(np.float64))
+        _real_e = ~_syn_e & ~np.isnan(_ee.astype(np.float64))
+        coord_elev: dict[tuple[float, float], float] = {}
+        coord_elev.update(zip(
+            zip(np.round(xs[_real_s], 7), np.round(ys[_real_s], 7)),
+            _es[_real_s].astype(np.float64),
+        ))
+        coord_elev.update(zip(
+            zip(np.round(xe[_real_e], 7), np.round(ye[_real_e], 7)),
+            _ee[_real_e].astype(np.float64),
+        ))
+        # Fill synthetic nodes from coord lookup (vectorized assignment)
+        _fill_s = _syn_s & np.isnan(_es.astype(np.float64))
+        if _fill_s.any():
+            _keys_s = list(zip(np.round(xs[_fill_s], 7), np.round(ys[_fill_s], 7)))
+            _vals_s = pd.array([coord_elev.get(k) for k in _keys_s], dtype="Float64")
+            _idxs_s = gdf.index[_fill_s]
+            _valid_s = pd.notna(_vals_s)
+            if _valid_s.any():
+                elev_start.loc[_idxs_s[_valid_s]] = _vals_s[_valid_s]
+        _fill_e = _syn_e & np.isnan(_ee.astype(np.float64))
+        if _fill_e.any():
+            _keys_e = list(zip(np.round(xe[_fill_e], 7), np.round(ye[_fill_e], 7)))
+            _vals_e = pd.array([coord_elev.get(k) for k in _keys_e], dtype="Float64")
+            _idxs_e = gdf.index[_fill_e]
+            _valid_e = pd.notna(_vals_e)
+            if _valid_e.any():
+                elev_end.loc[_idxs_e[_valid_e]] = _vals_e[_valid_e]
 
     gdf["elev_start_m"] = elev_start
     gdf["elev_end_m"] = elev_end
@@ -1428,6 +1474,8 @@ _ROAD_HW = frozenset({
 })
 _MATCH_RADIUS_M = 30.0
 _PARALLEL_THRESHOLD_DEG = 45.0
+_DEDUP_BUFFER_M = 3.0        # tight buffer for coincidence check
+_DEDUP_COVERAGE_THRESHOLD = 0.80  # fraction of road length that must be covered
 
 
 def step_09_match_separate_facilities(
@@ -1474,6 +1522,7 @@ def step_09_match_separate_facilities(
     foot_used: set[tuple[int, str]] = set()  # (road_idx, side)
     bike_used: set[tuple[int, str, str]] = set()  # (road_idx, side, slot)
     matched_cycle = matched_foot = 0
+    duplicate_to_centerline: dict[int, int] = {}  # dup_road_idx → true_centerline_idx
 
     fac_indices = gdf.index[is_cycleway | is_footway]
     for fac_idx in tqdm(fac_indices, desc="Matching facilities", unit="seg"):
@@ -1494,9 +1543,25 @@ def step_09_match_separate_facilities(
             continue
         fac_bear = math.degrees(math.atan2(fc[-1][0] - fc[0][0], fc[-1][1] - fc[0][1])) % 360
 
+        # For footways, partition candidates into coincident (mistagged road rows whose
+        # geometry nearly traces the footway) and true road candidates. Scoring runs only
+        # on true candidates so a mistagged duplicate is never selected as the parent road.
+        if fac_type == "foot":
+            tight_buf = fac_geom.buffer(_DEDUP_BUFFER_M)
+            cand_geoms = road_geoms_utm.iloc[candidates].values
+            road_lens = _shapely_length(cand_geoms)
+            int_lens = _shapely_length(_shapely_intersection(cand_geoms, tight_buf))
+            coverages = np.where(road_lens > 0, int_lens / road_lens, 0.0)
+            coincident_mask = coverages > _DEDUP_COVERAGE_THRESHOLD
+            coincident_positions = [candidates[i] for i, m in enumerate(coincident_mask) if m]
+            score_positions = [candidates[i] for i, m in enumerate(coincident_mask) if not m]
+        else:
+            coincident_positions = []
+            score_positions = candidates
+
         # Score candidates: prefer name match, bearing parallelism, proximity
         best_road, best_score, best_side = None, float("inf"), "left"
-        for cand_pos in candidates:
+        for cand_pos in score_positions:
             cand_idx = road_idx[cand_pos]
             road_geom = road_geoms_utm.iloc[cand_pos]
             dist = fac_geom.distance(road_geom)
@@ -1536,26 +1601,62 @@ def step_09_match_separate_facilities(
         if best_road is None:
             continue
 
+        # Record coincident road rows as duplicates of the true centerline
+        for cand_pos in coincident_positions:
+            dup_idx = road_idx[cand_pos]
+            if dup_idx not in duplicate_to_centerline:
+                duplicate_to_centerline[dup_idx] = best_road
+
+        # If best_road was already flagged as a duplicate by a prior footway, redirect
+        # the slot assignment to its paired centerline so the geometry isn't lost on drop.
+        assign_road = duplicate_to_centerline.get(best_road, best_road)
+
         # Assign to slot
         fac_wgs_geom = gdf.at[fac_idx, "street_geometry"]
         if fac_type == "foot":
-            if (best_road, best_side) not in foot_used:
-                gdf.at[best_road, f"sidewalk_{best_side}_geometry"] = fac_wgs_geom  # type: ignore[call-overload]
-                gdf.at[best_road, f"sidewalk_{best_side}_quality"] = "separate"
-                gdf.at[best_road, f"sidewalk_{best_side}_offset"] = "no"
-                foot_used.add((best_road, best_side))
+            if (assign_road, best_side) not in foot_used:
+                gdf.at[assign_road, f"sidewalk_{best_side}_geometry"] = fac_wgs_geom  # type: ignore[call-overload]
+                gdf.at[assign_road, f"sidewalk_{best_side}_quality"] = "separate"
+                gdf.at[assign_road, f"sidewalk_{best_side}_offset"] = "no"
+                foot_used.add((assign_road, best_side))
                 matched_foot += 1
         else:
             for slot in ("1", "2"):
-                if (best_road, best_side, slot) not in bike_used:
-                    gdf.at[best_road, f"bikeway_{best_side}_{slot}_geometry"] = fac_wgs_geom  # type: ignore[call-overload]
-                    gdf.at[best_road, f"bikeway_{best_side}_{slot}_quality"] = "separate"
-                    gdf.at[best_road, f"bikeway_{best_side}_{slot}_offset"] = "no"
-                    bike_used.add((best_road, best_side, slot))
+                if (assign_road, best_side, slot) not in bike_used:
+                    gdf.at[assign_road, f"bikeway_{best_side}_{slot}_geometry"] = fac_wgs_geom  # type: ignore[call-overload]
+                    gdf.at[assign_road, f"bikeway_{best_side}_{slot}_quality"] = "separate"
+                    gdf.at[assign_road, f"bikeway_{best_side}_{slot}_offset"] = "no"
+                    bike_used.add((assign_road, best_side, slot))
                     matched_cycle += 1
                     break
 
     log.info("  Matched %d cycleways, %d footways to road slots", matched_cycle, matched_foot)
+
+    # Consolidate sidewalk attributes from mistagged duplicate road rows into their
+    # true centerlines (fill-null only), then drop the duplicates.
+    if duplicate_to_centerline:
+        _sw_consolidate_cols = [
+            f"sidewalk_{side}_{attr}"
+            for side in ("left", "right")
+            for attr in ("presence", "surface", "condition", "width", "incline", "seperator", "geometry")
+        ]
+        existing_cols = [c for c in _sw_consolidate_cols if c in gdf.columns]
+        dup_indices = list(duplicate_to_centerline.keys())
+        dup_df = gdf.loc[dup_indices, existing_cols].copy()
+        dup_df["_center"] = [duplicate_to_centerline[i] for i in dup_indices]
+        # For centers with multiple duplicates, take the first non-null value per column
+        fill_vals = dup_df.groupby("_center")[existing_cols].first()
+        for col in existing_cols:
+            col_fills = fill_vals[col].dropna()
+            if col_fills.empty:
+                continue
+            center_null_mask = pd.isna(gdf.loc[col_fills.index, col])
+            to_update = col_fills.index[center_null_mask]
+            if not to_update.empty:
+                gdf.loc[to_update, col] = col_fills[to_update]  # type: ignore[call-overload]
+        gdf = gdf.drop(index=dup_indices)
+        log.info("  Removed %d mistagged street rows coinciding with sidewalk segments",
+                 len(duplicate_to_centerline))
 
     # Generate offset geometries for remaining facilities
     gdf = _generate_offset_geometries(gdf, config)
@@ -1608,34 +1709,34 @@ def _generate_offset_geometries(
 
             if bk_needs.at[idx]:
                 try:
-                    bk_results.append((idx, geom_u.offset_curve(sign * bo)))
+                    bk_results.append((idx, _consolidate_line_geom(geom_u.offset_curve(sign * bo))))
                 except Exception:
                     pass
 
             if sw_needs.at[idx]:
                 bk_w = config.default_bikeway_width if bk_needs.at[idx] else 0.0
                 try:
-                    sw_results.append((idx, geom_u.offset_curve(sign * (bo + bk_w))))
+                    sw_results.append((idx, _consolidate_line_geom(geom_u.offset_curve(sign * (bo + bk_w)))))
                 except Exception:
                     pass
 
-        # Batch convert UTM -> WGS84
+        # Batch convert UTM -> WGS84 and assign via .loc[]
         if bk_results:
             bk_idxs, bk_geoms = zip(*bk_results)
             bk_wgs = gpd.GeoSeries(bk_geoms, crs="EPSG:32610").to_crs("EPSG:4326")
-            for i, idx in enumerate(bk_idxs):
-                gdf.at[idx, f"bikeway_{side}_1_geometry"] = bk_wgs.iloc[i]  # type: ignore[call-overload]
-                gdf.at[idx, f"bikeway_{side}_1_quality"] = "buffered"
-                gdf.at[idx, f"bikeway_{side}_1_offset"] = "yes"
+            _bk_idx_list = list(bk_idxs)
+            gdf.loc[_bk_idx_list, f"bikeway_{side}_1_geometry"] = bk_wgs.values
+            gdf.loc[_bk_idx_list, f"bikeway_{side}_1_quality"] = "buffered"
+            gdf.loc[_bk_idx_list, f"bikeway_{side}_1_offset"] = "yes"
             generated += len(bk_results)
 
         if sw_results:
             sw_idxs, sw_geoms = zip(*sw_results)
             sw_wgs = gpd.GeoSeries(sw_geoms, crs="EPSG:32610").to_crs("EPSG:4326")
-            for i, idx in enumerate(sw_idxs):
-                gdf.at[idx, f"sidewalk_{side}_geometry"] = sw_wgs.iloc[i]  # type: ignore[call-overload, assignment]
-                gdf.at[idx, f"sidewalk_{side}_quality"] = "buffered"
-                gdf.at[idx, f"sidewalk_{side}_offset"] = "yes"
+            _sw_idx_list = list(sw_idxs)
+            gdf.loc[_sw_idx_list, f"sidewalk_{side}_geometry"] = sw_wgs.values
+            gdf.loc[_sw_idx_list, f"sidewalk_{side}_quality"] = "buffered"
+            gdf.loc[_sw_idx_list, f"sidewalk_{side}_offset"] = "yes"
             generated += len(sw_results)
 
     log.info("  Generated %d offset geometries", generated)
@@ -1663,6 +1764,23 @@ def step_10_snap_endpoints(
       (e) Roundabout entry corners — pair closest endpoints
     """
     log.info("Step 10: Snapping sidewalk endpoints")
+
+    # Consolidate any MultiLineString sidewalk geometries produced by
+    # offset_curve (on curved roads) or OSMnx footway edge simplification.
+    # Must run before endpoint collection so coords[0]/coords[-1] are reliable.
+    for side in ("left", "right"):
+        col = f"sidewalk_{side}_geometry"
+        vals = gdf[col].values
+        multi_mask = np.array([isinstance(v, MultiLineString) for v in vals], dtype=bool)
+        if multi_mask.any():
+            fixed = np.where(
+                multi_mask,
+                [_consolidate_line_geom(v) if isinstance(v, MultiLineString) else v for v in vals],
+                vals,
+            )
+            gdf[col] = fixed
+            n_fixed = int(multi_mask.sum())
+            log.info("  Consolidated %d MultiLineString %s sidewalk geometries", n_fixed, side)
 
     # Only process intersection nodes
     isect_start = gdf.loc[gdf["start_node_is_intersection_node"], "start_node_id"]
@@ -1810,7 +1928,69 @@ def step_10_snap_endpoints(
                 except Exception:
                     pass
 
-    log.info("Step 10: Snapped %d endpoints, trimmed %d crossings", snapped, trimmed)
+    # ── (e) Cross-sidewalk trimming at intersections ──────────────────────
+    # When two sidewalks from different segments converging at the same
+    # intersection node cross each other, trim back the portion that extends
+    # past the crossing point. Prevents sidewalks from penetrating into
+    # intersection hulls through junction points.
+    # Ported from Old/ProximityModelOLD2.py Stage 3 (STRtree crossing detection).
+    s3_geoms: list[BaseGeometry] = []
+    s3_meta: list[tuple[int, str, str, Any]] = []  # (seg_idx, side, which_end, node_id)
+
+    for nid, endpoints in node_endpoints.items():
+        for (seg_idx, side, which_end, sw_geom_utm, _bearing, _ep) in endpoints:
+            s3_geoms.append(sw_geom_utm)
+            s3_meta.append((seg_idx, side, which_end, nid))
+
+    cross_trimmed = 0
+    if s3_geoms:
+        tree = STRtree(s3_geoms)
+        left_idx, right_idx = tree.query(s3_geoms, predicate="crosses")
+        trimmed_keys: set[tuple[int, str]] = set()
+
+        for qi, ti in zip(left_idx.tolist(), right_idx.tolist()):
+            if ti <= qi:
+                continue
+            if s3_meta[qi][3] != s3_meta[ti][3]:
+                continue  # different intersection nodes
+            if s3_meta[qi][0] == s3_meta[ti][0]:
+                continue  # same segment
+
+            ix = s3_geoms[qi].intersection(s3_geoms[ti])
+            if not isinstance(ix, Point):
+                continue
+
+            for arr_i in (qi, ti):
+                seg_idx, side, which_end, _ = s3_meta[arr_i]
+                trim_key = (seg_idx, side)
+                if trim_key in trimmed_keys:
+                    continue
+
+                ls = s3_geoms[arr_i]
+                if not isinstance(ls, LineString) or ls.length < 0.01:
+                    continue
+
+                d = ls.project(ix)
+                dist_from_ep = (ls.length - d) if which_end == "end" else d
+                if dist_from_ep > 15.0:
+                    continue
+
+                if which_end == "end":
+                    new_geom = _substring(ls, 0, d) if d > 0.01 else None
+                else:
+                    new_geom = _substring(ls, d, ls.length) if d < ls.length - 0.01 else None
+
+                if new_geom is None or new_geom.length < 1.0:
+                    continue
+
+                gdf.at[seg_idx, f"sidewalk_{side}_geometry"] = _project_to_wgs(new_geom)
+                s3_geoms[arr_i] = new_geom
+                trimmed_keys.add(trim_key)
+                cross_trimmed += 1
+
+    trimmed += cross_trimmed
+    log.info("Step 10: Snapped %d endpoints, trimmed %d crossings (%d cross-sidewalk)",
+             snapped, trimmed, cross_trimmed)
     return gdf
 
 
@@ -1995,7 +2175,11 @@ def step_11_facility_grid_ids(
         gdf[f"bikeway_{side}_1_id"] = pd.NA
         gdf.loc[only1, f"bikeway_{side}_1_id"] = sgid[only1].astype(str) + f"{suffix}1"
 
-        # Slot 2 id (no separate grid_id column)
+        # Slot 2 grid_id (shared with slot 1) and id
+        gdf[f"bikeway_{side}_2_grid_id"] = pd.NA
+        gdf.loc[either_eligible & sgid.notna(), f"bikeway_{side}_2_grid_id"] = (
+            sgid[either_eligible & sgid.notna()].astype(str) + f"{suffix}2"
+        )
         only2 = ~absent2 & sgid.notna()
         gdf[f"bikeway_{side}_2_id"] = pd.NA
         gdf.loc[only2, f"bikeway_{side}_2_id"] = sgid[only2].astype(str) + f"{suffix}2"
@@ -2095,6 +2279,56 @@ def step_12_curb_ramps_and_hulls(
                 ramp_points.append(pt)
                 ramp_info.append((seg_idx, side, which_end, pt))
 
+        # ── 2A: Node-proxy hull points for presence-without-geometry ────
+        # When a segment has sidewalk presence (OSM tag) but no geometry
+        # (matching/offset failed), use the node's own Point as a proxy
+        # hull vertex so the hull covers all approach directions.
+        for seg_idx, which_end in seg_ends:
+            ngc = "start_node_geometry" if which_end == "start" else "end_node_geometry"
+            npt = gdf.at[seg_idx, ngc]
+            if not isinstance(npt, Point) or npt.is_empty:
+                continue
+            for side in ("left", "right"):
+                pres = gdf.at[seg_idx, f"sidewalk_{side}_presence"]
+                if not isinstance(pres, str):
+                    continue
+                if pres.strip().lower() not in ("separate", "yes", "both", "left", "right"):
+                    continue
+                sw_g = gdf.at[seg_idx, f"sidewalk_{side}_geometry"]
+                if sw_g is not None and isinstance(sw_g, BaseGeometry) and not sw_g.is_empty:
+                    continue  # geometry exists — endpoint already collected above
+                ramp_points.append(npt)
+                ramp_info.append((seg_idx, side, which_end, npt))
+
+        # ── 2B: Footway-footway shared intermediate nodes ───────────────
+        # When two footway arms share an intermediate node (physical footway
+        # crossing), include that shared node as a hull vertex and ramp point.
+        footway_arms = [
+            (si, we) for si, we in seg_ends
+            if str(gdf.at[si, "highway"]).lower()
+            in ("footway", "path", "pedestrian", "crossing", "steps")
+        ]
+        if len(footway_arms) >= 2:
+            seen_shared: set[Any] = set()
+            for i, (fi, wi) in enumerate(footway_arms):
+                fi_nodes = {gdf.at[fi, "start_node_id"], gdf.at[fi, "end_node_id"]}
+                for j in range(i + 1, len(footway_arms)):
+                    fj, wj = footway_arms[j]
+                    fj_nodes = {gdf.at[fj, "start_node_id"], gdf.at[fj, "end_node_id"]}
+                    shared = (fi_nodes & fj_nodes) - {node_id}
+                    for sn in shared:
+                        if sn in seen_shared:
+                            continue
+                        seen_shared.add(sn)
+                        spt = None
+                        if gdf.at[fi, "start_node_id"] == sn:
+                            spt = gdf.at[fi, "start_node_geometry"]
+                        elif gdf.at[fi, "end_node_id"] == sn:
+                            spt = gdf.at[fi, "end_node_geometry"]
+                        if isinstance(spt, Point) and not spt.is_empty:
+                            ramp_points.append(spt)
+                            ramp_info.append((fi, "left", "start", spt))
+
         if len(ramp_points) < 2:
             continue
 
@@ -2171,6 +2405,77 @@ def step_12_curb_ramps_and_hulls(
 
     log.info("Step 12: %d curb ramps placed, %d intersection hulls built", ramps_placed, len(hulls))
     return gdf, hulls
+
+
+# ---------------------------------------------------------------------------
+# Step 12b — Clear hull-captive sidewalk slots
+# ---------------------------------------------------------------------------
+def step_12b_clear_hull_artifact_sidewalks(
+    gdf: gpd.GeoDataFrame,
+    hulls: gpd.GeoDataFrame,
+    hull_sw_threshold: float = 0.80,
+) -> gpd.GeoDataFrame:
+    """Clear separately-matched sidewalk slots whose geometry falls mostly inside
+    an intersection hull.
+
+    Corner connectors and crosswalk approach footways often get mis-assigned as
+    the sidewalk for the road segment they happen to touch. Because they lie
+    inside the intersection zone, they produce short stub geometries that look
+    fragmented around the hull. Clearing them restores the buffered offset as
+    the fallback, which gives a cleaner appearance.
+
+    Adapted from _filter_intersection_hull_artifacts (secondary check) in
+    Old/ProximityModelOLD2.py.
+    """
+    # node_id → hull polygon
+    node_hull: dict[Any, BaseGeometry] = dict(zip(hulls["node_id"], hulls.geometry))
+    if not node_hull:
+        return gdf
+
+    start_ids = gdf["start_node_id"].values
+    end_ids   = gdf["end_node_id"].values
+    idx_arr   = gdf.index.values
+    n_cleared = 0
+
+    for side in ("left", "right"):
+        pres_col = f"sidewalk_{side}_presence"
+        geom_col = f"sidewalk_{side}_geometry"
+
+        pres_vals = gdf[pres_col].values
+        geom_vals = gdf[geom_col].values
+
+        sep_mask  = np.array([str(p).lower() == "separate" for p in pres_vals], dtype=bool)
+        geom_ok   = np.array([isinstance(g, BaseGeometry) and not g.is_empty for g in geom_vals], dtype=bool)
+        candidates = np.where(sep_mask & geom_ok)[0]
+
+        clear_positions: list[int] = []
+        for pos in candidates:
+            sw_g = geom_vals[pos]
+            sw_len = sw_g.length
+            if sw_len <= 0:
+                continue
+            max_frac = 0.0
+            for hull in (node_hull.get(start_ids[pos]), node_hull.get(end_ids[pos])):
+                if hull is None:
+                    continue
+                try:
+                    frac = sw_g.intersection(hull).length / sw_len
+                    if frac > max_frac:
+                        max_frac = frac
+                except Exception:
+                    pass
+            if max_frac >= hull_sw_threshold:
+                clear_positions.append(pos)
+
+        if clear_positions:
+            clear_idx = idx_arr[clear_positions]
+            gdf.loc[clear_idx, geom_col] = None
+            gdf.loc[clear_idx, pres_col] = pd.NA
+            n_cleared += len(clear_positions)
+
+    log.info("Step 12b: Cleared %d hull-captive sidewalk slots (threshold=%.0f%%)",
+             n_cleared, hull_sw_threshold * 100)
+    return gdf
 
 
 # ---------------------------------------------------------------------------
@@ -2351,6 +2656,7 @@ def step_15_crosswalk_geometries(
 
     case_counts = {"A": 0, "B": 0, "C": 0, "D": 0, "E": 0}
     xwalk_id = 0
+    absorbed_footway_rows: set[int] = set()  # footway rows consumed by Case A
 
     for slot in slots:
         slot_geom = slot["slot_geom"]
@@ -2425,6 +2731,7 @@ def step_15_crosswalk_geometries(
                 xwalk_geom = LineString(chain_coords)
                 source = "case_a"
                 case_counts["A"] += 1
+                absorbed_footway_rows.update(footway_in_slot)
 
         # ── Case B: Sidewalk crosses street ───────────────────────────
         if xwalk_geom is None:
@@ -2539,6 +2846,14 @@ def step_15_crosswalk_geometries(
             gdf.at[crossed_idx, f"crosswalk_{pos}_geometry"] = xwalk_geom  # type: ignore[call-overload]
             gdf.at[crossed_idx, f"crosswalk_{pos}_id"] = str(xwalk_id)
             gdf.at[crossed_idx, f"crosswalk_{pos}_source"] = source
+            # Grid IDs: tuple of the two sidewalk grid IDs the crosswalk connects
+            sw_l_gid = gdf.at[crossed_idx, "sidewalk_left_grid_ID"]
+            sw_r_gid = gdf.at[crossed_idx, "sidewalk_right_grid_ID"]
+            grid_pair = (
+                str(sw_l_gid) if pd.notna(sw_l_gid) else None,
+                str(sw_r_gid) if pd.notna(sw_r_gid) else None,
+            )
+            gdf.at[crossed_idx, f"crosswalk_{pos}_grid_ids"] = grid_pair
 
     # ── Populate crosswalk attributes from cache ──────────────────────
     if not crosswalk_cache.empty and len(crosswalk_cache) > 0:
@@ -2562,10 +2877,97 @@ def step_15_crosswalk_geometries(
                         if col in gdf.columns:
                             gdf.at[idx, col] = val
 
+    # ── Fix 1: Null sidewalk/curbramp geometry on absorbed footway rows ──
+    # Footway rows consumed by Case A had their geometry merged into a
+    # crosswalk.  Clear their sidewalk and curb ramp slots so the geometry
+    # doesn't persist as a duplicate alongside the crosswalk.
+    n_absorbed_cleared = 0
+    _existing_cols = set(gdf.columns)
+    for ar_idx in absorbed_footway_rows:
+        if ar_idx not in gdf.index:
+            continue
+        for side in ("left", "right"):
+            sw_col = f"sidewalk_{side}_geometry"
+            if sw_col in _existing_cols and not pd.isna(gdf.at[ar_idx, sw_col]):
+                gdf.at[ar_idx, sw_col] = None  # type: ignore[call-overload]
+                n_absorbed_cleared += 1
+            for rp in ("start", "end"):
+                for sl in ("1", "2", "3"):
+                    rc = f"sidewalk_{side}_curbramp_{rp}_{sl}_geometry"
+                    if rc in _existing_cols and not pd.isna(gdf.at[ar_idx, rc]):
+                        gdf.at[ar_idx, rc] = None  # type: ignore[call-overload]
+
+    # ── Fix 2: Post-crosswalk stub cleanup per intersection hull ──────
+    # After crosswalk slots are filled, sidewalk stubs >90% inside a hull
+    # are artifacts (approach footways, corner connectors).  Clear them and
+    # also null any curb ramp points sitting inside the hull on sidewalks
+    # that extend beyond it.
+    _SW_STUB_HULL_FRAC = 0.90
+    n_stubs_cleared = 0
+    n_ramps_inside_cleared = 0
+    node_hull_map: dict[Any, BaseGeometry] = dict(zip(hulls["node_id"], hulls.geometry))
+    start_ids = gdf["start_node_id"].values
+    end_ids = gdf["end_node_id"].values
+    idx_arr = gdf.index.values
+
+    for side in ("left", "right"):
+        sw_geom_col = f"sidewalk_{side}_geometry"
+        if sw_geom_col not in _existing_cols:
+            continue
+        sw_geom_vals = gdf[sw_geom_col].values
+        ramp_cols = [
+            f"sidewalk_{side}_curbramp_{rp}_{sl}_geometry"
+            for rp in ("start", "end") for sl in ("1", "2", "3")
+        ]
+        ramp_cols = [c for c in ramp_cols if c in _existing_cols]
+
+        for pos_i in range(len(idx_arr)):
+            sw_g = sw_geom_vals[pos_i]
+            if not isinstance(sw_g, BaseGeometry) or sw_g.is_empty or sw_g.length < 1e-6:
+                continue
+            # Collect adjacent hull(s)
+            adj_hulls = []
+            for nid in (start_ids[pos_i], end_ids[pos_i]):
+                h = node_hull_map.get(nid)
+                if h is not None:
+                    adj_hulls.append(h)
+            if not adj_hulls:
+                continue
+
+            max_frac = 0.0
+            best_hull = None
+            for h in adj_hulls:
+                try:
+                    frac = sw_g.intersection(h).length / sw_g.length
+                except Exception:
+                    continue
+                if frac > max_frac:
+                    max_frac = frac
+                    best_hull = h
+
+            row_idx = idx_arr[pos_i]
+            if max_frac >= _SW_STUB_HULL_FRAC:
+                # Sidewalk is a stub — clear geometry and all curb ramps
+                gdf.at[row_idx, sw_geom_col] = None  # type: ignore[call-overload]
+                for rc in ramp_cols:
+                    if not pd.isna(gdf.at[row_idx, rc]):
+                        gdf.at[row_idx, rc] = None  # type: ignore[call-overload]
+                n_stubs_cleared += 1
+            elif best_hull is not None:
+                # Sidewalk extends beyond — clear only curb ramps inside hull
+                for rc in ramp_cols:
+                    rv = gdf.at[row_idx, rc]
+                    if isinstance(rv, Point) and best_hull.covers(rv):
+                        gdf.at[row_idx, rc] = None  # type: ignore[call-overload]
+                        n_ramps_inside_cleared += 1
+
     total = sum(case_counts.values())
-    log.info("Step 15: %d crosswalks created (A=%d B=%d C=%d D=%d E=%d)",
+    log.info("Step 15: %d crosswalks created (A=%d B=%d C=%d D=%d E=%d), "
+             "%d absorbed footway slots cleared, %d post-xwalk stubs cleared, "
+             "%d hull-interior ramps cleared",
              total, case_counts["A"], case_counts["B"], case_counts["C"],
-             case_counts["D"], case_counts["E"])
+             case_counts["D"], case_counts["E"],
+             n_absorbed_cleared, n_stubs_cleared, n_ramps_inside_cleared)
     return gdf
 
 
@@ -2595,6 +2997,7 @@ def run_pipeline(config: PipelineConfig) -> gpd.GeoDataFrame:
 
     # Phase 3 — Intersection analysis
     gdf, hulls = step_12_curb_ramps_and_hulls(gdf, config)
+    gdf = step_12b_clear_hull_artifact_sidewalks(gdf, hulls)
     hulls = step_13_merge_hulls(hulls, config)
     gdf = step_14_crosswalk_slots(gdf, hulls, config)
     gdf = step_15_crosswalk_geometries(gdf, hulls, crosswalk_cache, config)
@@ -2615,6 +3018,24 @@ def run_pipeline(config: PipelineConfig) -> gpd.GeoDataFrame:
         "bikeway_left_2_permitted", "bikeway_right_2_permitted",
         "bikeway_right_2_incline",
     }
+
+    # Serialize list/dict columns to JSON strings so PyArrow writes them as
+    # plain strings and DuckDB WASM can read them without STRUCT inference issues.
+    import json as _json_ser
+
+    class _NumpyEncoder(_json_ser.JSONEncoder):
+        def default(self, obj):
+            if hasattr(obj, 'item'):  # numpy scalar (int64, float64, etc.)
+                return obj.item()
+            return super().default(obj)
+
+    for _ser_col in ("street_feature_types", "street_feature_attributes",
+                     "public_data_id_street_feature"):
+        if _ser_col in gdf.columns:
+            gdf[_ser_col] = gdf[_ser_col].apply(
+                lambda v: _json_ser.dumps(v, cls=_NumpyEncoder) if isinstance(v, (list, dict)) else v
+            )
+
     geom_col_set = set(GEOMETRY_COLUMNS)
     for col in gdf.columns:
         if gdf[col].dtype != object or col in geom_col_set:
@@ -2641,9 +3062,28 @@ def run_pipeline(config: PipelineConfig) -> gpd.GeoDataFrame:
         if col in gdf.columns and col != active_geom:
             gdf[col] = gpd.GeoSeries(gdf[col], crs="EPSG:4326")
 
-    # Write output
+    # Write output with grid origin metadata for RollTracks viewport-based loading
     Path(config.output_path).parent.mkdir(parents=True, exist_ok=True)
+    import json as _json
+    import pyarrow.parquet as _pq
+    import pyarrow as _pa
+
+    # Write initial parquet
     gdf.to_parquet(config.output_path)
+
+    # Append proximity_grid_origin to parquet key-value metadata
+    grid_origin_x = gdf.attrs.get("grid_origin_x")
+    grid_origin_y = gdf.attrs.get("grid_origin_y")
+    grid_cell_size = gdf.attrs.get("grid_cell_size")
+    if grid_origin_x is not None and grid_origin_y is not None:
+        table = _pq.read_table(config.output_path)
+        existing_meta = table.schema.metadata or {}
+        existing_meta[b"proximity_grid_origin"] = _json.dumps({
+            "x": grid_origin_x, "y": grid_origin_y, "cell_size": grid_cell_size,
+        }).encode()
+        table = table.replace_schema_metadata(existing_meta)
+        _pq.write_table(table, config.output_path)
+
     log.info("═══ Pipeline complete → %s (%d rows) ═══", config.output_path, len(gdf))
 
     return gdf

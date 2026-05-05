@@ -497,16 +497,17 @@ def generate_map(data: pd.DataFrame, center_lat: float, center_lon: float,
         _hull_attr_cols = [
             'start_node_id', 'end_node_id',
             'start_node_is_intersection_node', 'end_node_is_intersection_node',
-            'name',
+            'name', 'highway',
+            'sidewalk_left_presence', 'sidewalk_right_presence',
         ]
         _hull_df = gpd.GeoDataFrame(index=data.index, geometry=data['_street_geom'], crs='EPSG:4326')
-        _hull_df['street_geometry'] = data['_street_geom']
+        _hull_df['street_geometry'] = data['_street_geom'].values
+        _null_arr = [None] * len(data)
         for _col in _hull_geom_cols:
             _parsed = f'_p_{_col}'
-            _hull_df[_col] = data[_parsed] if _parsed in data.columns else None
+            _hull_df[_col] = data[_parsed].values if _parsed in data.columns else _null_arr
         for _col in _hull_attr_cols:
-            if _col in data.columns:
-                _hull_df[_col] = data[_col]
+            _hull_df[_col] = data[_col].values if _col in data.columns else _null_arr
         _, _hulls_gdf = _step_12(_hull_df, _DEFAULT_PIPELINE_CONFIG)
         _hulls_gdf = _step_13(_hulls_gdf, _DEFAULT_PIPELINE_CONFIG)
         _step_14(_hull_df, _hulls_gdf, _DEFAULT_PIPELINE_CONFIG)
@@ -2070,7 +2071,8 @@ def generate_county_map(parquet_path: str, data: pd.DataFrame, output_name: str 
     _hull_attr_cols_county = [
         'start_node_id', 'end_node_id',
         'start_node_is_intersection_node', 'end_node_is_intersection_node',
-        'name',
+        'name', 'highway',
+        'sidewalk_left_presence', 'sidewalk_right_presence',
     ]
     _hull_street_geom = parse_geom_series(data['street_geometry']) if 'street_geometry' in data.columns else gpd.GeoSeries(index=data.index, dtype=object)
     _hull_df = gpd.GeoDataFrame(index=data.index, geometry=_hull_street_geom, crs='EPSG:4326')

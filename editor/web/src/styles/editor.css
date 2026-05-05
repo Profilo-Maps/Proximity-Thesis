@@ -1,0 +1,498 @@
+:root {
+  --toolbar-w: 56px;
+  --right-w: 280px;
+  --bottom-h: 36px;
+  --bottom-h-expanded: 240px;
+  --bg: #000;
+  --bg-panel: #111;
+  --bg-surface: #222;
+  --bg-hover: #333;
+  --text: #fff;
+  --text-dim: #aaa;
+  --border: #333;
+  --accent: #fff;
+  --danger: #f44;
+  --success: #4f4;
+  --radius: 4px;
+  --font: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--text);
+  overflow: hidden;
+  height: 100vh;
+}
+
+#root { height: 100vh; }
+
+.px-root {
+  display: grid;
+  grid-template-columns: var(--toolbar-w) 1fr var(--right-w);
+  grid-template-rows: 1fr var(--bottom-h);
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* Toolbar spans full height in column 1, bottom strip starts at column 2 */
+
+.px-root.bottom-expanded {
+  grid-template-rows: 1fr var(--bottom-h-expanded);
+}
+
+.px-root.right-collapsed {
+  grid-template-columns: var(--toolbar-w) 1fr;
+}
+
+/* Toolbar styles are fully inline in ToolBar.tsx — no CSS needed */
+
+/* ── Map area ──────────���─────────────────────────────────��───── */
+.px-map-area {
+  grid-row: 1;
+  grid-column: 2;
+  position: relative;
+  overflow: hidden;
+}
+
+.px-map-area .maplibregl-map { width: 100%; height: 100%; }
+
+/* ── Right column ───────────────���────────────────────────────── */
+.px-right-col {
+  grid-row: 1;
+  grid-column: 3;
+  background: var(--bg-panel);
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* When both panels are collapsed, push the two bars to the bottom */
+.px-right-col.both-collapsed {
+  justify-content: flex-end;
+}
+
+/* ── Panel base ──────────────────────────────────────────────── */
+.px-panel {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.px-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text);
+  flex-shrink: 0;
+}
+
+.px-panel-header button {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 2px 4px;
+}
+
+.px-panel-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 12px;
+  font-size: 13px;
+  color: var(--text);
+}
+
+/* ── Selection detail card ───────────��───────────────────────── */
+.px-selection-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--text);
+  border-radius: var(--radius);
+  padding: 10px;
+  margin-bottom: 10px;
+}
+
+.px-selection-card .sel-type {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text);
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.px-selection-card .sel-id {
+  font-size: 12px;
+  color: var(--text);
+  word-break: break-all;
+  margin-bottom: 6px;
+}
+
+.px-selection-card .sel-props {
+  font-size: 11px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+
+.px-selection-card .sel-props span {
+  color: var(--text);
+}
+
+.px-selection-actions {
+  display: flex;
+  gap: 4px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+.px-selection-actions button {
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.px-selection-actions button:hover {
+  background: var(--text);
+  color: var(--bg);
+}
+
+/* ── Bottom strip (attribute table) ──────────────────────────── */
+.px-bottom-strip {
+  grid-row: 2;
+  grid-column: 2 / -1;
+  background: var(--bg-panel);
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.px-bottom-strip-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+  flex-shrink: 0;
+  cursor: pointer;
+  user-select: none;
+}
+
+.px-bottom-strip-header:hover { background: var(--bg-surface); }
+
+.px-bottom-strip-body {
+  flex: 1;
+  overflow: auto;
+  display: none;
+}
+
+.bottom-expanded .px-bottom-strip-body { display: block; }
+
+.px-bottom-strip table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.px-bottom-strip th,
+.px-bottom-strip td {
+  padding: 5px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.px-bottom-strip th {
+  position: sticky;
+  top: 0;
+  background: var(--bg-surface);
+  font-weight: 700;
+  color: var(--text);
+}
+
+.px-bottom-strip td input {
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-size: 12px;
+  width: 100%;
+  padding: 2px 0;
+  outline: none;
+}
+
+.px-bottom-strip td input:focus {
+  border-bottom: 1px solid var(--text);
+}
+
+.px-bottom-strip tr:hover { background: var(--bg-surface); }
+.px-bottom-strip tr.selected { background: var(--bg-hover); }
+
+/* ��─ Layers panel (map overlay) ────────────���─────────────────── */
+.px-layers-panel {
+  position: absolute;
+  bottom: 8px;
+  left: 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px;
+  min-width: 160px;
+  z-index: 5;
+  font-size: 13px;
+}
+
+.px-layers-panel .layer-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  cursor: pointer;
+}
+
+.px-layers-panel .layer-swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+.px-layers-panel .layer-label {
+  flex: 1;
+  color: var(--text);
+}
+
+.px-layers-panel .layer-row.hidden .layer-label {
+  color: var(--text-dim);
+  text-decoration: line-through;
+}
+
+/* ── Slide-out panels (Search, Config) ───────────────���───────── */
+/* Overlay wrapper — taken out of grid flow */
+.px-overlays {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 0;
+  height: 0;
+  z-index: 18;
+}
+
+/* Slide panels and backdrop are position:fixed, exclude from grid */
+.px-slide-panel {
+  position: fixed;
+  top: 0;
+  left: var(--toolbar-w);
+  width: 300px;
+  height: 100vh;
+  background: var(--bg-panel);
+  border-right: 1px solid var(--border);
+  z-index: 20;
+  transform: translateX(-100%);
+  transition: transform 0.2s ease, visibility 0s 0.2s;
+  display: flex;
+  flex-direction: column;
+  pointer-events: none;
+  visibility: hidden;
+}
+
+.px-slide-panel.open {
+  transform: translateX(0);
+  pointer-events: all;
+  visibility: visible;
+  transition: transform 0.2s ease, visibility 0s 0s;
+}
+
+.px-slide-panel .panel-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 20px;
+  cursor: pointer;
+  z-index: 1;
+}
+
+.px-slide-backdrop {
+  display: none;
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 19;
+}
+
+.px-slide-backdrop.open {
+  display: block;
+}
+
+/* ── Inputs ──────────────────────────────────────────────────── */
+.px-input {
+  width: 100%;
+  padding: 6px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: 13px;
+  font-family: var(--font);
+  outline: none;
+}
+
+.px-input:focus { border-color: var(--text); }
+
+.px-btn {
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 13px;
+  font-weight: 600;
+  font-family: var(--font);
+  cursor: pointer;
+  transition: all 0.1s;
+}
+
+.px-btn-primary { background: var(--text); color: var(--bg); border-color: var(--text); }
+.px-btn-primary:hover { background: var(--text-dim); }
+.px-btn-danger { background: var(--danger); color: #fff; border-color: var(--danger); }
+.px-btn-success { background: var(--success); color: #000; border-color: var(--success); }
+
+/* ── Probe list ──────────────────────────────────────────────── */
+.px-probe-list { list-style: none; }
+
+.px-probe-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  color: var(--text);
+}
+
+.px-probe-item:hover { background: var(--bg-surface); }
+.px-probe-item.selected { background: var(--bg-hover); }
+
+.px-probe-item .distance {
+  font-size: 11px;
+  color: var(--text-dim);
+  min-width: 40px;
+}
+
+/* ── History panel ─────────────────��─────────────────────────── */
+.px-history-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text);
+}
+
+.px-history-item .icon { font-size: 14px; flex-shrink: 0; }
+.px-history-item .timestamp { font-size: 10px; color: var(--text-dim); }
+
+/* ── Slider ──────────────────────────────────────────────────── */
+.px-slider {
+  width: 100%;
+  accent-color: var(--text);
+}
+
+/* ── Status indicator ──────────────��─────────────────────────── */
+.px-status {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  z-index: 5;
+  pointer-events: none;
+}
+
+/* ── Config panel ──────────────���─────────────────────────────── */
+.px-config-tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.px-config-tab {
+  flex: 1;
+  padding: 10px;
+  text-align: center;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-dim);
+  cursor: pointer;
+  border: none;
+  background: none;
+  border-bottom: 2px solid transparent;
+}
+
+.px-config-tab.active {
+  color: var(--text);
+  border-bottom-color: var(--text);
+}
+
+.px-config-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.px-config-field label {
+  font-size: 12px;
+  color: var(--text);
+}
+
+.px-config-field input {
+  width: 80px;
+  padding: 4px 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: 12px;
+  text-align: right;
+}
+
+.px-config-field input:focus { border-color: var(--text); }
+
+/* ── Pulse animation ─────────���───────────────────────��───────── */
+@keyframes px-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.px-pulse { animation: px-pulse 1.5s infinite; }

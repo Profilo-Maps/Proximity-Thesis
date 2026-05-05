@@ -1,19 +1,31 @@
 @echo off
 REM Pipeline runner for Proximity Model
-REM Runs ProximityModel.py, then test_maps.py on success
+REM One-stop launcher: pipeline, test maps, editor, or any combination.
 
 echo ================================================================================
 echo Proximity Model Pipeline Runner
 echo ================================================================================
 echo.
+echo   [1] Full         - Pipeline + Test Maps + Editor
+echo   [2] Pipeline only - Run pipeline
+echo   [3] Test Maps     - Generate diagnostic maps
+echo   [4] Editor only   - Launch editor
+echo.
+choice /c 1234 /n /m "Select mode [1/2/3/4]: "
+set MODE=%errorlevel%
 
 REM Get the directory where this batch file is located and cd into it
 set SCRIPT_DIR=%~dp0
 cd /d "%SCRIPT_DIR%"
 
-REM Record pipeline start time
+REM Record start time
 set PIPELINE_START=%time%
 
+REM --- Pipeline phase ---
+if %MODE%==3 goto :test_maps
+if %MODE%==4 goto :editor
+
+echo.
 echo Running ProximityModel.py...
 echo ================================================================================
 echo.
@@ -35,17 +47,18 @@ echo.
 echo ================================================================================
 echo ProximityModel.py completed successfully  [%DURATION%]
 echo ================================================================================
+
+if %MODE%==2 goto :done
+
+REM --- Test Maps phase ---
+:test_maps
+
 echo.
-echo Proceeding to test maps...
+echo Running test_maps.py...
+echo ================================================================================
 echo.
 
 set PHASE_START=%time%
-if not exist "%SCRIPT_DIR%Implementations\test_maps.py" (
-    echo ERROR: test_maps.py not found at %SCRIPT_DIR%Implementations\test_maps.py
-    dir "%SCRIPT_DIR%Implementations\"
-    pause
-    exit /b 1
-)
 uv run python "%SCRIPT_DIR%Implementations\test_maps.py"
 
 if errorlevel 1 (
@@ -62,26 +75,43 @@ echo.
 echo ================================================================================
 echo test_maps.py completed successfully  [%DURATION%]
 echo ================================================================================
+echo.
+echo Test maps are in: %SCRIPT_DIR%Output\test_maps\
+
+if %MODE%==3 goto :done
+
+REM --- Editor phase ---
+:editor
+
+echo.
+echo Launching county editor...
+echo ================================================================================
+echo.
+
+REM Start FastAPI backend
+start "Proximity Editor API" cmd /k "cd /d "%SCRIPT_DIR%editor\server" && uv run uvicorn editor_server:app --reload --port 8000"
+
+REM Start Vite dev server
+start "Proximity Editor Web" cmd /k "cd /d "%SCRIPT_DIR%editor\web" && npm run dev"
+
+REM Give the servers a moment to start before opening the browser
+timeout /t 3 /nobreak >nul
+start "" "http://localhost:5173"
+
+echo Editor is running:
+echo   API server:  http://localhost:8000
+echo   Web app:     http://localhost:5173
+echo.
+echo Close the server windows to stop.
+echo.
+
+:done
 
 call :elapsed %PIPELINE_START% %time%
 echo.
 echo ================================================================================
-echo Pipeline Complete!  Total runtime: %DURATION%
+echo Done!  Total runtime: %DURATION%
 echo ================================================================================
-echo.
-echo Test maps are in: %SCRIPT_DIR%Output\test_maps\
-echo.
-
-echo Launching county editor server on http://localhost:8081 ...
-echo ================================================================================
-start "Proximity Editor Server" cmd /k "cd /d "%SCRIPT_DIR%" && uv run uvicorn Implementations.editor_server:app --reload --port 8081"
-
-REM Give the server a moment to start before opening the browser
-timeout /t 2 /nobreak >nul
-start "" "http://localhost:8081"
-
-echo Editor server is running in a separate window.
-echo Close that window to stop the server.
 echo.
 pause
 exit /b 0

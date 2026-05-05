@@ -12,7 +12,8 @@
       "Bash(/c/Users/karna/miniconda3/envs/ParkximityENV/python.exe -c \"from Implementations.ProximityModel import _ix_outgoing_bearing, _ix_build_corners; print\\(''OK''\\)\")",
       "Read(//c/Users/karna/miniconda3/envs/ParkximityENV/**)",
       "Bash(C:/Users/karna/miniconda3/envs/ParkximityENV/python.exe -c \"from Implementations.ProximityModel import IntersectionConfig, Corner, ApproachingFacility, IntersectionNode, _ix_get_node_point, _ix_build_boundary, _ix_outgoing_bearing, _ix_build_corners, _create_schema_dataframe; df = _create_schema_dataframe\\(\\); assert ''intersetion_review_flag'' in df.columns; print\\(''All imports OK, schema OK''\\)\")",
-      "Bash(/c/Users/karna/miniconda3/envs/ParkximityENV/python.exe -m pyright Implementations/ProximityModel.py)"
+      "Bash(/c/Users/karna/miniconda3/envs/ParkximityENV/python.exe -m pyright Implementations/ProximityModel.py)",
+      "Bash(uv run:*)"
     ]
   }
 }
