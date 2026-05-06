@@ -392,17 +392,24 @@ def _coalesce_tags(df: pd.DataFrame, *cols: str) -> pd.Series:
 
 
 def _ensure_cols(gdf: gpd.GeoDataFrame, schema: dict[str, Any]) -> gpd.GeoDataFrame:
-    """Add any missing schema columns with their default values (batch, no fragmentation)."""
+    """Add any missing schema columns with their default values (chunked to bound peak memory)."""
     missing = {k: v for k, v in schema.items() if k not in gdf.columns}
     if not missing:
         return gdf
     n = len(gdf)
-    new_df = pd.DataFrame(
-        {col: pd.array([default] * n, dtype=object) for col, default in missing.items()},
-        index=gdf.index,
-    )
+    # Build missing columns in chunks of 50 so no single np.vstack blows up
+    # peak RAM for large regions (e.g. Alameda ~527k rows x 235 cols = ~945 MB).
+    chunk_size = 50
+    items = list(missing.items())
+    frames = [gdf]
+    for i in range(0, len(items), chunk_size):
+        chunk = items[i : i + chunk_size]
+        frames.append(pd.DataFrame(
+            {col: pd.array([default] * n, dtype=object) for col, default in chunk},
+            index=gdf.index,
+        ))
     return gpd.GeoDataFrame(
-        pd.concat([gdf, new_df], axis=1),
+        pd.concat(frames, axis=1),
         geometry="street_geometry",
         crs=gdf.crs,
     )
@@ -1639,6 +1646,12 @@ def step_09_match_separate_facilities(
             f"sidewalk_{side}_{attr}"
             for side in ("left", "right")
             for attr in ("presence", "surface", "condition", "width", "incline", "seperator", "geometry")
+        ] + [
+            f"bikeway_{side}_{slot}_{attr}"
+            for side in ("left", "right")
+            for slot in ("1", "2")
+            for attr in ("type", "surface", "condition", "quality", "permitted",
+                         "width", "incline", "seperator", "offset", "geometry")
         ]
         existing_cols = [c for c in _sw_consolidate_cols if c in gdf.columns]
         dup_indices = list(duplicate_to_centerline.keys())
@@ -2360,6 +2373,9 @@ def step_12_curb_ramps_and_hulls(
                 col = f"sidewalk_{side}_curbramp_{pos}_{n}_geometry"
                 if col in gdf.columns and pd.isna(gdf.at[seg_idx, col]):
                     gdf.at[seg_idx, col] = snapped[k]  # type: ignore[call-overload]
+                    quality_col = f"sidewalk_{side}_curbramp_{pos}_{n}_quality"
+                    if quality_col in gdf.columns:
+                        gdf.at[seg_idx, quality_col] = "topology"
                     ramp_id_counter += 1
                     id_col = f"sidewalk_{side}_curbramp_{pos}_{n}_ID"
                     if id_col in gdf.columns:
@@ -2971,6 +2987,173 @@ def step_15_crosswalk_geometries(
     return gdf
 
 
+# ---------------------------------------------------------------------------
+# Step 16 — Consolidate orphaned facility rows into road slots
+# ---------------------------------------------------------------------------
+def step_16_consolidate_orphaned_facilities(
+    gdf: gpd.GeoDataFrame,
+    config: PipelineConfig,
+) -> gpd.GeoDataFrame:
+    """Final pass: match every remaining standalone footway / cycleway row into
+    its nearest parallel road row's facility slot, then remove all such rows
+    so every block shares a single road row.
+
+    Rows that cannot be matched (no parallel road within _MATCH_RADIUS_M) are
+    also removed; their count is logged as a warning.
+    """
+    log.info("Step 16: Consolidating orphaned facility rows into road slots")
+
+    hw = gdf["highway"].astype(str).str.lower().str.strip()
+    bicycle_col = _safe_col(gdf, "bikeway_left_1_permitted").astype(str).str.lower()
+    is_road = hw.isin(_ROAD_HW)
+    is_cycleway = hw.isin(_BIKEWAY_HW) | (
+        hw.isin({"path", "footway"}) & bicycle_col.isin({"designated", "yes"})
+    )
+    is_footway = hw.isin(_FOOTWAY_HW) & ~is_cycleway
+    is_facility = is_footway | is_cycleway
+
+    fac_indices = gdf.index[is_facility]
+    n_fac = len(fac_indices)
+    if n_fac == 0 or not is_road.any():
+        log.info("  No facility rows present — nothing to consolidate")
+        return gdf
+
+    utm_street = gdf["street_geometry"].to_crs("EPSG:32610")
+    road_idx = gdf.index[is_road].tolist()
+    road_geoms_utm = utm_street[is_road]
+    road_sindex = road_geoms_utm.sindex
+    road_bearings = gdf.loc[is_road, "normalized_bearing"].to_dict()
+    road_names = gdf.loc[is_road, "name"].to_dict()
+
+    # Pre-populate used sets from slots already occupied by step 09
+    foot_used: set[tuple[int, str]] = set()
+    bike_used: set[tuple[int, str, str]] = set()
+    for ri in road_idx:
+        for side in ("left", "right"):
+            gcol = f"sidewalk_{side}_geometry"
+            g = gdf.at[ri, gcol] if gcol in gdf.columns else None
+            if g is not None and isinstance(g, BaseGeometry) and not g.is_empty:
+                foot_used.add((ri, side))
+            for slot in ("1", "2"):
+                bcol = f"bikeway_{side}_{slot}_geometry"
+                bk = gdf.at[ri, bcol] if bcol in gdf.columns else None
+                if bk is not None and isinstance(bk, BaseGeometry) and not bk.is_empty:
+                    bike_used.add((ri, side, slot))
+
+    def _slot_is_empty(row_idx: int, col: str) -> bool:
+        """Return True if the slot value is absent/null (handles list-valued cells)."""
+        if col not in gdf.columns:
+            return False
+        val = _first_if_list(gdf.at[row_idx, col])
+        return val is None or pd.isna(val)
+
+    matched_foot = matched_bike = unmatched = 0
+
+    for fac_idx in tqdm(fac_indices, desc="Consolidating facilities", unit="seg"):
+        fac_geom = utm_street.at[fac_idx]
+        if fac_geom is None or fac_geom.is_empty:
+            unmatched += 1
+            continue
+
+        fac_type = "bike" if is_cycleway.at[fac_idx] else "foot"
+        fc = _flatten_coords(fac_geom)
+        if len(fc) < 2:
+            unmatched += 1
+            continue
+
+        fac_bear = math.degrees(math.atan2(fc[-1][0] - fc[0][0], fc[-1][1] - fc[0][1])) % 360
+        buf = fac_geom.buffer(_MATCH_RADIUS_M)
+        candidates = list(road_sindex.query(buf, predicate="intersects"))
+        if not candidates:
+            unmatched += 1
+            continue
+
+        best_road, best_score, best_side = None, float("inf"), "left"
+        for cand_pos in candidates:
+            cand_idx = road_idx[cand_pos]
+            road_geom = road_geoms_utm.iloc[cand_pos]
+            dist = fac_geom.distance(road_geom)
+            rb = road_bearings.get(cand_idx, 0.0)
+            axis_diff = abs((fac_bear % 180) - (rb % 180))
+            if axis_diff > 90:
+                axis_diff = 180 - axis_diff
+            if axis_diff > _PARALLEL_THRESHOLD_DEG:
+                continue
+            fac_name = gdf.at[fac_idx, "name"]
+            road_name = road_names.get(cand_idx)
+            name_bonus = -10.0 if (
+                fac_name and road_name
+                and str(fac_name).strip() == str(road_name).strip()
+            ) else 0.0
+            score = dist + name_bonus
+            fac_mid = fac_geom.interpolate(0.5, normalized=True)
+            proj_dist = road_geom.project(fac_mid)
+            proj_pt = road_geom.interpolate(proj_dist)
+            rc = list(road_geom.coords)
+            seg_i = max(0, min(int(proj_dist / road_geom.length * (len(rc) - 1)), len(rc) - 2))
+            rx = rc[seg_i + 1][0] - rc[seg_i][0]
+            ry = rc[seg_i + 1][1] - rc[seg_i][1]
+            fx, fy = fac_mid.x - proj_pt.x, fac_mid.y - proj_pt.y
+            side = "left" if (rx * fy - ry * fx) > 0 else "right"
+            if score < best_score:
+                best_score = score
+                best_road = cand_idx
+                best_side = side
+
+        if best_road is None:
+            unmatched += 1
+            continue
+
+        fac_wgs = gdf.at[fac_idx, "street_geometry"]
+        _raw_surface = _first_if_list(gdf.at[fac_idx, "surface"]) if "surface" in gdf.columns else None
+        fac_surface = None if (_raw_surface is None or pd.isna(_raw_surface)) else _raw_surface
+
+        if fac_type == "foot":
+            if (best_road, best_side) not in foot_used:
+                gcol = f"sidewalk_{best_side}_geometry"
+                if gcol in gdf.columns:
+                    gdf.at[best_road, gcol] = fac_wgs  # type: ignore[call-overload]
+                gdf.at[best_road, f"sidewalk_{best_side}_quality"] = "separate"
+                gdf.at[best_road, f"sidewalk_{best_side}_offset"] = "no"
+                pcol = f"sidewalk_{best_side}_presence"
+                if _slot_is_empty(best_road, pcol):
+                    gdf.at[best_road, pcol] = "separate"
+                if fac_surface is not None:
+                    sc = f"sidewalk_{best_side}_surface"
+                    if _slot_is_empty(best_road, sc):
+                        gdf.at[best_road, sc] = fac_surface  # type: ignore[call-overload]
+                foot_used.add((best_road, best_side))
+                matched_foot += 1
+        else:
+            for slot in ("1", "2"):
+                if (best_road, best_side, slot) not in bike_used:
+                    gcol = f"bikeway_{best_side}_{slot}_geometry"
+                    if gcol in gdf.columns:
+                        gdf.at[best_road, gcol] = fac_wgs  # type: ignore[call-overload]
+                    gdf.at[best_road, f"bikeway_{best_side}_{slot}_quality"] = "separate"
+                    gdf.at[best_road, f"bikeway_{best_side}_{slot}_offset"] = "no"
+                    if fac_surface is not None:
+                        sc = f"bikeway_{best_side}_{slot}_surface"
+                        if _slot_is_empty(best_road, sc):
+                            gdf.at[best_road, sc] = fac_surface  # type: ignore[call-overload]
+                    bike_used.add((best_road, best_side, slot))
+                    matched_bike += 1
+                    break
+
+    if unmatched:
+        log.warning(
+            "  Step 16: %d facility rows had no matching road within %.0f m — dropped",
+            unmatched, _MATCH_RADIUS_M,
+        )
+
+    gdf = gdf.drop(index=fac_indices)
+    log.info(
+        "  Step 16: Consolidated %d footways, %d bikeways; removed %d facility rows",
+        matched_foot, matched_bike, n_fac,
+    )
+    return gdf
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # ORCHESTRATOR
 # ═════════════════════════════════════════════════════════════════════════════
@@ -3001,6 +3184,10 @@ def run_pipeline(config: PipelineConfig) -> gpd.GeoDataFrame:
     hulls = step_13_merge_hulls(hulls, config)
     gdf = step_14_crosswalk_slots(gdf, hulls, config)
     gdf = step_15_crosswalk_geometries(gdf, hulls, crosswalk_cache, config)
+
+    # Phase 4 — Final facility consolidation
+    gdf = step_16_consolidate_orphaned_facilities(gdf, config)
+    gdf = step_11_facility_grid_ids(gdf, config)  # Re-run to assign IDs to newly consolidated slots
 
     # Pre-write type normalization for object columns:
     #   - Schema-defined list columns (Str|List[Str] or Float|List[Float]):
@@ -3094,10 +3281,28 @@ def run_pipeline(config: PipelineConfig) -> gpd.GeoDataFrame:
 # ═════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    import argparse as _argparse
+
+    _parser = _argparse.ArgumentParser()
+    _parser.add_argument("--skip-existing", action="store_true",
+                         help="Skip regions whose output parquet already exists")
+    _args = _parser.parse_args()
+
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    sf_config = PipelineConfig(
-        place_name="San Francisco County, California, USA",
-        output_path="Output/San_Francisco_County_California_USA_network.parquet",
-    )
-    run_pipeline(sf_config)
+    _configs = [
+        PipelineConfig(
+            place_name="San Francisco County, California, USA",
+            output_path="Output/San_Francisco_County_California_USA_network.parquet",
+        ),
+        PipelineConfig(
+            place_name="Alameda County, California, USA",
+            output_path="Output/Alameda_County_California_USA_network.parquet",
+        ),
+    ]
+
+    for _cfg in _configs:
+        if _args.skip_existing and Path(_cfg.output_path).exists():
+            log.info("Skipping %s (parquet already exists)", _cfg.place_name)
+            continue
+        run_pipeline(_cfg)
