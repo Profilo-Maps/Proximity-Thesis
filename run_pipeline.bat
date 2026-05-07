@@ -26,12 +26,16 @@ if %MODE%==3 goto :test_maps
 if %MODE%==4 goto :editor
 
 echo.
+choice /c YN /n /m "Recreate existing parquets? [Y/N]: "
+if errorlevel 2 (set SKIP_EXISTING=--skip-existing) else (set SKIP_EXISTING=)
+
+echo.
 echo Running ProximityModel.py...
 echo ================================================================================
 echo.
 
 set PHASE_START=%time%
-uv run python "%SCRIPT_DIR%Implementations\ProximityModel.py"
+uv run python "%SCRIPT_DIR%Implementations\ProximityModel.py" %SKIP_EXISTING%
 
 if errorlevel 1 (
     echo.
@@ -82,6 +86,16 @@ if %MODE%==3 goto :done
 
 REM --- Editor phase ---
 :editor
+
+REM Skip launch if the API server is already running on port 8000
+netstat -ano | findstr ":8000 " | findstr LISTENING >nul 2>&1
+if not errorlevel 1 (
+    echo.
+    echo Editor is already running on port 8000 -- skipping re-launch.
+    echo Close the existing editor windows first if you want to restart.
+    echo.
+    goto :done
+)
 
 echo.
 echo Launching county editor...

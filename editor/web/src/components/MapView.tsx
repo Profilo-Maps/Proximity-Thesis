@@ -1,11 +1,13 @@
 import { useEffect, useRef, useCallback } from 'react';
 import maplibregl from 'maplibre-gl';
 import { useEditorStore, type LayerVisibility } from '../store/editorStore';
-import { fetchFeatures, fetchHulls } from '../api/editorApi';
+import { fetchFeatures, fetchHulls, fetchParquetCenter } from '../api/editorApi';
 import { LAYER_DEFS, EDIT_LAYER_DEFS, HIGHLIGHT_LAYER_DEFS, VERTEX_LAYER_DEFS } from '../hooks/useMapLayers';
 import { useToolHandler } from '../hooks/useToolHandler';
-import { useVertexDrag } from '../hooks/useVertexDrag';
+import { useVertexDrag, extractVertices } from '../hooks/useVertexDrag';
 import type { MapMouseEvent } from 'maplibre-gl';
+
+const DRAGGABLE_LINE_TYPES = ['street', 'bikeway', 'sidewalk'];
 
 // Map layer IDs to store layer keys for visibility sync
 const LAYER_KEY_MAP: Record<string, string> = {
@@ -50,32 +52,48 @@ export function MapView() {
   const refreshData = useCallback(async (map: maplibregl.Map) => {
     if (!parquet) return;
     const bounds = map.getBounds();
+    // Fetch a 50% overscan buffer around the viewport so features stay visible
+    // while panning and fewer re-fetches are needed
+    const latSpan = bounds.getNorth() - bounds.getSouth();
+    const lngSpan = bounds.getEast() - bounds.getWest();
+    // Adaptive overscan: large county bboxes at low zoom make 50% brutal
+    const overScan = zoom >= 17 ? 0.4 : zoom >= 15 ? 0.15 : 0;
+    const padLat = latSpan * overScan;
+    const padLng = lngSpan * overScan;
     const bbox: [number, number, number, number] = [
-      bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth(),
+      bounds.getWest() - padLng,
+      bounds.getSouth() - padLat,
+      bounds.getEast() + padLng,
+      bounds.getNorth() + padLat,
     ];
     const zoom = Math.floor(map.getZoom());
 
     try {
       const fc = await fetchFeatures(parquet, bbox, zoom);
       setFeatures(fc);
-
       const source = map.getSource('proximity-features') as maplibregl.GeoJSONSource | undefined;
       if (source) source.setData(fc);
+    } catch (err) {
+      console.error('[MapView] Failed to fetch features:', err);
+    }
 
-      if (zoom >= 17) {
+    if (zoom >= 17) {
+      try {
         const { hulls, slots } = await fetchHulls(parquet, bbox);
         setHullsAndSlots(hulls, slots);
-
         const hullSource = map.getSource('proximity-hulls') as maplibregl.GeoJSONSource | undefined;
         if (hullSource) hullSource.setData({ type: 'FeatureCollection', features: hulls });
-
         const slotSource = map.getSource('proximity-slots') as maplibregl.GeoJSONSource | undefined;
         if (slotSource) slotSource.setData({ type: 'FeatureCollection', features: slots });
+      } catch (err) {
+        console.error('[MapView] Failed to fetch hulls:', err);
       }
-    } catch (err) {
-      console.error('[MapView] Failed to refresh data:', err);
     }
   }, [parquet, setFeatures, setHullsAndSlots]);
+
+  // Keep a ref so the moveend handler (registered once) always calls the current refreshData
+  const refreshDataRef = useRef(refreshData);
+  useEffect(() => { refreshDataRef.current = refreshData; }, [refreshData]);
 
   // Initialize map
   useEffect(() => {
@@ -128,10 +146,9 @@ export function MapView() {
         map.addLayer(layerDef);
       }
 
-      // Add vertex layers (hidden by default, shown when vertex tool active)
+      // Add vertex layers — always visible, empty source = nothing rendered
       for (const layerDef of VERTEX_LAYER_DEFS) {
         map.addLayer(layerDef);
-        map.setLayoutProperty(layerDef.id, 'visibility', 'none');
       }
 
       // Initial data load
@@ -143,7 +160,7 @@ export function MapView() {
       setCenter([map.getCenter().lng, map.getCenter().lat]);
 
       clearTimeout(debounceRef.current);
-      debounceRef.current = window.setTimeout(() => refreshData(map), 300);
+      debounceRef.current = window.setTimeout(() => refreshDataRef.current(map), 600);
     });
 
     map.on('click', (e) => {
@@ -172,18 +189,27 @@ export function MapView() {
       }).filter((f) => f.properties?._t != null);
 
       const highlightSource = map.getSource('proximity-highlight') as maplibregl.GeoJSONSource | undefined;
+      const vertexSource = map.getSource('proximity-vertices') as maplibregl.GeoJSONSource | undefined;
       if (hits.length > 0) {
         const p = hits[0].properties!;
         const fid = (p._fid || p._seg_id || p._node_id || p.street_grid_id || null) as string | null;
         setSelectedFeatureId(fid);
-        // Set highlight immediately from the rendered feature geometry
         if (highlightSource) {
           highlightSource.setData({ type: 'FeatureCollection', features: [hits[0]] });
+        }
+        // Immediately populate vertex source for draggable line features
+        if (vertexSource) {
+          const isLine = fid != null && DRAGGABLE_LINE_TYPES.includes(p._t as string);
+          const fc = useEditorStore.getState().features;
+          vertexSource.setData(extractVertices(isLine ? fc : null, fid));
         }
       } else {
         setSelectedFeatureId(null);
         if (highlightSource) {
           highlightSource.setData({ type: 'FeatureCollection', features: [] });
+        }
+        if (vertexSource) {
+          vertexSource.setData({ type: 'FeatureCollection', features: [] });
         }
       }
     });
@@ -247,14 +273,23 @@ export function MapView() {
     if (source) source.setData(editFeatures);
   }, [editFeatures]);
 
-  // Re-fetch data when parquet changes
+  // Re-fetch data when parquet changes — also snap map to data center
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !parquet) return;
-    if (map.isStyleLoaded()) {
+
+    const load = async () => {
+      try {
+        const c = await fetchParquetCenter(parquet);
+        map.flyTo({ center: [c.lng, c.lat], zoom: 15, duration: 800 });
+      } catch { /* ignore — map stays at current position */ }
       refreshData(map);
+    };
+
+    if (map.isStyleLoaded()) {
+      load();
     } else {
-      map.once('load', () => refreshData(map));
+      map.once('load', load);
     }
   }, [parquet, refreshData]);
 

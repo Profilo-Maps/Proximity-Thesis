@@ -232,7 +232,7 @@ export const VERTEX_LAYER_DEFS: LayerSpecification[] = [
     id: 'px-vertices-mid',
     type: 'circle',
     source: 'proximity-vertices',
-    filter: ['==', ['get', '_endpoint'], false],
+    filter: ['==', ['get', '_endpoint'], 0],
     paint: {
       'circle-radius': 4,
       'circle-color': '#aaa',
@@ -246,7 +246,7 @@ export const VERTEX_LAYER_DEFS: LayerSpecification[] = [
     id: 'px-vertices-end',
     type: 'circle',
     source: 'proximity-vertices',
-    filter: ['==', ['get', '_endpoint'], true],
+    filter: ['==', ['get', '_endpoint'], 1],
     paint: {
       'circle-radius': 6,
       'circle-color': '#fff',

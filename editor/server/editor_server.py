@@ -35,11 +35,11 @@ if str(_IMPL_DIR) not in sys.path:
 
 from ProximityModel import (
     PipelineConfig,
-    step_10_snap_endpoints,
-    step_12_curb_ramps_and_hulls,
-    step_13_merge_hulls,
-    step_14_crosswalk_slots,
-    step_15_crosswalk_geometries,
+    step_12_snap_endpoints,
+    step_13_curb_ramps_and_hulls,
+    step_14_merge_hulls,
+    step_15_crosswalk_slots,
+    step_16_crosswalk_geometries,
 )
 
 # Buffer (metres) used to expand edit bboxes before filtering affected rows.
@@ -60,12 +60,16 @@ _gdf_cache: dict[str, gpd.GeoDataFrame] = {}
 
 
 def _load_gdf(parquet_name: str) -> gpd.GeoDataFrame:
-    """Load a parquet into the cache (or return cached copy)."""
+    """Load a parquet into the cache (or return cached copy).
+    Builds the spatial index on first load so bbox queries are O(log n)."""
     if parquet_name not in _gdf_cache:
         path = OUTPUT_DIR / parquet_name
         if not path.exists():
             raise HTTPException(404, f"Parquet not found: {parquet_name}")
-        _gdf_cache[parquet_name] = gpd.read_parquet(path)
+        gdf = gpd.read_parquet(path)
+        # Force spatial index build now so first query is fast
+        _ = gdf["street_geometry"].sindex
+        _gdf_cache[parquet_name] = gdf
     return _gdf_cache[parquet_name]
 
 
@@ -92,11 +96,39 @@ if _DIST_DIR.exists():
     app.mount("/assets", StaticFiles(directory=str(_DIST_DIR / "assets")), name="assets")
 
 
+@app.on_event("startup")
+async def _preload_parquets():
+    """Pre-load all parquets (including spatial index) on server startup."""
+    import asyncio
+    files = sorted(p.name for p in OUTPUT_DIR.glob("*.parquet"))
+    loop = asyncio.get_event_loop()
+    for name in files:
+        try:
+            await loop.run_in_executor(None, _load_gdf, name)
+            print(f"[startup] Preloaded {name}")
+        except Exception as exc:
+            print(f"[startup] Failed to preload {name}: {exc}")
+
+
 @app.get("/parquets")
 async def list_parquets():
     """Return list of available parquet files in the Output directory."""
     files = sorted(p.name for p in OUTPUT_DIR.glob("*.parquet"))
     return {"files": files}
+
+
+@app.get("/center/{parquet_name}")
+async def get_center(parquet_name: str):
+    """Return the geographic centroid of all street geometries in the parquet."""
+    gdf = _load_gdf(parquet_name)
+    geoms = gdf["street_geometry"].dropna()
+    if geoms.empty:
+        return {"lng": -122.42, "lat": 37.77}
+    total_bounds = geoms.total_bounds  # [minx, miny, maxx, maxy]
+    return {
+        "lng": float((total_bounds[0] + total_bounds[2]) / 2),
+        "lat": float((total_bounds[1] + total_bounds[3]) / 2),
+    }
 
 
 @app.get("/parquet/{filename}")
@@ -124,11 +156,16 @@ async def get_hulls(
         return {"hulls": [], "slots": []}
 
     patch_df = gdf.loc[patch_idx].copy()
-    _, hulls = step_12_curb_ramps_and_hulls(patch_df, _PIPELINE_CONFIG)
+    try:
+        _, hulls = step_13_curb_ramps_and_hulls(patch_df, _PIPELINE_CONFIG)
+    except Exception as exc:
+        print(f"[hulls] step_13 failed: {exc}")
+        import traceback; traceback.print_exc()
+        return {"hulls": [], "slots": []}
     if hulls.empty:
         return {"hulls": [], "slots": []}
-    hulls = step_13_merge_hulls(hulls, _PIPELINE_CONFIG)
-    step_14_crosswalk_slots(patch_df, hulls, _PIPELINE_CONFIG)
+    hulls = step_14_merge_hulls(hulls, _PIPELINE_CONFIG)
+    step_15_crosswalk_slots(patch_df, hulls, _PIPELINE_CONFIG)
 
     hull_features = []
     for idx in hulls.index:
@@ -255,28 +292,40 @@ def _val(gdf: gpd.GeoDataFrame, idx: int, col: str) -> Any:
 def _build_features(
     gdf: gpd.GeoDataFrame, indices: pd.Index, tier: int,
 ) -> list[dict]:
-    """Build GeoJSON features for the given row indices and tier level."""
+    """Build GeoJSON features for the given row indices and tier level.
+    Uses iterrows on a pre-sliced subset to avoid repeated gdf.at[] lookups."""
     features: list[dict] = []
     seen_nodes: set[str] = set()
     seen_ramps: set[str] = set()
 
-    for idx in indices:
-        seg_id = str(gdf.at[idx, "street_grid_id"] or "")
+    cols = set(gdf.columns)  # pre-compute column set once
+
+    def _rv(row: pd.Series, col: str) -> Any:
+        """Row value with NaN → None."""
+        if col not in cols:
+            return None
+        v = row[col]
+        return None if isinstance(v, float) and pd.isna(v) else v
+
+    subset = gdf.loc[indices]
+
+    for _, row in subset.iterrows():
+        seg_id = str(_rv(row, "street_grid_id") or "")
 
         # ── Streets (always) ─────────────────────────────────────────────
-        street_geom = gdf.at[idx, "street_geometry"]
+        street_geom = _rv(row, "street_geometry")
         sg = _geo(street_geom)
         if not sg:
             continue
-        col = _incline_color(_FC["street"], _val(gdf, idx, "street_incline"))
+        s_col = _incline_color(_FC["street"], _rv(row, "street_incline"))
         features.append({
             "type": "Feature", "geometry": sg,
             "properties": {
-                "_t": "street", "_color": col,
+                "_t": "street", "_color": s_col,
                 "_seg_id": seg_id, "_fid": seg_id,
                 "_mid": _midpoint(street_geom),
-                "name": _safe_str(_val(gdf, idx, "name")),
-                "highway": _safe_str(_val(gdf, idx, "highway")),
+                "name": _safe_str(_rv(row, "name")),
+                "highway": _safe_str(_rv(row, "highway")),
             },
         })
 
@@ -285,14 +334,14 @@ def _build_features(
             for side in ("left", "right"):
                 for n in (1, 2):
                     gcol = f"bikeway_{side}_{n}_geometry"
-                    bg = _geo(_val(gdf, idx, gcol))
+                    bk_geom = _rv(row, gcol)
+                    bg = _geo(bk_geom)
                     if not bg:
                         continue
-                    is_off = _safe_str(_val(gdf, idx, f"bikeway_{side}_{n}_offset")) == "yes"
+                    is_off = _safe_str(_rv(row, f"bikeway_{side}_{n}_offset")) == "yes"
                     base = _FC["bk_off"] if is_off else _FC["bk_sep"]
-                    bk_col = _incline_color(base, _val(gdf, idx, f"bikeway_{side}_{n}_incline"))
+                    bk_col = _incline_color(base, _rv(row, f"bikeway_{side}_{n}_incline"))
                     bk_key = f"bk_{side}_{n}_{seg_id}"
-                    bk_geom = gdf.at[idx, gcol]
                     features.append({
                         "type": "Feature", "geometry": bg,
                         "properties": {
@@ -308,13 +357,13 @@ def _build_features(
         if tier >= 3:
             for side in ("left", "right"):
                 gcol = f"sidewalk_{side}_geometry"
-                sw_geom = _val(gdf, idx, gcol)
+                sw_geom = _rv(row, gcol)
                 swg = _geo(sw_geom)
                 if not swg:
                     continue
-                is_off = _safe_str(_val(gdf, idx, f"sidewalk_{side}_offset")) == "yes"
+                is_off = _safe_str(_rv(row, f"sidewalk_{side}_offset")) == "yes"
                 sw_col = _FC["sw_off"] if is_off else _FC["sw_sep"]
-                sw_id = _safe_str(_val(gdf, idx, f"sidewalk_{side}_ID")) or ""
+                sw_id = _safe_str(_rv(row, f"sidewalk_{side}_ID")) or ""
                 sw_fid = sw_id or f"sw_{side}_{seg_id}"
                 features.append({
                     "type": "Feature", "geometry": swg,
@@ -330,7 +379,7 @@ def _build_features(
 
             # ── Crosswalks ────────────────────────────────────────────────
             for pos in ("start", "end"):
-                xwg = _geo(_val(gdf, idx, f"crosswalk_{pos}_geometry"))
+                xwg = _geo(_rv(row, f"crosswalk_{pos}_geometry"))
                 if xwg:
                     features.append({
                         "type": "Feature", "geometry": xwg,
@@ -338,7 +387,7 @@ def _build_features(
                     })
 
             # ── Curb returns ──────────────────────────────────────────────
-            crg = _geo(_val(gdf, idx, "curb_return_geometry"))
+            crg = _geo(_rv(row, "curb_return_geometry"))
             if crg:
                 features.append({
                     "type": "Feature", "geometry": crg,
@@ -346,8 +395,8 @@ def _build_features(
                 })
 
             # ── Traffic calming ───────────────────────────────────────────
-            feat_geom = _val(gdf, idx, "street_feature_geometry")
-            feat_types = _val(gdf, idx, "street_feature_types")
+            feat_geom = _rv(row, "street_feature_geometry")
+            feat_types = _rv(row, "street_feature_types")
             if feat_geom is not None and feat_types is not None:
                 types = _parse_feature_types(feat_types)
                 if types and isinstance(feat_geom, BaseGeometry) and not feat_geom.is_empty:
@@ -364,15 +413,13 @@ def _build_features(
         # ── Intersection nodes (tier ≥ 4) ─────────────────────────────────
         if tier >= 4:
             for prefix in ("start", "end"):
-                int_col = f"{prefix}_node_is_intersection_node"
-                if not _val(gdf, idx, int_col):
+                if not _rv(row, f"{prefix}_node_is_intersection_node"):
                     continue
-                gcol = f"{prefix}_node_geometry"
-                node_geom = _val(gdf, idx, gcol)
+                node_geom = _rv(row, f"{prefix}_node_geometry")
                 ng = _geo(node_geom)
                 if not ng:
                     continue
-                nid = _safe_str(_val(gdf, idx, f"{prefix}_node_id")) or ""
+                nid = _safe_str(_rv(row, f"{prefix}_node_id")) or ""
                 if nid in seen_nodes:
                     continue
                 seen_nodes.add(nid)
@@ -386,8 +433,7 @@ def _build_features(
             for side in ("left", "right"):
                 for pos in ("start", "end"):
                     for n in (1, 2, 3):
-                        gcol = f"sidewalk_{side}_curbramp_{pos}_{n}_geometry"
-                        rg = _geo(_val(gdf, idx, gcol))
+                        rg = _geo(_rv(row, f"sidewalk_{side}_curbramp_{pos}_{n}_geometry"))
                         if not rg:
                             continue
                         ramp_key = f"{side}_{pos}_{n}_{seg_id}"
@@ -421,10 +467,10 @@ async def get_features(
     gdf = _load_gdf(parquet_name)
     tier = _get_tier(zoom)
 
-    # Spatial filter — always use viewport bbox
+    # Spatial filter via STRtree — O(log n + k) instead of O(n)
     search_box = box(min_lon, min_lat, max_lon, max_lat)
-    mask = gdf["street_geometry"].intersects(search_box)
-    indices = gdf.index[mask]
+    candidates = gdf["street_geometry"].sindex.query(search_box, predicate="intersects")
+    indices = gdf.index[candidates]
 
     # Highway-type filter for lower tiers
     if tier <= 2:
@@ -491,8 +537,8 @@ async def get_rows(
     """Return attribute rows for segments in the viewport (no geometry)."""
     gdf = _load_gdf(parquet_name)
     search_box = box(min_lon, min_lat, max_lon, max_lat)
-    mask = gdf["street_geometry"].intersects(search_box)
-    indices = gdf.index[mask]
+    candidates = gdf["street_geometry"].sindex.query(search_box, predicate="intersects")
+    indices = gdf.index[candidates]
 
     rows: list[dict] = []
     for idx in indices:
@@ -739,14 +785,15 @@ class SaveResponse(BaseModel):
 
 # ── Bbox filtering helper ────────────────────────────────────────────────────
 def _filter_bbox(gdf: gpd.GeoDataFrame, bbox: BBox, buffer_m: float = 0.0) -> pd.Index:
-    """Return index labels of rows whose street_geometry intersects the buffered bbox."""
+    """Return index labels of rows whose street_geometry intersects the buffered bbox.
+    Uses STRtree spatial index for O(log n + k) performance."""
     search_box = box(
         bbox.minX - buffer_m, bbox.minY - buffer_m,
         bbox.maxX + buffer_m, bbox.maxY + buffer_m,
     )
-    geom_col = gdf.geometry if gdf.geometry.name == "street_geometry" else gdf["street_geometry"]
-    mask = geom_col.intersects(search_box)
-    return gdf.index[mask]
+    geom_series = gdf["street_geometry"]
+    candidates = geom_series.sindex.query(search_box, predicate="intersects")
+    return gdf.index[candidates]
 
 
 # ── Edit application functions ────────────────────────────────────────────────
@@ -1069,7 +1116,7 @@ def _compute_consolidation_buffer(
         return None
 
     # Run step_12 once to get current hulls (in WGS84)
-    _, current_hulls = step_12_curb_ramps_and_hulls(patch_df.copy(), _PIPELINE_CONFIG)
+    _, current_hulls = step_13_curb_ramps_and_hulls(patch_df.copy(), _PIPELINE_CONFIG)
     if current_hulls.empty:
         return None
 
@@ -1338,8 +1385,8 @@ async def save_edits(req: SaveRequest):
     # Steps 12-15: intersection analysis — runs only on affected rows
     hulls: gpd.GeoDataFrame | None = None
     if req.dirty_from_stage <= STAGE_ASSIGN_RAMPS:
-        intersection_patch_df, hulls = step_12_curb_ramps_and_hulls(intersection_patch_df, run_config)
-        hulls = step_13_merge_hulls(hulls, run_config)
+        intersection_patch_df, hulls = step_13_curb_ramps_and_hulls(intersection_patch_df, run_config)
+        hulls = step_14_merge_hulls(hulls, run_config)
         hulls = _apply_edited_hulls(hulls, req.edits.edited_hulls)
         if req.dirty_from_stage <= STAGE_BUILD_HULLS:
             stages_run.append(STAGE_BUILD_HULLS)
@@ -1347,11 +1394,11 @@ async def save_edits(req: SaveRequest):
 
     if req.dirty_from_stage <= STAGE_CREATE_XWALKS:
         if hulls is None:
-            intersection_patch_df, hulls = step_12_curb_ramps_and_hulls(intersection_patch_df, run_config)
-            hulls = step_13_merge_hulls(hulls, run_config)
+            intersection_patch_df, hulls = step_13_curb_ramps_and_hulls(intersection_patch_df, run_config)
+            hulls = step_14_merge_hulls(hulls, run_config)
             hulls = _apply_edited_hulls(hulls, req.edits.edited_hulls)
-        intersection_patch_df = step_14_crosswalk_slots(intersection_patch_df, hulls, run_config)
-        intersection_patch_df = step_15_crosswalk_geometries(
+        intersection_patch_df = step_15_crosswalk_slots(intersection_patch_df, hulls, run_config)
+        intersection_patch_df = step_16_crosswalk_geometries(
             intersection_patch_df, hulls, _EMPTY_CROSSWALK_CACHE, run_config,
         )
         stages_run.append(STAGE_CREATE_XWALKS)
@@ -1434,8 +1481,8 @@ def _save_stream(req: SaveRequest):
     hulls = None
     if req.dirty_from_stage <= STAGE_ASSIGN_RAMPS:
         yield _emit("build_hulls", 40)
-        intersection_patch_df, hulls = step_12_curb_ramps_and_hulls(intersection_patch_df, run_config)
-        hulls = step_13_merge_hulls(hulls, run_config)
+        intersection_patch_df, hulls = step_13_curb_ramps_and_hulls(intersection_patch_df, run_config)
+        hulls = step_14_merge_hulls(hulls, run_config)
         hulls = _apply_edited_hulls(hulls, req.edits.edited_hulls)
         if req.dirty_from_stage <= STAGE_BUILD_HULLS:
             stages_run.append(STAGE_BUILD_HULLS)
@@ -1444,12 +1491,12 @@ def _save_stream(req: SaveRequest):
 
     if req.dirty_from_stage <= STAGE_CREATE_XWALKS:
         if hulls is None:
-            intersection_patch_df, hulls = step_12_curb_ramps_and_hulls(intersection_patch_df, run_config)
-            hulls = step_13_merge_hulls(hulls, run_config)
+            intersection_patch_df, hulls = step_13_curb_ramps_and_hulls(intersection_patch_df, run_config)
+            hulls = step_14_merge_hulls(hulls, run_config)
             hulls = _apply_edited_hulls(hulls, req.edits.edited_hulls)
         yield _emit("create_crosswalks", 75)
-        intersection_patch_df = step_14_crosswalk_slots(intersection_patch_df, hulls, run_config)
-        intersection_patch_df = step_15_crosswalk_geometries(
+        intersection_patch_df = step_15_crosswalk_slots(intersection_patch_df, hulls, run_config)
+        intersection_patch_df = step_16_crosswalk_geometries(
             intersection_patch_df, hulls, _EMPTY_CROSSWALK_CACHE, run_config,
         )
         stages_run.append(STAGE_CREATE_XWALKS)

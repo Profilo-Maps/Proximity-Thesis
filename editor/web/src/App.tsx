@@ -7,6 +7,7 @@ import { AttributeTable } from './components/panels/AttributeTable';
 import { LayersPanel } from './components/panels/LayersPanel';
 import { SearchPanel } from './components/panels/SearchPanel';
 import { ConfigPanel } from './components/panels/ConfigPanel';
+import { DatasetPanel } from './components/panels/DatasetPanel';
 import { SubtypeSelector } from './components/SubtypeSelector';
 import { useEditorStore } from './store/editorStore';
 import { useChangesetStore } from './store/changesetStore';
@@ -22,12 +23,16 @@ export function App() {
   const setChangesetParquet = useChangesetStore((s) => s.setParquet);
   const searchOpen = useEditorStore((s) => s.searchOpen);
   const configOpen = useEditorStore((s) => s.configOpen);
+  const datasetOpen = useEditorStore((s) => s.datasetOpen);
   const toggleSearch = useEditorStore((s) => s.toggleSearch);
   const toggleConfig = useEditorStore((s) => s.toggleConfig);
+  const toggleDataset = useEditorStore((s) => s.toggleDataset);
   const [parquetList, setParquetList] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
 
-  // Initialize parquet from URL query param or auto-detect
+  // Initialize parquet from URL query param or auto-detect.
+  // Retries with backoff so the editor works even when the browser opens
+  // before the FastAPI server has finished starting.
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const fromUrl = params.get('parquet');
@@ -39,16 +44,38 @@ export function App() {
       return;
     }
 
-    fetchParquetList()
-      .then((files) => {
-        setParquetList(files);
-        if (files.length === 1) {
-          setParquet(files[0]);
-          setChangesetParquet(files[0]);
+    let cancelled = false;
+    const DELAYS = [500, 1000, 2000, 3000, 4000]; // ms between retries
+
+    const attempt = async (retries: number) => {
+      try {
+        const files = await fetchParquetList();
+        if (cancelled) return;
+        if (files.length > 0) {
+          setParquetList(files);
+          if (files.length === 1) {
+            setParquet(files[0]);
+            setChangesetParquet(files[0]);
+          }
+          setLoading(false);
+          return;
         }
-      })
-      .catch((err) => console.error('[App] Failed to list parquets:', err))
-      .finally(() => setLoading(false));
+        // Server responded but returned empty — may still be preloading
+        throw new Error('empty');
+      } catch {
+        if (cancelled) return;
+        const delay = DELAYS[retries] ?? null;
+        if (delay == null) {
+          // All retries exhausted
+          setLoading(false);
+          return;
+        }
+        setTimeout(() => attempt(retries + 1), delay);
+      }
+    };
+
+    attempt(0);
+    return () => { cancelled = true; };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleSelectParquet = (name: string) => {
@@ -93,7 +120,7 @@ export function App() {
     );
   }
 
-  const slideOpen = searchOpen || configOpen;
+  const slideOpen = searchOpen || configOpen || datasetOpen;
   const bothCollapsed = probeMinimized && historyMinimized;
 
   return (
@@ -120,10 +147,11 @@ export function App() {
       <div className="px-overlays">
         <div
           className={`px-slide-backdrop${slideOpen ? ' open' : ''}`}
-          onClick={() => { if (searchOpen) toggleSearch(); if (configOpen) toggleConfig(); }}
+          onClick={() => { if (searchOpen) toggleSearch(); if (configOpen) toggleConfig(); if (datasetOpen) toggleDataset(); }}
         />
         <SearchPanel />
         <ConfigPanel />
+        <DatasetPanel />
       </div>
     </div>
   );

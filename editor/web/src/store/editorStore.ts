@@ -83,6 +83,8 @@ interface EditorState {
   toggleSearch: () => void;
   configOpen: boolean;
   toggleConfig: () => void;
+  datasetOpen: boolean;
+  toggleDataset: () => void;
 
   // Status text
   statusText: string;
@@ -186,9 +188,11 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   setEditFeatures: (fc) => set({ editFeatures: fc }),
 
   searchOpen: false,
-  toggleSearch: () => set((s) => ({ searchOpen: !s.searchOpen, configOpen: false })),
+  toggleSearch: () => set((s) => ({ searchOpen: !s.searchOpen, configOpen: false, datasetOpen: false })),
   configOpen: false,
-  toggleConfig: () => set((s) => ({ configOpen: !s.configOpen, searchOpen: false })),
+  toggleConfig: () => set((s) => ({ configOpen: !s.configOpen, searchOpen: false, datasetOpen: false })),
+  datasetOpen: false,
+  toggleDataset: () => set((s) => ({ datasetOpen: !s.datasetOpen, configOpen: false, searchOpen: false })),
 
   statusText: '',
   setStatusText: (t) => set({ statusText: t }),

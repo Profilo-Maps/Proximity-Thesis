@@ -19,7 +19,7 @@ const DRAGGABLE_LINE_TYPES = ['street', 'bikeway', 'sidewalk'];
 const DRAGGABLE_POINT_TYPES = ['node', 'ramp', 'calm'];
 
 /** Vertex layers that receive pointer events */
-const VERTEX_LAYERS = ['px-vertices-end', 'px-vertices-mid'];
+export const VERTEX_LAYERS = ['px-vertices-end', 'px-vertices-mid'];
 
 interface DragState {
   /** Source feature _seg_id or _fid */
@@ -56,7 +56,7 @@ export function extractVertices(fc: FeatureCollection | null, selectedSegmentId?
           _src_id: fid,
           _src_type: t,
           _vi: -1,
-          _endpoint: true,
+          _endpoint: 1,
         },
       });
       continue;
@@ -66,7 +66,9 @@ export function extractVertices(fc: FeatureCollection | null, selectedSegmentId?
     if (!DRAGGABLE_LINE_TYPES.includes(t)) continue;
     if (f.geometry.type !== 'LineString') continue;
 
-    const fid = f.properties?._seg_id ?? f.properties?._fid ?? '';
+    // _fid is unique per sub-feature (e.g. "bk_left_1_16_13_735" for bikeways),
+    // _seg_id is the parent street grid id — use _fid first for exact match
+    const fid = f.properties?._fid ?? f.properties?._seg_id ?? '';
 
     // If a segment is selected, only show vertices for that segment
     if (selectedSegmentId && fid !== selectedSegmentId) continue;
@@ -81,7 +83,7 @@ export function extractVertices(fc: FeatureCollection | null, selectedSegmentId?
           _src_id: fid,
           _src_type: t,
           _vi: i,
-          _endpoint: isEndpoint,
+          _endpoint: isEndpoint ? 1 : 0,
         },
       });
     }
@@ -98,26 +100,33 @@ export function useVertexDrag(mapRef: React.RefObject<maplibregl.Map | null>) {
 
   const isVertexTool = activeTool === 'move_point';
 
-  // Show/hide vertex layers — only when move_point tool is active
+  // Populate vertex source whenever selection or features change.
+  // Vertex layers are always added to the map; an empty source = nothing rendered.
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || !map.isStyleLoaded()) return;
+    if (!map) return;
 
-    const vis = isVertexTool ? 'visible' : 'none';
-    for (const id of VERTEX_LAYERS) {
-      try { map.setLayoutProperty(id, 'visibility', vis); } catch { /* layer may not exist yet */ }
+    // Match by _fid first (unique per sub-feature), then _seg_id fallback
+    const isLine = selectedFeatureId != null && features != null &&
+      features.features.some((f) => {
+        const p = f.properties;
+        if (!p || !DRAGGABLE_LINE_TYPES.includes(p._t)) return false;
+        return p._fid === selectedFeatureId || p._seg_id === selectedFeatureId;
+      });
+
+    const updateSource = () => {
+      const src = map.getSource('proximity-vertices') as maplibregl.GeoJSONSource | undefined;
+      const vfc = extractVertices(isLine ? features : null, selectedFeatureId);
+      console.log('[VertexDrag]', { selectedFeatureId, isLine, featureCount: features?.features.length, vertexCount: vfc.features.length, srcFound: !!src });
+      if (src) src.setData(vfc);
+    };
+
+    if (map.isStyleLoaded()) {
+      updateSource();
+    } else {
+      map.once('load', updateSource);
     }
-  }, [isVertexTool, mapRef]);
-
-  // Rebuild vertex source when features change (only relevant when tool is active)
-  // Only show vertices for the selected segment to avoid cluttering the map
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map || !map.isStyleLoaded()) return;
-    const src = map.getSource('proximity-vertices') as maplibregl.GeoJSONSource | undefined;
-    if (!src) return;
-    src.setData(extractVertices(isVertexTool ? features : null, isVertexTool ? selectedFeatureId : null));
-  }, [features, isVertexTool, selectedFeatureId, mapRef]);
+  }, [selectedFeatureId, features, mapRef]);
 
   /** Find the vertex point under the cursor */
   const hitTestVertex = useCallback((e: maplibregl.MapMouseEvent): DragState | null => {
@@ -138,7 +147,7 @@ export function useVertexDrag(mapRef: React.RefObject<maplibregl.Map | null>) {
       featureType: (h.properties?._src_type ?? '') as string,
       vertexIndex: h.properties?._vi as number,
       originalCoords: (h.geometry as Point).coordinates as [number, number],
-      isEndpoint: h.properties?._endpoint as boolean,
+      isEndpoint: h.properties?._endpoint === 1,
     };
   }, [mapRef]);
 

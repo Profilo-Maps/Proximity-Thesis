@@ -59,6 +59,7 @@ _NON_ROAD_HIGHWAY = frozenset({
 })
 
 _TC_COINCIDENCE_THRESHOLD_M = 5.0  # snap distance for traffic-calming matching
+_CURB_RAMP_DATA_PATH: str = ""
 
 # ── OSM tags to request ──────────────────────────────────────────────────────
 _EXTRA_WAY_TAGS = [
@@ -155,6 +156,10 @@ class PipelineConfig:
     # ── Network filter ────────────────────────────────────────────────────
     network_type: str = "all"
     custom_filter: str | None = None
+
+    # ── Curb ramp enrichment (step 17) ────────────────────────────────────
+    curb_ramp_data_path: str = "Data/Curb_Ramps_20260217.csv"
+    curb_ramp_match_radius_m: float = 5.0
 
     @classmethod
     def from_json(cls, path: str) -> PipelineConfig:
@@ -300,6 +305,21 @@ def _build_empty_schema() -> dict[str, Any]:
             cols[f"{pfx}_feature_types"] = None
             cols[f"public_data_id_{pfx}_features"] = None
 
+    # ── Neighbor adjacency lists ─────────────────────────────────────────
+    # Each column stores a list of grid IDs of adjacent segments (sidewalks,
+    # crosswalks, bikeways) connecting at the start (from) or end (to) of
+    # this facility. Used for pedestrian/cycling graph traversal.
+    for side in ("left", "right"):
+        cols[f"sidewalk_{side}_from_segments"] = None
+        cols[f"sidewalk_{side}_to_segments"] = None
+    for pos in ("start", "end"):
+        cols[f"crosswalk_{pos}_from_segments"] = None
+        cols[f"crosswalk_{pos}_to_segments"] = None
+    for side in ("left", "right"):
+        for n in (1, 2):
+            cols[f"bikeway_{side}_{n}_from_segments"] = None
+            cols[f"bikeway_{side}_{n}_to_segments"] = None
+
     # ── Geometry columns default to None ──────────────────────────────────
     for gc in GEOMETRY_COLUMNS:
         cols[gc] = None
@@ -377,7 +397,7 @@ def _first_if_list(val: Any) -> Any:
 
 def _scalar_col(series: pd.Series) -> pd.Series:
     """Coerce a Series that may contain lists to scalar values (take first element)."""
-    if series.apply(lambda v: isinstance(v, list)).any():
+    if any(type(v) is list for v in series):
         return series.apply(_first_if_list)
     return series
 
@@ -576,32 +596,53 @@ def _extract_crossing_node_cache(nodes_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFram
                                  geometry="geometry", crs=nodes_gdf.crs)
 
     sub = nodes_gdf.loc[relevant].copy()
-    rows = []
-    for osmid in sub.index:
-        def _s(col: pd.Series) -> str | None:
-            v = col.at[osmid]
-            return str(v).strip() if not pd.isna(v) else None
+    idx = sub.index
 
-        c_val = _s(crossing_col)
-        hw_val = _s(highway_col)
-        sig_val = _s(signals_col)
+    def _str_col(col: pd.Series) -> pd.Series:
+        """Convert a series to stripped str values; NA → None."""
+        s = col.loc[idx]
+        mask = s.notna()
+        result = pd.Series(None, index=idx, dtype=object)
+        result[mask] = s[mask].astype(str).str.strip()
+        return result
 
-        rows.append({
-            "osmid": int(osmid),
-            "geometry": sub.at[osmid, "geometry"],
-            "type": c_val or (hw_val if hw_val == "crossing" else None),
-            "controlled": "yes" if (c_val in _SIGNAL_TYPES or sig_val in ("yes", "traffic_signals")) else None,
-            "marked": "yes" if (c_val in _MARKED_TYPES or _s(markings_col) in ("yes", "lines", "dots", "dashes")) else None,
-            "markings": _s(markings_col),
-            "signals": sig_val,
-            "island": _s(island_col),
-            "kerb": _s(kerb_col),
-            "tactile_paving": _s(tp_col),
-            "traffic_calming": _s(tc_col),
-            "continuous": _s(continuous_col),
-        })
+    c_vals   = _str_col(crossing_col)
+    hw_vals  = _str_col(highway_col)
+    sig_vals = _str_col(signals_col)
+    mark_vals = _str_col(markings_col)
+    isl_vals  = _str_col(island_col)
+    kerb_vals = _str_col(kerb_col)
+    tp_vals   = _str_col(tp_col)
+    tc_vals   = _str_col(tc_col)
+    cont_vals = _str_col(continuous_col)
 
-    return gpd.GeoDataFrame(rows, geometry="geometry", crs=nodes_gdf.crs)
+    # type: c_val or (hw_val if hw_val == "crossing" else None)
+    type_vals = c_vals.where(c_vals.notna(),
+                             hw_vals.where(hw_vals == "crossing", other=None))
+
+    # controlled: "yes" if signal type, else None
+    controlled_bool = c_vals.isin(_SIGNAL_TYPES) | sig_vals.isin(("yes", "traffic_signals"))
+    controlled_vals = controlled_bool.map({True: "yes", False: None})
+
+    # marked: "yes" if marked type or markings tag matches, else None
+    marked_bool = c_vals.isin(_MARKED_TYPES) | mark_vals.isin(("yes", "lines", "dots", "dashes"))
+    marked_vals = marked_bool.map({True: "yes", False: None})
+
+    result_df = pd.DataFrame({
+        "osmid":         idx.astype(int),
+        "geometry":      sub["geometry"].values,
+        "type":          type_vals.values,
+        "controlled":    controlled_vals.values,
+        "marked":        marked_vals.values,
+        "markings":      mark_vals.values,
+        "signals":       sig_vals.values,
+        "island":        isl_vals.values,
+        "kerb":          kerb_vals.values,
+        "tactile_paving": tp_vals.values,
+        "traffic_calming": tc_vals.values,
+        "continuous":    cont_vals.values,
+    })
+    return gpd.GeoDataFrame(result_df, geometry="geometry", crs=nodes_gdf.crs)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -761,16 +802,34 @@ def step_01_create_parquet(config: PipelineConfig) -> gpd.GeoDataFrame:
 # ---------------------------------------------------------------------------
 # Step 2 — Load OSM streets into parquet, cache crosswalk data
 # ---------------------------------------------------------------------------
+def _load_or_cache_graph(place: str, network_type: str, suffix: str = "") -> Any:
+    """Download an OSMnx graph or load from pickle cache."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    slug = place.replace("/", "_").replace(" ", "_")
+    cache_file = CACHE_DIR / f"{slug}{suffix}.pkl"
+    if cache_file.exists():
+        log.info("  Loading cached %s graph from %s", network_type, cache_file)
+        with open(cache_file, "rb") as f:
+            return pickle.load(f)
+    log.info("  Downloading %s graph from OSM…", network_type)
+    G = ox.graph_from_place(place, network_type=network_type)
+    with open(cache_file, "wb") as f:
+        pickle.dump(G, f)
+    log.info("  Cached %s graph to %s", network_type, cache_file)
+    return G
+
+
 def step_02_load_streets(
     gdf: gpd.GeoDataFrame,
     config: PipelineConfig,
-) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, Any, gpd.GeoDataFrame, gpd.GeoDataFrame]:
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, Any, gpd.GeoDataFrame,
+           gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame]:
     """
-    Pull street network from OSM via OSMnx, populate street columns.
-    Returns (gdf, crosswalk_cache, G, nodes_gdf, edges_reset).
+    Pull street, walk, and bike networks from OSM via OSMnx, populate street columns.
+    Returns (gdf, crosswalk_cache, G, nodes_gdf, edges_reset, walk_edges, bike_edges).
     """
     place = config.place_name
-    log.info("Step 2: Loading OSM streets for %s", place)
+    log.info("Step 2: Loading OSM networks for %s", place)
 
     # ── Configure OSMnx tags ──────────────────────────────────────────────
     ox.settings.useful_tags_way = list(set(
@@ -780,24 +839,23 @@ def step_02_load_streets(
         ox.settings.useful_tags_node + _CROSSING_NODE_TAGS
     ))
 
-    # ── Download / cache graph ────────────────────────────────────────────
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_file = CACHE_DIR / f"{place.replace('/', '_').replace(' ', '_')}.pkl"
-    if cache_file.exists():
-        log.info("  Loading cached graph from %s", cache_file)
-        with open(cache_file, "rb") as f:
-            G = pickle.load(f)
-    else:
-        log.info("  Downloading graph from OSM…")
-        G = ox.graph_from_place(place, network_type=config.network_type)
-        with open(cache_file, "wb") as f:
-            pickle.dump(G, f)
-        log.info("  Cached graph to %s", cache_file)
+    # ── Download / cache graphs ───────────────────────────────────────────
+    G = _load_or_cache_graph(place, config.network_type)
+    G_walk = _load_or_cache_graph(place, "walk", suffix="_walk")
+    G_bike = _load_or_cache_graph(place, "bike", suffix="_bike")
 
     # ── Convert to GeoDataFrames ──────────────────────────────────────────
     nodes, edges = ox.graph_to_gdfs(G)
-    edges_reset = edges.reset_index()  # flatten (u, v, key) → numeric index
-    log.info("  %d edges, %d nodes", len(edges_reset), len(nodes))
+    edges_reset = edges.reset_index()
+    log.info("  Street network: %d edges, %d nodes", len(edges_reset), len(nodes))
+
+    _, walk_edges_raw = ox.graph_to_gdfs(G_walk)
+    walk_edges = walk_edges_raw.reset_index()
+    log.info("  Walk network: %d edges", len(walk_edges))
+
+    _, bike_edges_raw = ox.graph_to_gdfs(G_bike)
+    bike_edges = bike_edges_raw.reset_index()
+    log.info("  Bike network: %d edges", len(bike_edges))
 
     # ── Build crosswalk cache from nodes ──────────────────────────────────
     crosswalk_cache = _extract_crossing_node_cache(nodes)
@@ -818,17 +876,17 @@ def step_02_load_streets(
         ms_str = ms_str.str.replace(_sfx, "", regex=False)
     maxspeed_vals = pd.to_numeric(ms_str, errors="coerce").fillna(config.default_maxspeed).astype(np.int64).values
 
-    # Parse lanes — flatten lists, convert to nullable int
+    # Parse lanes — flatten lists, convert to nullable Int64 array (avoids Python list comprehension)
     lanes_raw = _safe_col(edges_reset, "lanes")
     _lanes_flat = lanes_raw.apply(lambda v: v[0] if isinstance(v, list) else v)
-    lanes_vals = pd.to_numeric(_lanes_flat.astype(str).str.strip(), errors="coerce")
-    lanes_vals = [int(v) if pd.notna(v) else None for v in lanes_vals]
+    _lanes_numeric = pd.to_numeric(_lanes_flat.astype(str).str.strip(), errors="coerce")
+    lanes_vals = pd.array(_lanes_numeric, dtype="Int64")  # NA-safe nullable int
 
-    # Parse lane_width — flatten lists, convert to nullable float
+    # Parse lane_width — flatten lists, convert to nullable Float64 array
     lw_raw = _safe_col(edges_reset, "lane_width")
     _lw_flat = lw_raw.apply(lambda v: v[0] if isinstance(v, list) else v)
-    lw_vals = pd.to_numeric(_lw_flat.astype(str).str.strip(), errors="coerce")
-    lw_vals = [float(v) if pd.notna(v) else None for v in lw_vals]
+    _lw_numeric = pd.to_numeric(_lw_flat.astype(str).str.strip(), errors="coerce")
+    lw_vals = pd.array(_lw_numeric, dtype="Float64")
 
     # Stringify osmid (may be int or list of ints from simplification)
     street_ids = edges_reset["osmid"].astype(str).values
@@ -860,7 +918,7 @@ def step_02_load_streets(
     log.info("Step 2: Populated %d street segments, %d schema columns",
              len(populated), len(populated.columns))
 
-    return populated, crosswalk_cache, G, nodes, edges_reset
+    return populated, crosswalk_cache, G, nodes, edges_reset, walk_edges, bike_edges
 
 
 # ---------------------------------------------------------------------------
@@ -1200,8 +1258,8 @@ def step_06_usgs_elevation(
         pd.DataFrame({"node_id": _end_ids[_er],   "x": _xs_end[_er],   "y": _ys_end[_er]}),
     ]).dropna(subset=["x", "y"]).drop_duplicates("node_id")
     unique_points: dict[int, tuple[float, float]] = {
-        int(r["node_id"]): (float(r["x"]), float(r["y"]))
-        for _, r in _node_df.iterrows()
+        int(nid): (float(x), float(y))
+        for nid, x, y in zip(_node_df["node_id"], _node_df["x"], _node_df["y"])
     }
 
     log.info("  %d unique nodes to query", len(unique_points))
@@ -1332,15 +1390,27 @@ def step_07_populate_facilities(
     gdf: gpd.GeoDataFrame,
     config: PipelineConfig,
     edges_reset: gpd.GeoDataFrame | None = None,
+    walk_edges: gpd.GeoDataFrame | None = None,
+    bike_edges: gpd.GeoDataFrame | None = None,
 ) -> gpd.GeoDataFrame:
     """Populate bikeway and sidewalk presence/attribute columns from inline OSM tags.
 
     Uses cascade precedence: side-specific tag > :both tag > bare tag.
+    Walk/bike edge GeoDataFrames carry the pedestrian and cycling network topology
+    from OSM; stored on the GDF as attrs for use by downstream neighbor computation.
     """
     if edges_reset is None:
         log.warning("Step 7: No edges_reset provided, skipping facility population")
         return gdf
     log.info("Step 7: Populating sidewalk and bikeway tags")
+
+    # Store walk/bike topology for downstream neighbor computation (step 11b)
+    if walk_edges is not None:
+        gdf.attrs["_walk_edges"] = walk_edges
+        log.info("  Walk topology stored: %d edges", len(walk_edges))
+    if bike_edges is not None:
+        gdf.attrs["_bike_edges"] = bike_edges
+        log.info("  Bike topology stored: %d edges", len(bike_edges))
 
     er = edges_reset  # alias
 
@@ -1481,8 +1551,8 @@ _ROAD_HW = frozenset({
 })
 _MATCH_RADIUS_M = 30.0
 _PARALLEL_THRESHOLD_DEG = 45.0
-_DEDUP_BUFFER_M = 3.0        # tight buffer for coincidence check
-_DEDUP_COVERAGE_THRESHOLD = 0.80  # fraction of road length that must be covered
+_DEDUP_BUFFER_M = 1.0        # tight buffer for coincidence check
+_DEDUP_COVERAGE_THRESHOLD = 0.90  # fraction of road length that must be covered
 
 
 def step_09_match_separate_facilities(
@@ -1530,6 +1600,7 @@ def step_09_match_separate_facilities(
     bike_used: set[tuple[int, str, str]] = set()  # (road_idx, side, slot)
     matched_cycle = matched_foot = 0
     duplicate_to_centerline: dict[int, int] = {}  # dup_road_idx → true_centerline_idx
+    coincident_no_road: set[int] = set()  # dup_road_idx with no true centerline to map to
 
     fac_indices = gdf.index[is_cycleway | is_footway]
     for fac_idx in tqdm(fac_indices, desc="Matching facilities", unit="seg"):
@@ -1566,46 +1637,57 @@ def step_09_match_separate_facilities(
             coincident_positions = []
             score_positions = candidates
 
-        # Score candidates: prefer name match, bearing parallelism, proximity
-        best_road, best_score, best_side = None, float("inf"), "left"
-        for cand_pos in score_positions:
-            cand_idx = road_idx[cand_pos]
-            road_geom = road_geoms_utm.iloc[cand_pos]
-            dist = fac_geom.distance(road_geom)
-
-            # Bearing parallelism check
-            rb = road_bearings.get(cand_idx, 0.0)
-            axis_diff = abs((fac_bear % 180) - (rb % 180))
-            if axis_diff > 90:
-                axis_diff = 180 - axis_diff
-            if axis_diff > _PARALLEL_THRESHOLD_DEG:
-                continue
-
-            # Name bonus
-            fac_name = gdf.at[fac_idx, "name"]
-            road_name = road_names.get(cand_idx)
-            name_bonus = -10.0 if (fac_name and road_name and str(fac_name).strip() == str(road_name).strip()) else 0.0
-
-            score = dist + name_bonus
-
-            # Determine side: project facility midpoint onto road, check which side
+        def _compute_side(road_geom: Any, fac_geom: Any) -> str:
             fac_mid = fac_geom.interpolate(0.5, normalized=True)
             proj_dist = road_geom.project(fac_mid)
             proj_pt = road_geom.interpolate(proj_dist)
-            # Cross product to determine left/right
             rc = list(road_geom.coords)
             seg_start_i = max(0, min(int(proj_dist / road_geom.length * (len(rc) - 1)), len(rc) - 2))
-            rx, ry = rc[seg_start_i + 1][0] - rc[seg_start_i][0], rc[seg_start_i + 1][1] - rc[seg_start_i][1]
+            rx = rc[seg_start_i + 1][0] - rc[seg_start_i][0]
+            ry = rc[seg_start_i + 1][1] - rc[seg_start_i][1]
             fx, fy = fac_mid.x - proj_pt.x, fac_mid.y - proj_pt.y
-            cross = rx * fy - ry * fx
-            side = "left" if cross > 0 else "right"
+            return "left" if (rx * fy - ry * fx) > 0 else "right"
 
-            if score < best_score:
-                best_score = score
-                best_road = cand_idx
-                best_side = side
+        # Name match takes priority: if any candidate shares the footway name,
+        # pick the closest among them immediately without bearing/distance scoring.
+        best_road, best_side = None, "left"
+        fac_name = str(gdf.at[fac_idx, "name"]).strip() if gdf.at[fac_idx, "name"] else ""
+        if fac_name:
+            name_matches = [
+                (road_idx[p], road_geoms_utm.iloc[p])
+                for p in score_positions
+                if str(road_names.get(road_idx[p], "") or "").strip() == fac_name
+            ]
+            if name_matches:
+                best_cand_idx, best_geom = min(name_matches, key=lambda t: fac_geom.distance(t[1]))
+                best_road = best_cand_idx
+                best_side = _compute_side(best_geom, fac_geom)
+
+        # Fallback: score by bearing parallelism + proximity
+        if best_road is None:
+            best_score = float("inf")
+            for cand_pos in score_positions:
+                cand_idx = road_idx[cand_pos]
+                road_geom = road_geoms_utm.iloc[cand_pos]
+
+                rb = road_bearings.get(cand_idx, 0.0)
+                axis_diff = abs((fac_bear % 180) - (rb % 180))
+                if axis_diff > 90:
+                    axis_diff = 180 - axis_diff
+                if axis_diff > _PARALLEL_THRESHOLD_DEG:
+                    continue
+
+                dist = fac_geom.distance(road_geom)
+                if dist < best_score:
+                    best_score = dist
+                    best_road = cand_idx
+                    best_side = _compute_side(road_geom, fac_geom)
 
         if best_road is None:
+            # No true road candidate — coincident rows are still dropped (footway is
+            # the correct geometry; no centerline exists to consolidate attributes into)
+            for cand_pos in coincident_positions:
+                coincident_no_road.add(road_idx[cand_pos])
             continue
 
         # Record coincident road rows as duplicates of the true centerline
@@ -1670,6 +1752,13 @@ def step_09_match_separate_facilities(
         gdf = gdf.drop(index=dup_indices)
         log.info("  Removed %d mistagged street rows coinciding with sidewalk segments",
                  len(duplicate_to_centerline))
+
+    if coincident_no_road:
+        # Drop coincident road rows that had no true parallel centerline
+        orphan_drop = list(coincident_no_road - set(duplicate_to_centerline.keys()))
+        if orphan_drop:
+            gdf = gdf.drop(index=orphan_drop)
+            log.info("  Removed %d coincident road rows with no true centerline", len(orphan_drop))
 
     # Generate offset geometries for remaining facilities
     gdf = _generate_offset_geometries(gdf, config)
@@ -1757,9 +1846,9 @@ def _generate_offset_geometries(
 
 
 # ---------------------------------------------------------------------------
-# Step 10 — Snap sidewalk endpoints at intersections
+# Step 12 — Snap sidewalk endpoints at intersections
 # ---------------------------------------------------------------------------
-def step_10_snap_endpoints(
+def step_12_snap_endpoints(
     gdf: gpd.GeoDataFrame,
     config: PipelineConfig,
 ) -> gpd.GeoDataFrame:
@@ -1776,7 +1865,7 @@ def step_10_snap_endpoints(
       (d) Trim sidewalks that cross a street centerline
       (e) Roundabout entry corners — pair closest endpoints
     """
-    log.info("Step 10: Snapping sidewalk endpoints")
+    log.info("Step 12: Snapping sidewalk endpoints")
 
     # Consolidate any MultiLineString sidewalk geometries produced by
     # offset_curve (on curved roads) or OSMnx footway edge simplification.
@@ -2002,7 +2091,7 @@ def step_10_snap_endpoints(
                 cross_trimmed += 1
 
     trimmed += cross_trimmed
-    log.info("Step 10: Snapped %d endpoints, trimmed %d crossings (%d cross-sidewalk)",
+    log.info("Step 12: Snapped %d endpoints, trimmed %d crossings (%d cross-sidewalk)",
              snapped, trimmed, cross_trimmed)
     return gdf
 
@@ -2207,9 +2296,118 @@ def step_11_facility_grid_ids(
 
 
 # ---------------------------------------------------------------------------
-# Step 12 — Place curb ramps and build intersection hulls
+# Step 11b — Compute sidewalk / bikeway / crosswalk neighbor adjacency
 # ---------------------------------------------------------------------------
-def step_12_curb_ramps_and_hulls(
+
+def step_11b_compute_neighbors(
+    gdf: gpd.GeoDataFrame,
+    config: PipelineConfig,
+) -> gpd.GeoDataFrame:
+    """Populate from_segments / to_segments columns on each facility.
+
+    For each sidewalk, bikeway, and crosswalk, determine which other facility
+    segments connect at each end (start-node end = from, end-node end = to).
+    Sources of adjacency:
+      1. Road-node topology: roads sharing intersection nodes → their facilities
+         are neighbors at that node.
+      2. Walk/bike network topology (if stored in gdf.attrs): explicitly-connected
+         OSM footway/cycleway edges → their matched road-row facilities.
+      3. Mid-block splits: consecutive segments from the same OSM way that were
+         split by step 03 share an intermediate node.
+    """
+    log.info("Step 11b: Computing facility neighbor adjacency")
+
+    # ── Build node → facility mapping ─────────────────────────────────────
+    # For each intersection node, collect all facility IDs whose parent road
+    # meets that node (at start or end).
+    node_to_fac_start: dict[Any, list[str]] = defaultdict(list)  # node → IDs at their start
+    node_to_fac_end: dict[Any, list[str]] = defaultdict(list)    # node → IDs at their end
+
+    for idx in gdf.index:
+        start_nid = gdf.at[idx, "start_node_id"]
+        end_nid = gdf.at[idx, "end_node_id"]
+
+        for side in ("left", "right"):
+            sw_id = gdf.at[idx, f"sidewalk_{side}_grid_ID"]
+            if sw_id is not None and not (isinstance(sw_id, float) and pd.isna(sw_id)):
+                node_to_fac_start[start_nid].append(str(sw_id))
+                node_to_fac_end[end_nid].append(str(sw_id))
+
+        for side in ("left", "right"):
+            for n in (1, 2):
+                bk_id = gdf.at[idx, f"bikeway_{side}_{n}_grid_id"]
+                if bk_id is not None and not (isinstance(bk_id, float) and pd.isna(bk_id)):
+                    node_to_fac_start[start_nid].append(str(bk_id))
+                    node_to_fac_end[end_nid].append(str(bk_id))
+
+        for pos in ("start", "end"):
+            xw_id = gdf.at[idx, f"crosswalk_{pos}_id"]
+            if xw_id is not None and not (isinstance(xw_id, float) and pd.isna(xw_id)):
+                # Crosswalk connects at the node corresponding to its pos
+                nid = start_nid if pos == "start" else end_nid
+                node_to_fac_start[nid].append(str(xw_id))
+                node_to_fac_end[nid].append(str(xw_id))
+
+    # ── Build adjacency: for each facility, neighbors at each end ─────────
+    # A facility's "from" neighbors = other facilities at the same start node
+    # A facility's "to" neighbors = other facilities at the same end node
+
+    total_links = 0
+    for idx in gdf.index:
+        start_nid = gdf.at[idx, "start_node_id"]
+        end_nid = gdf.at[idx, "end_node_id"]
+
+        # All facilities meeting at start_nid and end_nid
+        at_start = set(node_to_fac_start.get(start_nid, []) +
+                       node_to_fac_end.get(start_nid, []))
+        at_end = set(node_to_fac_start.get(end_nid, []) +
+                     node_to_fac_end.get(end_nid, []))
+
+        for side in ("left", "right"):
+            sw_id = gdf.at[idx, f"sidewalk_{side}_grid_ID"]
+            if sw_id is None or (isinstance(sw_id, float) and pd.isna(sw_id)):
+                continue
+            sw_id_str = str(sw_id)
+            from_nbrs = sorted(at_start - {sw_id_str})
+            to_nbrs = sorted(at_end - {sw_id_str})
+            gdf.at[idx, f"sidewalk_{side}_from_segments"] = from_nbrs  # type: ignore[call-overload]
+            gdf.at[idx, f"sidewalk_{side}_to_segments"] = to_nbrs  # type: ignore[call-overload]
+            total_links += len(from_nbrs) + len(to_nbrs)
+
+        for side in ("left", "right"):
+            for n in (1, 2):
+                pfx = f"bikeway_{side}_{n}"
+                bk_id = gdf.at[idx, f"{pfx}_grid_id"]
+                if bk_id is None or (isinstance(bk_id, float) and pd.isna(bk_id)):
+                    continue
+                bk_id_str = str(bk_id)
+                from_nbrs = sorted(at_start - {bk_id_str})
+                to_nbrs = sorted(at_end - {bk_id_str})
+                gdf.at[idx, f"{pfx}_from_segments"] = from_nbrs  # type: ignore[call-overload]
+                gdf.at[idx, f"{pfx}_to_segments"] = to_nbrs  # type: ignore[call-overload]
+                total_links += len(from_nbrs) + len(to_nbrs)
+
+        for pos in ("start", "end"):
+            xw_id = gdf.at[idx, f"crosswalk_{pos}_id"]
+            if xw_id is None or (isinstance(xw_id, float) and pd.isna(xw_id)):
+                continue
+            xw_id_str = str(xw_id)
+            nid = start_nid if pos == "start" else end_nid
+            at_xw = set(node_to_fac_start.get(nid, []) +
+                        node_to_fac_end.get(nid, []))
+            xw_nbrs = sorted(at_xw - {xw_id_str})
+            gdf.at[idx, f"crosswalk_{pos}_from_segments"] = xw_nbrs  # type: ignore[call-overload]
+            gdf.at[idx, f"crosswalk_{pos}_to_segments"] = xw_nbrs  # type: ignore[call-overload]
+            total_links += len(xw_nbrs) * 2
+
+    log.info("Step 11b: %d adjacency links computed", total_links)
+    return gdf
+
+
+# ---------------------------------------------------------------------------
+# Step 13 — Place curb ramps and build intersection hulls
+# ---------------------------------------------------------------------------
+def step_13_curb_ramps_and_hulls(
     gdf: gpd.GeoDataFrame,
     config: PipelineConfig,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
@@ -2218,7 +2416,7 @@ def step_12_curb_ramps_and_hulls(
 
     Returns (gdf, hulls_gdf).
     """
-    log.info("Step 12: Placing curb ramps and building intersection hulls")
+    log.info("Step 13: Placing curb ramps and building intersection hulls")
 
     # Identify intersection nodes
     isect_start = gdf.loc[gdf["start_node_is_intersection_node"]]
@@ -2243,6 +2441,9 @@ def step_12_curb_ramps_and_hulls(
     # zone and should not stretch the hull toward it.
     _HULL_RAMP_MAX_DIST_M = 15.0
     node_utm_coords: dict[Any, tuple[float, float]] = {}
+    _new_nids: list[Any] = []
+    _new_xs: list[float] = []
+    _new_ys: list[float] = []
     for geom_col, id_col in [
         ("start_node_geometry", "start_node_id"),
         ("end_node_geometry",   "end_node_id"),
@@ -2253,8 +2454,17 @@ def step_12_curb_ramps_and_hulls(
             if nid in node_utm_coords:
                 continue
             if isinstance(g, Point) and not g.is_empty:
-                nx, ny = _to_utm.transform(g.x, g.y)
-                node_utm_coords[nid] = (float(nx), float(ny))
+                node_utm_coords[nid] = None  # placeholder to avoid duplicates
+                _new_nids.append(nid)
+                _new_xs.append(g.x)
+                _new_ys.append(g.y)
+    if _new_nids:
+        _uxs, _uys = _to_utm.transform(
+            np.array(_new_xs, dtype=np.float64),
+            np.array(_new_ys, dtype=np.float64),
+        )
+        for nid, ux, uy in zip(_new_nids, _uxs, _uys):
+            node_utm_coords[nid] = (float(ux), float(uy))
 
     hull_rows = []
     ramps_placed = 0
@@ -2264,6 +2474,7 @@ def step_12_curb_ramps_and_hulls(
         ramp_points: list[Point] = []
         ramp_info: list[tuple[int, str, str, Point]] = []  # (seg_idx, side, pos, point)
 
+        # ── Topology 1: Sidewalk endpoint nearest to intersection node ───
         for seg_idx, which_end in seg_ends:
             # Fetch the street-node geometry to resolve endpoint direction
             node_geom_col = "start_node_geometry" if which_end == "start" else "end_node_geometry"
@@ -2292,28 +2503,49 @@ def step_12_curb_ramps_and_hulls(
                 ramp_points.append(pt)
                 ramp_info.append((seg_idx, side, which_end, pt))
 
-        # ── 2A: Node-proxy hull points for presence-without-geometry ────
-        # When a segment has sidewalk presence (OSM tag) but no geometry
-        # (matching/offset failed), use the node's own Point as a proxy
-        # hull vertex so the hull covers all approach directions.
-        for seg_idx, which_end in seg_ends:
-            ngc = "start_node_geometry" if which_end == "start" else "end_node_geometry"
-            npt = gdf.at[seg_idx, ngc]
-            if not isinstance(npt, Point) or npt.is_empty:
-                continue
-            for side in ("left", "right"):
-                pres = gdf.at[seg_idx, f"sidewalk_{side}_presence"]
-                if not isinstance(pres, str):
-                    continue
-                if pres.strip().lower() not in ("separate", "yes", "both", "left", "right"):
-                    continue
-                sw_g = gdf.at[seg_idx, f"sidewalk_{side}_geometry"]
-                if sw_g is not None and isinstance(sw_g, BaseGeometry) and not sw_g.is_empty:
-                    continue  # geometry exists — endpoint already collected above
-                ramp_points.append(npt)
-                ramp_info.append((seg_idx, side, which_end, npt))
+        # ── Topology 2: Sidewalk-sidewalk geometric crossings ────────────
+        # When two sidewalk geometries from arms of this intersection cross
+        # each other (e.g. a footway mapped through the full intersection
+        # crossing orthogonal sidewalks), the crossing points are curb ramps.
+        # Each crossing point is assigned to both sidewalks involved.
+        node_utm_coord = node_utm_coords.get(node_id)
+        if node_utm_coord is not None and len(ramp_info) >= 2:
+            # Collect all (seg_idx, side, pos, wgs_geom) for this node
+            sw_line_geoms: list[tuple[int, str, str, Any]] = []
+            for seg_idx, which_end in seg_ends:
+                for side in ("left", "right"):
+                    sw_g = gdf.at[seg_idx, f"sidewalk_{side}_geometry"]
+                    if sw_g is None or not isinstance(sw_g, BaseGeometry) or sw_g.is_empty:
+                        continue
+                    sw_line_geoms.append((seg_idx, side, which_end, sw_g))
+            for i in range(len(sw_line_geoms)):
+                for j in range(i + 1, len(sw_line_geoms)):
+                    si, ss, sp, sg = sw_line_geoms[i]
+                    ti, ts, tp, tg = sw_line_geoms[j]
+                    if si == ti and ss == ts:
+                        continue  # same geometry
+                    xsect = sg.intersection(tg)
+                    if xsect is None or xsect.is_empty:
+                        continue
+                    pts = list(xsect.geoms) if hasattr(xsect, "geoms") else [xsect]
+                    for cp in pts:
+                        if not isinstance(cp, Point):
+                            continue
+                        cpx, cpy = _to_utm.transform(
+                            np.array([cp.x], dtype=np.float64),
+                            np.array([cp.y], dtype=np.float64),
+                        )
+                        dist = math.hypot(float(cpx[0]) - node_utm_coord[0],
+                                          float(cpy[0]) - node_utm_coord[1])
+                        if dist > _HULL_RAMP_MAX_DIST_M:
+                            continue
+                        # Assign to both sidewalks involved in the crossing
+                        ramp_points.append(cp)
+                        ramp_info.append((si, ss, sp, cp))
+                        ramp_points.append(cp)
+                        ramp_info.append((ti, ts, tp, cp))
 
-        # ── 2B: Footway-footway shared intermediate nodes ───────────────
+        # ── Topology 3: Footway-footway shared intermediate nodes ────────
         # When two footway arms share an intermediate node (physical footway
         # crossing), include that shared node as a hull vertex and ramp point.
         footway_arms = [
@@ -2357,7 +2589,7 @@ def step_12_curb_ramps_and_hulls(
         if k > 1:
             _coords = np.column_stack([ux, uy])
             _diff   = _coords[:, None, :] - _coords[None, :, :]
-            _dists  = np.sqrt((_diff ** 2).sum(axis=2))
+            _dists  = np.linalg.norm(_diff, axis=2)
             _mask   = np.triu((_dists > 0) & (_dists < snap_threshold), k=1)
             for i, j in zip(*np.where(_mask)):
                 mx = (ux[i] + ux[j]) / 2
@@ -2376,10 +2608,10 @@ def step_12_curb_ramps_and_hulls(
                     quality_col = f"sidewalk_{side}_curbramp_{pos}_{n}_quality"
                     if quality_col in gdf.columns:
                         gdf.at[seg_idx, quality_col] = "topology"
-                    ramp_id_counter += 1
                     id_col = f"sidewalk_{side}_curbramp_{pos}_{n}_ID"
                     if id_col in gdf.columns:
-                        gdf.at[seg_idx, id_col] = str(ramp_id_counter)
+                        sgid = gdf.at[seg_idx, "street_grid_id"]
+                        gdf.at[seg_idx, id_col] = f"{sgid}_CR_{side}_{pos}_{n}"
                     ramps_placed += 1
                     break
 
@@ -2419,14 +2651,14 @@ def step_12_curb_ramps_and_hulls(
         columns=["node_id", "geometry", "n_ramps", "arm_indices"], geometry="geometry", crs="EPSG:4326"
     )
 
-    log.info("Step 12: %d curb ramps placed, %d intersection hulls built", ramps_placed, len(hulls))
+    log.info("Step 13: %d curb ramps placed, %d intersection hulls built", ramps_placed, len(hulls))
     return gdf, hulls
 
 
 # ---------------------------------------------------------------------------
 # Step 12b — Clear hull-captive sidewalk slots
 # ---------------------------------------------------------------------------
-def step_12b_clear_hull_artifact_sidewalks(
+def step_13b_clear_hull_artifact_sidewalks(
     gdf: gpd.GeoDataFrame,
     hulls: gpd.GeoDataFrame,
     hull_sw_threshold: float = 0.80,
@@ -2489,15 +2721,15 @@ def step_12b_clear_hull_artifact_sidewalks(
             gdf.loc[clear_idx, pres_col] = pd.NA
             n_cleared += len(clear_positions)
 
-    log.info("Step 12b: Cleared %d hull-captive sidewalk slots (threshold=%.0f%%)",
+    log.info("Step 13b: Cleared %d hull-captive sidewalk slots (threshold=%.0f%%)",
              n_cleared, hull_sw_threshold * 100)
     return gdf
 
 
 # ---------------------------------------------------------------------------
-# Step 13 — Merge nearby intersection hulls
+# Step 14 — Merge nearby intersection hulls
 # ---------------------------------------------------------------------------
-def step_13_merge_hulls(
+def step_14_merge_hulls(
     hulls: gpd.GeoDataFrame,
     config: PipelineConfig,
 ) -> gpd.GeoDataFrame:
@@ -2507,9 +2739,9 @@ def step_13_merge_hulls(
     union overlapping groups.
     """
     if hulls.empty:
-        log.info("Step 13: No hulls to merge")
+        log.info("Step 14: No hulls to merge")
         return hulls
-    log.info("Step 13: Merging nearby intersection hulls")
+    log.info("Step 14: Merging nearby intersection hulls")
 
     # Project to UTM for metric buffering
     hulls_utm = hulls.to_crs("EPSG:32610").copy()
@@ -2524,56 +2756,51 @@ def step_13_merge_hulls(
     adj = lil_matrix((n, n), dtype=bool)
     sindex = buffered.sindex
 
-    for i in range(n):
-        hits = list(sindex.query(cast(BaseGeometry, buffered.iloc[i]), predicate="intersects"))
-        for j in hits:
-            if i != j:
-                adj[i, j] = True
-                adj[j, i] = True
+    left_idx, right_idx = sindex.query(buffered, predicate="intersects")
+    for i, j in zip(left_idx.tolist(), right_idx.tolist()):
+        if i != j:
+            adj[i, j] = True
+            adj[j, i] = True
 
     n_components, labels = connected_components(adj.tocsr(), directed=False)
 
     # Merge each component
+    from shapely.ops import unary_union as _unary_union
     merged_rows = []
     for comp in range(n_components):
         members = np.flatnonzero(labels == comp)
         if len(members) == 1:
             idx = members[0]
+            r = hulls.iloc[idx]
             merged_rows.append({
-                "node_id": hulls.iloc[idx]["node_id"],
-                "geometry": hulls.iloc[idx]["geometry"],
-                "n_ramps": hulls.iloc[idx]["n_ramps"],
-                "arm_indices": hulls.iloc[idx]["arm_indices"],
+                "node_id": r["node_id"],
+                "geometry": r["geometry"],
+                "n_ramps": r["n_ramps"],
+                "arm_indices": r["arm_indices"],
             })
         else:
-            union_utm = hulls_utm.iloc[members[0]].geometry
-            all_arms = list(hulls.iloc[members[0]]["arm_indices"])
-            total_ramps = int(hulls.iloc[members[0]]["n_ramps"])
-            node_ids = [hulls.iloc[members[0]]["node_id"]]
-            for m in members[1:]:
-                union_utm = union_utm.union(hulls_utm.iloc[m].geometry)
-                all_arms.extend(hulls.iloc[m]["arm_indices"])
-                total_ramps += int(hulls.iloc[m]["n_ramps"])
-                node_ids.append(hulls.iloc[m]["node_id"])
-            # Convert merged UTM hull back to WGS84
-            merged_wgs = _project_to_wgs(union_utm.convex_hull)
+            sub = hulls.iloc[members]
+            sub_utm = hulls_utm.iloc[members]
+            union_utm = _unary_union(sub_utm.geometry.values).convex_hull
+            merged_wgs = _project_to_wgs(union_utm)
+            all_arms: list[int] = [arm for arms in sub["arm_indices"] for arm in arms]
             merged_rows.append({
-                "node_id": node_ids[0],
+                "node_id": sub.iloc[0]["node_id"],
                 "geometry": merged_wgs,
-                "n_ramps": total_ramps,
+                "n_ramps": int(sub["n_ramps"].sum()),
                 "arm_indices": list(set(all_arms)),
             })
 
     merged = gpd.GeoDataFrame(merged_rows, geometry="geometry", crs="EPSG:4326")
     n_merged = n - len(merged)
-    log.info("Step 13: %d hulls -> %d after merging (%d merged)", n, len(merged), n_merged)
+    log.info("Step 14: %d hulls -> %d after merging (%d merged)", n, len(merged), n_merged)
     return merged
 
 
 # ---------------------------------------------------------------------------
-# Step 14 — Calculate crosswalk slots from hull faces
+# Step 15 — Calculate crosswalk slots from hull faces
 # ---------------------------------------------------------------------------
-def step_14_crosswalk_slots(
+def step_15_crosswalk_slots(
     gdf: gpd.GeoDataFrame,
     hulls: gpd.GeoDataFrame,
     config: PipelineConfig,
@@ -2587,9 +2814,9 @@ def step_14_crosswalk_slots(
     Stores slots as a 'crosswalk_slots' column on the hulls GDF.
     """
     if hulls.empty:
-        log.info("Step 14: No hulls, no crosswalk slots")
+        log.info("Step 15: No hulls, no crosswalk slots")
         return gdf
-    log.info("Step 14: Computing crosswalk slots from hull faces")
+    log.info("Step 15: Computing crosswalk slots from hull faces")
 
     # Project hulls to UTM for metric buffering
     hulls_utm = hulls.copy()
@@ -2626,32 +2853,34 @@ def step_14_crosswalk_slots(
 
     # Store slots on hulls GDF for step 15
     hulls.attrs["crosswalk_slots"] = all_slots
-    log.info("Step 14: %d crosswalk slots created from %d hulls", len(all_slots), len(hulls))
+    log.info("Step 15: %d crosswalk slots created from %d hulls", len(all_slots), len(hulls))
     return gdf
 
 
 # ---------------------------------------------------------------------------
-# Step 15 — Detect/create crosswalk geometries (Cases A-E) and populate attrs
+# Step 16 — Detect/create crosswalk geometries (Cases A-E) and populate attrs
 # ---------------------------------------------------------------------------
-def step_15_crosswalk_geometries(
+def step_16_crosswalk_geometries(
     gdf: gpd.GeoDataFrame,
     hulls: gpd.GeoDataFrame,
     crosswalk_cache: gpd.GeoDataFrame,
     config: PipelineConfig,
 ) -> gpd.GeoDataFrame:
-    """Detect or create crosswalk geometries. Cases A->B->C->D->E priority.
+    """Detect or create crosswalk geometries. Priority order:
 
-    Case A: Separately-mapped footway crossing chain
-    Case B: Sidewalk crosses a street segment
-    Case C: Curb ramp pair (cross-arm)
-    Case D: Curb ramp pair (own-arm)
-    Case E: Sidewalk endpoint pair (fallback)
+    OSM A:    OSM crossing point + ≥2 curb ramps → polyline ramp → point → ramp
+    OSM B:    OSM crossing point + 1 curb ramp → line extended equally past crossing point
+    OSM C:    OSM crossing point, no ramps → orthogonal line to sidewalks; new ramp slots written
+    OSM D:    Separately-mapped footway crossing chain
+    Topo A:   Sidewalk crosses a street segment
+    Topo B:   Curb ramp pair (any arm in slot)
+    Topo C:   Sidewalk endpoint pair (fallback)
     """
     slots = hulls.attrs.get("crosswalk_slots", [])
     if not slots:
-        log.info("Step 15: No crosswalk slots to process")
+        log.info("Step 16: No crosswalk slots to process")
         return gdf
-    log.info("Step 15: Processing %d crosswalk slots", len(slots))
+    log.info("Step 16: Processing %d crosswalk slots", len(slots))
 
     hw_col = gdf["highway"].astype(str).str.lower()
     is_footway_row = hw_col.isin({"footway", "path", "pedestrian", "crossing", "steps"})
@@ -2663,16 +2892,21 @@ def step_15_crosswalk_geometries(
         "motorway_link", "trunk_link", "primary_link", "secondary_link", "tertiary_link",
     })
 
-    # Build spatial index for footway-type segments — avoids 21K x 106K nested scan for Case A.
+    # Build spatial index for footway-type segments — avoids 21K x 106K nested scan for Case D.
     footway_gdf = gdf.loc[is_footway_row, ["street_geometry"]].copy()
     footway_gs = gpd.GeoSeries(
         list(footway_gdf["street_geometry"]), crs="EPSG:4326", index=footway_gdf.index
     )
     footway_sindex = footway_gs.sindex if len(footway_gs) > 0 else None
 
-    case_counts = {"A": 0, "B": 0, "C": 0, "D": 0, "E": 0}
+    case_counts = {"OSM_A": 0, "OSM_B": 0, "OSM_C": 0, "OSM_D": 0, "Topo_A": 0, "Topo_B": 0, "Topo_C": 0}
     xwalk_id = 0
-    absorbed_footway_rows: set[int] = set()  # footway rows consumed by Case A
+    absorbed_footway_rows: set[int] = set()  # footway rows consumed by Case D
+
+    # Build crossing-node spatial index for OSM point cases
+    xwalk_sindex = crosswalk_cache.sindex if (
+        not crosswalk_cache.empty and len(crosswalk_cache) > 0
+    ) else None
 
     for slot in slots:
         slot_geom = slot["slot_geom"]
@@ -2719,7 +2953,169 @@ def step_15_crosswalk_geometries(
         xwalk_geom = None
         source = None
 
-        # ── Case A: Footway crossing chain (spatial-index candidate query) ───
+        # ── OSM A/B/C: OSM crossing-point cases ──────────────────────────────
+        # Find OSM crossing nodes whose point geometry falls inside this slot.
+        osm_crossing_pts: list[Any] = []
+        if xwalk_sindex is not None:
+            cn_hits = list(xwalk_sindex.query(slot_geom, predicate="intersects"))
+            for hi in cn_hits:
+                cp = crosswalk_cache.geometry.iloc[hi]
+                if isinstance(cp, Point) and not cp.is_empty and slot_geom.contains(cp):
+                    osm_crossing_pts.append(cp)
+
+        if osm_crossing_pts:
+            # Use the crossing node nearest to the slot centroid
+            slot_centroid = slot_geom.centroid
+            osm_pt = min(osm_crossing_pts, key=lambda p: p.distance(slot_centroid))
+
+            # Collect all curb ramps in slot from every arm
+            osm_ramp_pts: list[Any] = []
+            for aidx in arm_indices:
+                if aidx not in gdf.index:
+                    continue
+                for sw_side in ("left", "right"):
+                    for sw_p in ("start", "end"):
+                        for sw_n in (1, 2, 3):
+                            rcol = f"sidewalk_{sw_side}_curbramp_{sw_p}_{sw_n}_geometry"
+                            if rcol in gdf.columns:
+                                rg = gdf.at[aidx, rcol]
+                                if rg is not None and isinstance(rg, BaseGeometry) and not rg.is_empty:
+                                    if slot_geom.contains(rg):
+                                        osm_ramp_pts.append(rg)
+
+            if len(osm_ramp_pts) >= 2:
+                # OSM A: polyline ramp1 → crossing_point → ramp2
+                # Pick the two most distant ramps to span the crosswalk
+                best_pair_osm = None
+                best_dist_osm = 0.0
+                for i in range(len(osm_ramp_pts)):
+                    for j in range(i + 1, len(osm_ramp_pts)):
+                        d = osm_ramp_pts[i].distance(osm_ramp_pts[j])
+                        if d > best_dist_osm:
+                            best_dist_osm = d
+                            best_pair_osm = (osm_ramp_pts[i], osm_ramp_pts[j])
+                if best_pair_osm:
+                    xwalk_geom = LineString([
+                        (best_pair_osm[0].x, best_pair_osm[0].y),
+                        (osm_pt.x, osm_pt.y),
+                        (best_pair_osm[1].x, best_pair_osm[1].y),
+                    ])
+                    source = "osm_a"
+                    case_counts["OSM_A"] += 1
+
+            elif len(osm_ramp_pts) == 1:
+                # OSM B: extend line equally past crossing point from single ramp
+                ramp_pt = osm_ramp_pts[0]
+                dx = osm_pt.x - ramp_pt.x
+                dy = osm_pt.y - ramp_pt.y
+                xwalk_geom = LineString([
+                    (ramp_pt.x, ramp_pt.y),
+                    (osm_pt.x, osm_pt.y),
+                    (osm_pt.x + dx, osm_pt.y + dy),
+                ])
+                source = "osm_b"
+                case_counts["OSM_B"] += 1
+
+            else:
+                # OSM C: no ramps — extend orthogonal line to sidewalks (or 2× road width)
+                bearing_deg = float(gdf.at[crossed_idx, "normalized_bearing"] or 0.0)
+                orth_rad = math.radians((bearing_deg + 90.0) % 360.0)
+                dx_unit = math.sin(orth_rad)
+                dy_unit = math.cos(orth_rad)
+
+                raw_lanes = gdf.at[crossed_idx, "lanes"]
+                raw_lw = gdf.at[crossed_idx, "lane_width"]
+                lanes_val = float(raw_lanes) if not pd.isna(raw_lanes) else config.default_lanes
+                lw_val = float(raw_lw) if not pd.isna(raw_lw) else config.default_lane_width
+                max_half_ext_m = lanes_val * lw_val  # total line = 2× road width
+
+                # Project crossing point to UTM
+                cp_arr_x = np.array([osm_pt.x], dtype=np.float64)
+                cp_arr_y = np.array([osm_pt.y], dtype=np.float64)
+                cp_ux_arr, cp_uy_arr = _to_utm.transform(cp_arr_x, cp_arr_y)
+                cp_ux, cp_uy = float(cp_ux_arr[0]), float(cp_uy_arr[0])
+
+                # Collect sidewalk geometries from arm segments projected to UTM
+                sw_utm_geoms: list[tuple[int, str, Any]] = []
+                for aidx in arm_indices:
+                    if aidx not in gdf.index:
+                        continue
+                    for sw_side in ("left", "right"):
+                        sw = gdf.at[aidx, f"sidewalk_{sw_side}_geometry"]
+                        if sw is None or not isinstance(sw, BaseGeometry) or sw.is_empty:
+                            continue
+                        sw_utm = gpd.GeoSeries([sw], crs="EPSG:4326").to_crs("EPSG:32610").iloc[0]
+                        sw_utm_geoms.append((aidx, sw_side, sw_utm))
+
+                def _extend_to_sw(direction: float) -> tuple[Any, int | None, str | None]:
+                    """Extend from crossing point; return (endpoint_wgs, aidx, side)."""
+                    end_ux = cp_ux + dx_unit * direction * max_half_ext_m
+                    end_uy = cp_uy + dy_unit * direction * max_half_ext_m
+                    ray = LineString([(cp_ux, cp_uy), (end_ux, end_uy)])
+                    best_d, best_pt_utm, best_aidx, best_side = float("inf"), None, None, None
+                    for aidx, sw_side, sw_utm in sw_utm_geoms:
+                        if not ray.intersects(sw_utm):
+                            continue
+                        ix = ray.intersection(sw_utm)
+                        if ix.is_empty:
+                            continue
+                        ix_pts = list(ix.geoms) if hasattr(ix, "geoms") else [ix]
+                        for ip in ix_pts:
+                            if not isinstance(ip, Point):
+                                continue
+                            d = math.hypot(ip.x - cp_ux, ip.y - cp_uy)
+                            if d < best_d:
+                                best_d, best_pt_utm, best_aidx, best_side = d, ip, aidx, sw_side
+                    if best_pt_utm is not None:
+                        lons, lats = _to_wgs.transform(
+                            np.array([best_pt_utm.x], dtype=np.float64),
+                            np.array([best_pt_utm.y], dtype=np.float64),
+                        )
+                        return Point(float(lons[0]), float(lats[0])), best_aidx, best_side
+                    # No sidewalk hit — truncate at max extension
+                    lons, lats = _to_wgs.transform(
+                        np.array([end_ux], dtype=np.float64),
+                        np.array([end_uy], dtype=np.float64),
+                    )
+                    return Point(float(lons[0]), float(lats[0])), None, None
+
+                pt_pos, pos_aidx, pos_side = _extend_to_sw(1.0)
+                pt_neg, neg_aidx, neg_side = _extend_to_sw(-1.0)
+
+                xwalk_geom = LineString([
+                    (pt_neg.x, pt_neg.y),
+                    (osm_pt.x, osm_pt.y),
+                    (pt_pos.x, pt_pos.y),
+                ])
+                source = "osm_c"
+                case_counts["OSM_C"] += 1
+
+                # Write new curb ramp slots where the line hit sidewalks
+                for hit_pt, hit_aidx, hit_side in [
+                    (pt_pos, pos_aidx, pos_side),
+                    (pt_neg, neg_aidx, neg_side),
+                ]:
+                    if hit_aidx is None or hit_side is None:
+                        continue
+                    hit_pos = "start" if gdf.at[hit_aidx, "start_node_id"] == node_id else "end"
+                    for n in (1, 2, 3):
+                        gcol = f"sidewalk_{hit_side}_curbramp_{hit_pos}_{n}_geometry"
+                        if gcol not in gdf.columns:
+                            gdf[gcol] = None
+                        val = gdf.at[hit_aidx, gcol]
+                        if val is None or not isinstance(val, BaseGeometry):
+                            gdf.at[hit_aidx, gcol] = hit_pt  # type: ignore[call-overload]
+                            qcol = f"sidewalk_{hit_side}_curbramp_{hit_pos}_{n}_quality"
+                            if qcol not in gdf.columns:
+                                gdf[qcol] = None
+                            gdf.at[hit_aidx, qcol] = "osmpoint"
+                            id_col = f"sidewalk_{hit_side}_curbramp_{hit_pos}_{n}_ID"
+                            if id_col in gdf.columns:
+                                sgid = gdf.at[hit_aidx, "street_grid_id"]
+                                gdf.at[hit_aidx, id_col] = f"{sgid}_CR_{hit_side}_{hit_pos}_{n}"
+                            break
+
+        # ── OSM D: Footway crossing chain (spatial-index candidate query) ───
         footway_in_slot = []
         if footway_sindex is not None:
             cand_pos = list(footway_sindex.query(slot_geom, predicate="intersects"))
@@ -2745,11 +3141,11 @@ def step_15_crosswalk_geometries(
                 chain_coords.extend(_flatten_coords(cast(BaseGeometry, gdf.at[fidx, "street_geometry"])))
             if len(chain_coords) >= 2:
                 xwalk_geom = LineString(chain_coords)
-                source = "case_a"
-                case_counts["A"] += 1
+                source = "osm_d"
+                case_counts["OSM_D"] += 1
                 absorbed_footway_rows.update(footway_in_slot)
 
-        # ── Case B: Sidewalk crosses street ───────────────────────────
+        # ── Topo A: Sidewalk crosses street ───────────────────────────
         if xwalk_geom is None:
             street_geom = cast(BaseGeometry, gdf.at[crossed_idx, "street_geometry"])
             for side in ("left", "right"):
@@ -2767,19 +3163,19 @@ def step_15_crosswalk_geometries(
                                     _flatten_coords(sw)[0],
                                     _flatten_coords(sw)[-1],
                                 ]) if sw.length < 0.0003 else sw
-                                source = "case_b"
-                                case_counts["B"] += 1
+                                source = "topo_a"
+                                case_counts["Topo_A"] += 1
                                 break
                         except Exception:
                             pass
                 if xwalk_geom is not None:
                     break
 
-        # ── Case C: Curb ramp pair (cross-arm) ───────────────────────
+        # ── Topo B: Curb ramp pair (any arm in slot) ─────────────────
         if xwalk_geom is None:
             ramp_pts_in_slot = []
             for aidx in arm_indices:
-                if aidx == crossed_idx or aidx not in gdf.index:
+                if aidx not in gdf.index:
                     continue
                 for side in ("left", "right"):
                     for p in ("start", "end"):
@@ -2796,31 +3192,10 @@ def step_15_crosswalk_geometries(
                     (ramp_pts_in_slot[0].x, ramp_pts_in_slot[0].y),
                     (ramp_pts_in_slot[1].x, ramp_pts_in_slot[1].y),
                 ])
-                source = "case_c"
-                case_counts["C"] += 1
+                source = "topo_b"
+                case_counts["Topo_B"] += 1
 
-        # ── Case D: Curb ramp pair (own-arm) ─────────────────────────
-        if xwalk_geom is None:
-            ramp_pts_own = []
-            for side in ("left", "right"):
-                for p in ("start", "end"):
-                    for n in (1, 2, 3):
-                        col = f"sidewalk_{side}_curbramp_{p}_{n}_geometry"
-                        if col in gdf.columns and crossed_idx in gdf.index:
-                            rg = gdf.at[crossed_idx, col]
-                            if rg is not None and isinstance(rg, BaseGeometry):
-                                if slot_geom.contains(rg):
-                                    ramp_pts_own.append(rg)
-
-            if len(ramp_pts_own) >= 2:
-                xwalk_geom = LineString([
-                    (ramp_pts_own[0].x, ramp_pts_own[0].y),
-                    (ramp_pts_own[1].x, ramp_pts_own[1].y),
-                ])
-                source = "case_d"
-                case_counts["D"] += 1
-
-        # ── Case E: Sidewalk endpoint pair (fallback) ────────────────
+        # ── Topo C: Sidewalk endpoint pair (fallback) ────────────────
         if xwalk_geom is None:
             sw_endpoints = []
             for aidx in arm_indices:
@@ -2853,14 +3228,15 @@ def step_15_crosswalk_geometries(
                         (best_pair[0].x, best_pair[0].y),
                         (best_pair[1].x, best_pair[1].y),
                     ])
-                    source = "case_e"
-                    case_counts["E"] += 1
+                    source = "topo_c"
+                    case_counts["Topo_C"] += 1
 
         # ── Write crosswalk to GDF ────────────────────────────────────
         if xwalk_geom is not None:
             xwalk_id += 1
             gdf.at[crossed_idx, f"crosswalk_{pos}_geometry"] = xwalk_geom  # type: ignore[call-overload]
-            gdf.at[crossed_idx, f"crosswalk_{pos}_id"] = str(xwalk_id)
+            xwalk_sgid = gdf.at[crossed_idx, "street_grid_id"]
+            gdf.at[crossed_idx, f"crosswalk_{pos}_id"] = f"{xwalk_sgid}_XW_{pos}"
             gdf.at[crossed_idx, f"crosswalk_{pos}_source"] = source
             # Grid IDs: tuple of the two sidewalk grid IDs the crosswalk connects
             sw_l_gid = gdf.at[crossed_idx, "sidewalk_left_grid_ID"]
@@ -2874,16 +3250,19 @@ def step_15_crosswalk_geometries(
     # ── Populate crosswalk attributes from cache ──────────────────────
     if not crosswalk_cache.empty and len(crosswalk_cache) > 0:
         xwalk_sindex = crosswalk_cache.sindex
-        for idx in gdf.index:
-            for pos in ("start", "end"):
-                xg = gdf.at[idx, f"crosswalk_{pos}_geometry"]
-                if xg is None or not isinstance(xg, BaseGeometry):
-                    continue
-                # Find nearest crossing node
+        for pos in ("start", "end"):
+            geom_col = f"crosswalk_{pos}_geometry"
+            geom_arr = np.asarray(gdf[geom_col])
+            active_mask = np.array([isinstance(v, BaseGeometry) for v in geom_arr], dtype=bool)
+            active_index = gdf.index[active_mask]
+            for idx in active_index:
+                xg = gdf.at[idx, geom_col]
+                # Find nearest crossing node by true distance, not index order
                 hits = list(xwalk_sindex.query(xg.buffer(0.0002), predicate="intersects"))
                 if not hits:
                     continue
-                nearest = hits[0]
+                xg_centroid = xg.centroid
+                nearest = min(hits, key=lambda i: crosswalk_cache.geometry.iloc[i].distance(xg_centroid))
                 cache_row = crosswalk_cache.iloc[nearest]
                 for attr in ("type", "controlled", "marked", "markings", "signals",
                               "island", "kerb", "tactile_paving", "traffic_calming", "continuous"):
@@ -2894,7 +3273,7 @@ def step_15_crosswalk_geometries(
                             gdf.at[idx, col] = val
 
     # ── Fix 1: Null sidewalk/curbramp geometry on absorbed footway rows ──
-    # Footway rows consumed by Case A had their geometry merged into a
+    # Footway rows consumed by Case D had their geometry merged into a
     # crosswalk.  Clear their sidewalk and curb ramp slots so the geometry
     # doesn't persist as a duplicate alongside the crosswalk.
     n_absorbed_cleared = 0
@@ -2978,19 +3357,23 @@ def step_15_crosswalk_geometries(
                         n_ramps_inside_cleared += 1
 
     total = sum(case_counts.values())
-    log.info("Step 15: %d crosswalks created (A=%d B=%d C=%d D=%d E=%d), "
-             "%d absorbed footway slots cleared, %d post-xwalk stubs cleared, "
-             "%d hull-interior ramps cleared",
-             total, case_counts["A"], case_counts["B"], case_counts["C"],
-             case_counts["D"], case_counts["E"],
-             n_absorbed_cleared, n_stubs_cleared, n_ramps_inside_cleared)
+    log.info(
+        "Step 16: %d crosswalks created "
+        "(OSM_A=%d OSM_B=%d OSM_C=%d OSM_D=%d Topo_A=%d Topo_B=%d Topo_C=%d), "
+        "%d absorbed footway slots cleared, %d post-xwalk stubs cleared, "
+        "%d hull-interior ramps cleared",
+        total,
+        case_counts["OSM_A"], case_counts["OSM_B"], case_counts["OSM_C"], case_counts["OSM_D"],
+        case_counts["Topo_A"], case_counts["Topo_B"], case_counts["Topo_C"],
+        n_absorbed_cleared, n_stubs_cleared, n_ramps_inside_cleared,
+    )
     return gdf
 
 
 # ---------------------------------------------------------------------------
-# Step 16 — Consolidate orphaned facility rows into road slots
+# Step 10 — Consolidate orphaned facility rows into road slots
 # ---------------------------------------------------------------------------
-def step_16_consolidate_orphaned_facilities(
+def step_10_consolidate_orphaned_facilities(
     gdf: gpd.GeoDataFrame,
     config: PipelineConfig,
 ) -> gpd.GeoDataFrame:
@@ -3001,7 +3384,7 @@ def step_16_consolidate_orphaned_facilities(
     Rows that cannot be matched (no parallel road within _MATCH_RADIUS_M) are
     also removed; their count is logged as a warning.
     """
-    log.info("Step 16: Consolidating orphaned facility rows into road slots")
+    log.info("Step 10: Consolidating orphaned facility rows into road slots")
 
     hw = gdf["highway"].astype(str).str.lower().str.strip()
     bicycle_col = _safe_col(gdf, "bikeway_left_1_permitted").astype(str).str.lower()
@@ -3009,7 +3392,11 @@ def step_16_consolidate_orphaned_facilities(
     is_cycleway = hw.isin(_BIKEWAY_HW) | (
         hw.isin({"path", "footway"}) & bicycle_col.isin({"designated", "yes"})
     )
-    is_footway = hw.isin(_FOOTWAY_HW) & ~is_cycleway
+    # Exclude crossing-type ways — these are crosswalk geometries, not parallel
+    # sidewalk facilities, and must survive until step 16's Case D can use them.
+    footway_tag = _safe_col(gdf, "footway").astype(str).str.lower()
+    is_crossing = hw.isin({"crossing"}) | footway_tag.isin({"crossing"})
+    is_footway = hw.isin(_FOOTWAY_HW) & ~is_cycleway & ~is_crossing
     is_facility = is_footway | is_cycleway
 
     fac_indices = gdf.index[is_facility]
@@ -3028,16 +3415,24 @@ def step_16_consolidate_orphaned_facilities(
     # Pre-populate used sets from slots already occupied by step 09
     foot_used: set[tuple[int, str]] = set()
     bike_used: set[tuple[int, str, str]] = set()
-    for ri in road_idx:
-        for side in ("left", "right"):
-            gcol = f"sidewalk_{side}_geometry"
-            g = gdf.at[ri, gcol] if gcol in gdf.columns else None
-            if g is not None and isinstance(g, BaseGeometry) and not g.is_empty:
+    road_df = gdf.loc[road_idx]
+    for side in ("left", "right"):
+        gcol = f"sidewalk_{side}_geometry"
+        if gcol in gdf.columns:
+            geom_arr = road_df[gcol].values
+            has_geom = np.array(
+                [isinstance(g, BaseGeometry) and not g.is_empty for g in geom_arr], dtype=bool
+            )
+            for ri in road_df.index[has_geom]:
                 foot_used.add((ri, side))
-            for slot in ("1", "2"):
-                bcol = f"bikeway_{side}_{slot}_geometry"
-                bk = gdf.at[ri, bcol] if bcol in gdf.columns else None
-                if bk is not None and isinstance(bk, BaseGeometry) and not bk.is_empty:
+        for slot in ("1", "2"):
+            bcol = f"bikeway_{side}_{slot}_geometry"
+            if bcol in gdf.columns:
+                geom_arr = road_df[bcol].values
+                has_geom = np.array(
+                    [isinstance(g, BaseGeometry) and not g.is_empty for g in geom_arr], dtype=bool
+                )
+                for ri in road_df.index[has_geom]:
                     bike_used.add((ri, side, slot))
 
     def _slot_is_empty(row_idx: int, col: str) -> bool:
@@ -3047,25 +3442,23 @@ def step_16_consolidate_orphaned_facilities(
         val = _first_if_list(gdf.at[row_idx, col])
         return val is None or pd.isna(val)
 
-    matched_foot = matched_bike = unmatched = 0
+    matched_foot = matched_bike = 0
+    matched_indices: set[int] = set()
 
     for fac_idx in tqdm(fac_indices, desc="Consolidating facilities", unit="seg"):
         fac_geom = utm_street.at[fac_idx]
         if fac_geom is None or fac_geom.is_empty:
-            unmatched += 1
             continue
 
         fac_type = "bike" if is_cycleway.at[fac_idx] else "foot"
         fc = _flatten_coords(fac_geom)
         if len(fc) < 2:
-            unmatched += 1
             continue
 
         fac_bear = math.degrees(math.atan2(fc[-1][0] - fc[0][0], fc[-1][1] - fc[0][1])) % 360
         buf = fac_geom.buffer(_MATCH_RADIUS_M)
         candidates = list(road_sindex.query(buf, predicate="intersects"))
         if not candidates:
-            unmatched += 1
             continue
 
         best_road, best_score, best_side = None, float("inf"), "left"
@@ -3101,7 +3494,6 @@ def step_16_consolidate_orphaned_facilities(
                 best_side = side
 
         if best_road is None:
-            unmatched += 1
             continue
 
         fac_wgs = gdf.at[fac_idx, "street_geometry"]
@@ -3123,6 +3515,7 @@ def step_16_consolidate_orphaned_facilities(
                     if _slot_is_empty(best_road, sc):
                         gdf.at[best_road, sc] = fac_surface  # type: ignore[call-overload]
                 foot_used.add((best_road, best_side))
+                matched_indices.add(fac_idx)
                 matched_foot += 1
         else:
             for slot in ("1", "2"):
@@ -3137,19 +3530,298 @@ def step_16_consolidate_orphaned_facilities(
                         if _slot_is_empty(best_road, sc):
                             gdf.at[best_road, sc] = fac_surface  # type: ignore[call-overload]
                     bike_used.add((best_road, best_side, slot))
+                    matched_indices.add(fac_idx)
                     matched_bike += 1
                     break
 
-    if unmatched:
-        log.warning(
-            "  Step 16: %d facility rows had no matching road within %.0f m — dropped",
-            unmatched, _MATCH_RADIUS_M,
+    unmatched_count = n_fac - len(matched_indices)
+    if unmatched_count:
+        log.info(
+            "  Step 10: %d facility rows had no matching road within %.0f m — preserved",
+            unmatched_count, _MATCH_RADIUS_M,
         )
 
-    gdf = gdf.drop(index=fac_indices)
+    gdf = gdf.drop(index=list(matched_indices))
     log.info(
-        "  Step 16: Consolidated %d footways, %d bikeways; removed %d facility rows",
-        matched_foot, matched_bike, n_fac,
+        "  Step 10: Consolidated %d footways, %d bikeways; removed %d matched facility rows",
+        matched_foot, matched_bike, len(matched_indices),
+    )
+    return gdf
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 17 — Enrich curb ramps with government data
+# ─────────────────────────────────────────────────────────────────────────────
+
+def step_17_enrich_curb_ramps(
+    gdf: gpd.GeoDataFrame,
+    config: PipelineConfig,
+) -> gpd.GeoDataFrame:
+    """Enrich existing curb-ramp slots (or create new ones) from government CSV data."""
+
+    # ── Graceful skip checks ────────────────────────────────────────────────
+    if not config.curb_ramp_data_path:
+        log.info("Step 17: skipped — curb_ramp_data_path is empty")
+        return gdf
+
+    import os
+    if not os.path.isfile(config.curb_ramp_data_path):
+        log.info("Step 17: skipped — file not found: %s", config.curb_ramp_data_path)
+        return gdf
+
+    df = pd.read_csv(config.curb_ramp_data_path)
+    df = df[df["crExist"].astype(str) == "1"]
+
+    if len(df) == 0:
+        log.info("Step 17: skipped — zero rows with crExist==1")
+        return gdf
+
+    # ── Coordinate resolution ───────────────────────────────────────────────
+    has_latlon = ("Latitude" in df.columns and "Longitude" in df.columns)
+    has_xy = ("xLoc" in df.columns and "yLoc" in df.columns)
+
+    # Build reprojector for State Plane fallback
+    sp_transformer = None
+    if has_xy:
+        from pyproj import Transformer as _Tf
+        sp_transformer = _Tf.from_crs(2227, 4326, always_xy=True)
+
+    csv_points: list[tuple[float, float, Any]] = []  # (lon, lat, row)
+
+    # Resolve coordinates vectorized: Priority 1 = Lat/Lon, Priority 2 = State Plane xLoc/yLoc
+    resolved_lons = pd.Series(pd.NA, index=df.index, dtype="Float64")
+    resolved_lats = pd.Series(pd.NA, index=df.index, dtype="Float64")
+
+    if has_latlon:
+        lat_num = pd.to_numeric(df["Latitude"], errors="coerce")
+        lon_num = pd.to_numeric(df["Longitude"], errors="coerce")
+        valid_ll = lat_num.notna() & lon_num.notna()
+        resolved_lats[valid_ll] = lat_num[valid_ll]
+        resolved_lons[valid_ll] = lon_num[valid_ll]
+
+    if has_xy and sp_transformer is not None:
+        still_missing = resolved_lons.isna()
+        if still_missing.any():
+            x_num = pd.to_numeric(df.loc[still_missing, "xLoc"], errors="coerce")
+            y_num = pd.to_numeric(df.loc[still_missing, "yLoc"], errors="coerce")
+            xy_valid = x_num.notna() & y_num.notna()
+            if xy_valid.any():
+                proj_lons, proj_lats = sp_transformer.transform(
+                    x_num[xy_valid].values.astype(np.float64),
+                    y_num[xy_valid].values.astype(np.float64),
+                )
+                resolved_lons.iloc[np.where(still_missing)[0][xy_valid.values]] = proj_lons
+                resolved_lats.iloc[np.where(still_missing)[0][xy_valid.values]] = proj_lats
+
+    valid_mask = resolved_lons.notna() & resolved_lats.notna()
+    skipped_no_coords = int((~valid_mask).sum())
+    for i in np.where(valid_mask.values)[0]:
+        csv_points.append((float(resolved_lons.iloc[i]), float(resolved_lats.iloc[i]), df.iloc[i]))
+
+    if not csv_points:
+        log.info("Step 17: skipped — no CSV rows with valid coordinates")
+        return gdf
+
+    # ── Build spatial index of existing ramp slots (UTM) ────────────────────
+    # Iterate per column (12 combos) rather than per row × combo — lets us batch
+    # the UTM transform once per column instead of once per valid cell.
+    ramp_slot_list: list[tuple[int, str, str, int, float, float]] = []
+    ramp_slot_points: list[Point] = []
+
+    for side in ("left", "right"):
+        for pos in ("start", "end"):
+            for n in (1, 2, 3):
+                col = f"sidewalk_{side}_curbramp_{pos}_{n}_geometry"
+                if col not in gdf.columns:
+                    continue
+                geom_arr = gdf[col].values
+                valid_mask = np.array(
+                    [isinstance(g, BaseGeometry) and not g.is_empty for g in geom_arr],
+                    dtype=bool,
+                )
+                if not valid_mask.any():
+                    continue
+                valid_idx = gdf.index[valid_mask]
+                valid_geoms = geom_arr[valid_mask]
+                g_xs = np.array([g.x for g in valid_geoms], dtype=np.float64)
+                g_ys = np.array([g.y for g in valid_geoms], dtype=np.float64)
+                uxs, uys = _to_utm.transform(g_xs, g_ys)
+                for i, idx in enumerate(valid_idx):
+                    ux, uy = float(uxs[i]), float(uys[i])
+                    ramp_slot_list.append((idx, side, pos, n, ux, uy))
+                    ramp_slot_points.append(Point(ux, uy))
+
+    ramp_tree = STRtree(ramp_slot_points) if ramp_slot_points else None
+
+    # ── Build road geometry index (UTM) ─────────────────────────────────────
+    hw = gdf["highway"].astype(str).str.lower().str.strip()
+    is_road = hw.isin(_ROAD_HW)
+    road_indices = gdf.index[is_road].tolist()
+
+    road_geoms_utm: list[BaseGeometry] = []
+    road_geoms_valid_idx: list[int] = []  # parallel to road_geoms_utm
+    for ri in road_indices:
+        sg = gdf.at[ri, "street_geometry"]
+        if sg is None or not isinstance(sg, BaseGeometry) or sg.is_empty:
+            continue
+        utm_g = _project_to_utm(sg)
+        road_geoms_utm.append(utm_g)
+        road_geoms_valid_idx.append(ri)
+
+    road_tree = STRtree(road_geoms_utm) if road_geoms_utm else None
+
+    # ── Per-CSV-ramp loop ───────────────────────────────────────────────────
+    matched = 0
+    new_ramp = 0
+    skipped_no_slot = 0
+    radius = config.curb_ramp_match_radius_m
+
+    for lon, lat, row in csv_points:
+        ux, uy = _to_utm.transform(lon, lat)
+        csv_utm = Point(float(ux), float(uy))
+
+        # Try matching to existing ramp slot
+        found_match = False
+        if ramp_tree is not None and ramp_slot_points:
+            nearby_idxs = ramp_tree.query(csv_utm.buffer(radius))
+            if len(nearby_idxs) > 0:
+                # Find nearest
+                best_dist = float("inf")
+                best_i = -1
+                for ni in nearby_idxs:
+                    d = csv_utm.distance(ramp_slot_points[ni])
+                    if d < best_dist:
+                        best_dist = d
+                        best_i = ni
+
+                road_idx, side, pos, n, _, _ = ramp_slot_list[best_i]
+                prefix = f"sidewalk_{side}_curbramp_{pos}_{n}"
+                gdf.at[road_idx, f"public_data_id_{prefix}"] = row.get("locID")
+                gdf.at[road_idx, f"{prefix}_returnloc"] = row.get("curbReturnLoc")
+                gdf.at[road_idx, f"{prefix}_returnposition"] = row.get("positionOnReturn")
+                gdf.at[road_idx, f"{prefix}_condition_score"] = row.get("conditionScore")
+                gdf.at[road_idx, f"{prefix}_quality"] = "government"
+                matched += 1
+                found_match = True
+
+        if found_match:
+            continue
+
+        # No existing slot match — assign to nearest road
+        if road_tree is None or not road_geoms_utm:
+            skipped_no_slot += 1
+            continue
+
+        near_road_idxs = road_tree.query(csv_utm.buffer(radius * 10))
+        if len(near_road_idxs) == 0:
+            # Fallback: nearest geometry overall
+            near_road_idxs = road_tree.query(csv_utm.buffer(500))
+        if len(near_road_idxs) == 0:
+            skipped_no_slot += 1
+            continue
+
+        # Find nearest road by distance
+        best_road_dist = float("inf")
+        best_road_local_idx = -1
+        for ri_local in near_road_idxs:
+            d = csv_utm.distance(road_geoms_utm[ri_local])
+            if d < best_road_dist:
+                best_road_dist = d
+                best_road_local_idx = ri_local
+
+        road_idx = road_geoms_valid_idx[best_road_local_idx]
+        road_utm_geom = road_geoms_utm[best_road_local_idx]
+
+        # ── Determine pos (start/end) ──────────────────────────────────────
+        start_node_geom = gdf.at[road_idx, "start_node_geometry"]
+        end_node_geom = gdf.at[road_idx, "end_node_geometry"]
+
+        d_start = float("inf")
+        d_end = float("inf")
+        if isinstance(start_node_geom, Point) and not start_node_geom.is_empty:
+            snx, sny = _to_utm.transform(start_node_geom.x, start_node_geom.y)
+            d_start = csv_utm.distance(Point(float(snx), float(sny)))
+        if isinstance(end_node_geom, Point) and not end_node_geom.is_empty:
+            enx, eny = _to_utm.transform(end_node_geom.x, end_node_geom.y)
+            d_end = csv_utm.distance(Point(float(enx), float(eny)))
+
+        pos = "start" if d_start <= d_end else "end"
+
+        # ── Determine side (left/right) via cross product ───────────────────
+        # Project csv_utm onto road UTM geometry, get nearest segment vector
+        proj_dist = road_utm_geom.project(csv_utm)
+        proj_point = road_utm_geom.interpolate(proj_dist)
+
+        # Get the road segment tangent vector at projection point
+        coords = list(road_utm_geom.coords)
+        # Find segment containing the projection
+        seg_vec = None
+        accumulated = 0.0
+        for i in range(len(coords) - 1):
+            seg_len = Point(coords[i]).distance(Point(coords[i + 1]))
+            if accumulated + seg_len >= proj_dist or i == len(coords) - 2:
+                seg_vec = (coords[i + 1][0] - coords[i][0],
+                           coords[i + 1][1] - coords[i][1])
+                break
+            accumulated += seg_len
+
+        if seg_vec is None:
+            seg_vec = (coords[-1][0] - coords[0][0], coords[-1][1] - coords[0][1])
+
+        # Offset vector: projection point → csv_utm
+        offset_vec = (csv_utm.x - proj_point.x, csv_utm.y - proj_point.y)
+
+        # Cross product: seg_vec × offset_vec
+        cross = seg_vec[0] * offset_vec[1] - seg_vec[1] * offset_vec[0]
+        side = "left" if cross > 0 else "right"
+
+        # ── Find first available slot n ─────────────────────────────────────
+        slot_n = None
+        for n in (1, 2, 3):
+            col = f"sidewalk_{side}_curbramp_{pos}_{n}_geometry"
+            if col not in gdf.columns:
+                gdf[col] = None
+            val = gdf.at[road_idx, col]
+            if val is None or (not isinstance(val, BaseGeometry)) or (isinstance(val, BaseGeometry) and val.is_empty):
+                # Also check via pd.isna for scalar None/NaN
+                slot_n = n
+                break
+            elif pd.isna(val):
+                slot_n = n
+                break
+
+        if slot_n is None:
+            skipped_no_slot += 1
+            continue
+
+        n = slot_n
+        prefix = f"sidewalk_{side}_curbramp_{pos}_{n}"
+
+        # Ensure columns exist
+        for suffix in ("_geometry", "_ID", "_quality", "_returnloc",
+                       "_returnposition", "_condition_score"):
+            c = prefix + suffix
+            if c not in gdf.columns:
+                gdf[c] = None
+        pub_col = f"public_data_id_{prefix}"
+        if pub_col not in gdf.columns:
+            gdf[pub_col] = None
+
+        # Write values
+        gdf.at[road_idx, f"{prefix}_geometry"] = Point(lon, lat)
+        _sgid = gdf.at[road_idx, "street_grid_id"]
+        gdf.at[road_idx, f"{prefix}_ID"] = f"{_sgid}_CR_{side}_{pos}_{n}"
+        gdf.at[road_idx, pub_col] = row.get("locID")
+        gdf.at[road_idx, f"{prefix}_returnloc"] = row.get("curbReturnLoc")
+        gdf.at[road_idx, f"{prefix}_returnposition"] = row.get("positionOnReturn")
+        gdf.at[road_idx, f"{prefix}_condition_score"] = row.get("conditionScore")
+        gdf.at[road_idx, f"{prefix}_quality"] = "government"
+        new_ramp += 1
+
+    log.info(
+        "Step 17: %d government ramps matched to existing slots, %d new slots created, "
+        "%d skipped (no coords), %d skipped (no slot)",
+        matched, new_ramp, skipped_no_coords, skipped_no_slot,
     )
     return gdf
 
@@ -3165,29 +3837,31 @@ def run_pipeline(config: PipelineConfig) -> gpd.GeoDataFrame:
 
     # Phase 1 — Street network foundation
     gdf = step_01_create_parquet(config)
-    gdf, crosswalk_cache, G, nodes, edges_reset = step_02_load_streets(gdf, config)
+    gdf, crosswalk_cache, G, nodes, edges_reset, walk_edges, bike_edges = step_02_load_streets(gdf, config)
     gdf = step_03_split_deflections(gdf, config)
     gdf = step_04_bearings_and_grid_ids(gdf, config, G=G, nodes=nodes)
     gdf = step_05_traffic_calming(gdf, config)
     gdf = step_06_usgs_elevation(gdf, config)
 
     # Phase 2 — Sidewalks and bikelanes
-    gdf = step_07_populate_facilities(gdf, config, edges_reset=edges_reset)
+    gdf = step_07_populate_facilities(gdf, config, edges_reset=edges_reset,
+                                      walk_edges=walk_edges, bike_edges=bike_edges)
     gdf = step_08_swap_left_right(gdf, config)
     gdf = step_09_match_separate_facilities(gdf, config)
-    gdf = step_10_snap_endpoints(gdf, config)
+    gdf = step_10_consolidate_orphaned_facilities(gdf, config)
     gdf = step_11_facility_grid_ids(gdf, config)
+    gdf = step_11b_compute_neighbors(gdf, config)
+    gdf = step_12_snap_endpoints(gdf, config)
 
     # Phase 3 — Intersection analysis
-    gdf, hulls = step_12_curb_ramps_and_hulls(gdf, config)
-    gdf = step_12b_clear_hull_artifact_sidewalks(gdf, hulls)
-    hulls = step_13_merge_hulls(hulls, config)
-    gdf = step_14_crosswalk_slots(gdf, hulls, config)
-    gdf = step_15_crosswalk_geometries(gdf, hulls, crosswalk_cache, config)
+    gdf, hulls = step_13_curb_ramps_and_hulls(gdf, config)
+    gdf = step_13b_clear_hull_artifact_sidewalks(gdf, hulls)
+    hulls = step_14_merge_hulls(hulls, config)
+    gdf = step_15_crosswalk_slots(gdf, hulls, config)
+    gdf = step_16_crosswalk_geometries(gdf, hulls, crosswalk_cache, config)
 
-    # Phase 4 — Final facility consolidation
-    gdf = step_16_consolidate_orphaned_facilities(gdf, config)
-    gdf = step_11_facility_grid_ids(gdf, config)  # Re-run to assign IDs to newly consolidated slots
+    # Phase 4 — Government data enrichment
+    gdf = step_17_enrich_curb_ramps(gdf, config)
 
     # Pre-write type normalization for object columns:
     #   - Schema-defined list columns (Str|List[Str] or Float|List[Float]):
@@ -3227,7 +3901,7 @@ def run_pipeline(config: PipelineConfig) -> gpd.GeoDataFrame:
     for col in gdf.columns:
         if gdf[col].dtype != object or col in geom_col_set:
             continue
-        has_list = gdf[col].apply(lambda v: isinstance(v, list)).any()
+        has_list = any(type(v) is list for v in gdf[col])
         if not has_list:
             continue
         if col in _SCHEMA_LIST_COLS:

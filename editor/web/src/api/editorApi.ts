@@ -54,6 +54,12 @@ export async function fetchHulls(
   return res.json();
 }
 
+export async function fetchParquetCenter(parquet: string): Promise<{ lng: number; lat: number }> {
+  const res = await fetch(`${BASE}/center/${parquet}`);
+  if (!res.ok) throw new Error(`Failed to fetch center: ${res.status}`);
+  return res.json();
+}
+
 export async function fetchParquetList(): Promise<string[]> {
   const res = await fetch(`${BASE}/parquets`);
   if (!res.ok) throw new Error(`Failed to fetch parquet list: ${res.status}`);

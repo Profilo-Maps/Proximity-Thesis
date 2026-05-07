@@ -19,7 +19,7 @@ import {
   type ToolSessionState,
   type SourceMutation,
 } from '@proximity/shared/tools';
-import { extractVertices } from './useVertexDrag';
+import { extractVertices, VERTEX_LAYERS } from './useVertexDrag';
 
 export function useToolHandler(
   mapRef: React.RefObject<maplibregl.Map | null>
@@ -117,7 +117,7 @@ export function useToolHandler(
         const src = map.getSource('proximity-features') as import('maplibre-gl').GeoJSONSource | undefined;
         if (src) src.setData(fc);
         const vertSrc = map.getSource('proximity-vertices') as import('maplibre-gl').GeoJSONSource | undefined;
-        if (vertSrc) vertSrc.setData(extractVertices(fc));
+        if (vertSrc) vertSrc.setData(extractVertices(fc, store.selectedFeatureId));
       },
       recordDeletedPoint: (edit) => changeset.recordDeletedPoint(edit),
       recordDeletedHull: (edit) => changeset.recordDeletedHull(edit),
@@ -160,6 +160,87 @@ export function useToolHandler(
 
       const map = mapRef.current;
       if (!map) return;
+
+      // ── Vertex-aware tools: delete_point and add_node ──────────────────
+      const pad = 10;
+      const ptBbox: [maplibregl.PointLike, maplibregl.PointLike] = [
+        [e.point.x - pad, e.point.y - pad],
+        [e.point.x + pad, e.point.y + pad],
+      ];
+
+      if (tool === 'delete_point') {
+        // Check if click hit a visible line vertex
+        const vertHits = map.queryRenderedFeatures(ptBbox, { layers: VERTEX_LAYERS });
+        const lineVert = vertHits.find((h) => (h.properties?._vi as number) >= 0);
+        if (lineVert) {
+          const vi: number = lineVert.properties?._vi as number;
+          const srcId: string = lineVert.properties?._src_id as string;
+          const store = useEditorStore.getState();
+          const fc = store.features;
+          if (!fc) return;
+          // Find the line feature and remove the vertex
+          const feat = fc.features.find((f) => {
+            const id = f.properties?._seg_id ?? f.properties?._fid;
+            return id === srcId && f.geometry.type === 'LineString';
+          });
+          if (feat && feat.geometry.type === 'LineString' && feat.geometry.coordinates.length > 2) {
+            store.pushSnapshot();
+            feat.geometry.coordinates.splice(vi, 1);
+            const featuresSrc = map.getSource('proximity-features') as import('maplibre-gl').GeoJSONSource | undefined;
+            featuresSrc?.setData(fc);
+            const vertSrc = map.getSource('proximity-vertices') as import('maplibre-gl').GeoJSONSource | undefined;
+            vertSrc?.setData(extractVertices(fc, store.selectedFeatureId));
+            store.setStatusText(`Removed vertex ${vi} from ${srcId}`);
+            useChangesetStore.getState().recordMovedEndpoint({
+              node_id: `${srcId}:deleted_v${vi}`,
+              new_x: 0, new_y: 0,
+              rubber_band_segments: [srcId],
+            });
+          }
+          return;
+        }
+        // Fall through to normal delete_point logic (intersection nodes, points)
+      }
+
+      if (tool === 'add_node') {
+        const store = useEditorStore.getState();
+        const selectedId = store.selectedFeatureId;
+        if (selectedId) {
+          const fc = store.features;
+          const feat = fc?.features.find((f) => {
+            const id = f.properties?._seg_id ?? f.properties?._fid;
+            return id === selectedId && f.geometry.type === 'LineString';
+          });
+          if (feat && feat.geometry.type === 'LineString') {
+            // Find the closest segment of the line and insert vertex there
+            const coords = feat.geometry.coordinates as [number, number][];
+            const px = e.lngLat.lng;
+            const py = e.lngLat.lat;
+            let bestSeg = 0;
+            let bestDist = Infinity;
+            for (let i = 0; i < coords.length - 1; i++) {
+              const [ax, ay] = coords[i];
+              const [bx, by] = coords[i + 1];
+              const dx = bx - ax; const dy = by - ay;
+              const len2 = dx * dx + dy * dy;
+              if (len2 === 0) continue;
+              const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / len2));
+              const nx = ax + t * dx; const ny = ay + t * dy;
+              const d = (px - nx) ** 2 + (py - ny) ** 2;
+              if (d < bestDist) { bestDist = d; bestSeg = i; }
+            }
+            store.pushSnapshot();
+            coords.splice(bestSeg + 1, 0, [px, py]);
+            const featuresSrc = map.getSource('proximity-features') as import('maplibre-gl').GeoJSONSource | undefined;
+            featuresSrc?.setData(fc!);
+            const vertSrc = map.getSource('proximity-vertices') as import('maplibre-gl').GeoJSONSource | undefined;
+            vertSrc?.setData(extractVertices(fc!, selectedId));
+            store.setStatusText(`Added vertex at position ${bestSeg + 1} on ${selectedId}`);
+            return;
+          }
+        }
+        // Fall through to normal add_node logic
+      }
 
       // Lazily create/update adapter
       if (!adapterRef.current) {

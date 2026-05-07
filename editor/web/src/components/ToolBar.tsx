@@ -117,6 +117,7 @@ export function ToolBar() {
   const setActiveTool = useEditorStore((s) => s.setActiveTool);
   const toggleSearch = useEditorStore((s) => s.toggleSearch);
   const toggleConfig = useEditorStore((s) => s.toggleConfig);
+  const toggleDataset = useEditorStore((s) => s.toggleDataset);
 
   return (
     <nav style={S.nav}>
@@ -155,7 +156,16 @@ export function ToolBar() {
           })}
         </div>
       ))}
-      <div style={S.bottomRow}>
+      <div style={{ ...S.bottomRow, flexDirection: 'column', gap: 4 }}>
+        <button
+          style={S.topBtn}
+          title="Select dataset"
+          onClick={toggleDataset}
+          onMouseEnter={(e) => { e.currentTarget.style.background = '#333'; }}
+          onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+        >
+          {'\u2630'}
+        </button>
         <button
           style={S.topBtn}
           title="Settings"
