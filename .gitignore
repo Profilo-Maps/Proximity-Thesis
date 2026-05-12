@@ -3,6 +3,13 @@
 /Output
 /cache
 /CLAUDE.md
-/Implementations/__pycache__
 /.venv
 /notesforrobot
+/.claude
+/.vscode
+/docs
+/Old
+/Implementations/.osm_cache
+**/__pycache__/
+*.tsbuildinfo
+node_modules/

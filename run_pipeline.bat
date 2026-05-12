@@ -1,17 +1,16 @@
 @echo off
 REM Pipeline runner for Proximity Model
-REM One-stop launcher: pipeline, test maps, editor, or any combination.
+REM One-stop launcher: pipeline, editor, or both.
 
 echo ================================================================================
 echo Proximity Model Pipeline Runner
 echo ================================================================================
 echo.
-echo   [1] Full         - Pipeline + Test Maps + Editor
+echo   [1] Full         - Pipeline + Editor
 echo   [2] Pipeline only - Run pipeline
-echo   [3] Test Maps     - Generate diagnostic maps
-echo   [4] Editor only   - Launch editor
+echo   [3] Editor only   - Launch editor
 echo.
-choice /c 1234 /n /m "Select mode [1/2/3/4]: "
+choice /c 123 /n /m "Select mode [1/2/3]: "
 set MODE=%errorlevel%
 
 REM Get the directory where this batch file is located and cd into it
@@ -22,8 +21,7 @@ REM Record start time
 set PIPELINE_START=%time%
 
 REM --- Pipeline phase ---
-if %MODE%==3 goto :test_maps
-if %MODE%==4 goto :editor
+if %MODE%==3 goto :editor
 
 echo.
 choice /c YN /n /m "Recreate existing parquets? [Y/N]: "
@@ -53,36 +51,6 @@ echo ProximityModel.py completed successfully  [%DURATION%]
 echo ================================================================================
 
 if %MODE%==2 goto :done
-
-REM --- Test Maps phase ---
-:test_maps
-
-echo.
-echo Running test_maps.py...
-echo ================================================================================
-echo.
-
-set PHASE_START=%time%
-uv run python "%SCRIPT_DIR%Implementations\test_maps.py"
-
-if errorlevel 1 (
-    echo.
-    echo ================================================================================
-    echo ERROR: test_maps.py failed with error code %errorlevel%
-    echo ================================================================================
-    pause
-    exit /b 1
-)
-
-call :elapsed %PHASE_START% %time%
-echo.
-echo ================================================================================
-echo test_maps.py completed successfully  [%DURATION%]
-echo ================================================================================
-echo.
-echo Test maps are in: %SCRIPT_DIR%Output\test_maps\
-
-if %MODE%==3 goto :done
 
 REM --- Editor phase ---
 :editor

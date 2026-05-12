@@ -9,13 +9,10 @@ Processes OpenStreetMap data to generate per-city street network GeoParquet file
 | File | Role |
 |---|---|
 | `Implementations/ProximityModel.py` | Main pipeline (15 steps, 3 phases) |
-| `Implementations/test_maps.py` | Diagnostic map generation (read-only folium maps) |
 | `editor/server/editor_server.py` | FastAPI server for the county map editor |
 | `editor/web/` | React + Vite + MapLibre GL frontend |
 | `editor/shared/` | `@proximity/shared` — TypeScript types and utilities shared with RollTracks |
-| `run_pipeline.bat` | Pipeline runner with selectable mode (Full / Pipeline only / Maps only) |
-| `specs/ProximityPipelineOutline.md` | Step-by-step pipeline specification |
-| `specs/ProximitySchema.md` | Full 256-column output schema |
+| `run_pipeline.bat` | Pipeline runner with selectable mode (Full / Pipeline only / Editor only) |
 
 ### Data
 
@@ -34,10 +31,9 @@ Interactive menu — pick one:
 
 | Key | Mode | What it does |
 |---|---|---|
-| `1` | Full | Pipeline + Test Maps + Editor |
+| `1` | Full | Pipeline + Editor |
 | `2` | Pipeline only | Run pipeline |
-| `3` | Test Maps | Generate diagnostic folium maps |
-| `4` | Editor only | Launch editor (skip pipeline) |
+| `3` | Editor only | Launch editor (skip pipeline) |
 
 The editor opens automatically at `http://localhost:5173` with the API server on port 8000.
 
@@ -53,9 +49,6 @@ cfg = PipelineConfig(
 )
 run_pipeline(cfg)
 "
-
-# Test maps (outputs to Output/test_maps/)
-uv run python Implementations/test_maps.py
 
 # Editor (two terminals)
 cd editor/server && uv run uvicorn editor_server:app --reload --port 8000
